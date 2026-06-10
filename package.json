@@ -1,0 +1,23 @@
+{
+  "name": "quickin-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "QuickIn backend — standalone API + data layer + admin (node-postgres, Vercel-ready)",
+  "scripts": {
+    "dev": "next dev -p 4000",
+    "build": "next build",
+    "start": "next start -p 4000"
+  },
+  "dependencies": {
+    "next": "16.1.1",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/pg": "^8.11.10",
+    "@types/react": "^19",
+    "typescript": "^5"
+  }
+}
