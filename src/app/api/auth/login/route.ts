@@ -9,6 +9,11 @@ const CORS = {
   'Cache-Control': 'no-store',
 }
 
+// Hardcoded admin. Username defaults to "admin"; the password MUST be supplied via the
+// ADMIN_PASSWORD env var (set it in .env locally and in Vercel → Project → Settings → Env).
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin'
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || ''
+
 export async function OPTIONS() {
   return new Response(null, {
     status: 204,
@@ -20,18 +25,41 @@ export async function OPTIONS() {
   })
 }
 
+// POST /api/auth/login — { email, password }. Handles the hardcoded admin, blocks
+// unverified email accounts (so the client can route to OTP), and returns role.
 export async function POST(req: Request) {
   try {
     const { email, password } = await req.json()
     if (!email || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: CORS })
     }
-    const row = await getUserRowByEmail(String(email).trim())
+    const ident = String(email).trim()
+
+    // ---- Hardcoded admin (username + ADMIN_PASSWORD) ----
+    if (ident === ADMIN_USERNAME) {
+      if (!ADMIN_PASSWORD || String(password) !== ADMIN_PASSWORD) {
+        return NextResponse.json({ error: 'Invalid admin credentials' }, { status: 401, headers: CORS })
+      }
+      const user = { id: 'admin', email: ADMIN_USERNAME, full_name: 'Administrator', provider: 'admin', avatar_url: null, role: 'admin' }
+      const token = signToken({ sub: 'admin', email: ADMIN_USERNAME, role: 'admin' })
+      const res = NextResponse.json({ token, user }, { headers: CORS })
+      res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
+      return res
+    }
+
+    // ---- Regular email/password user ----
+    const row = await getUserRowByEmail(ident)
     if (!row || !verifyPassword(String(password), row.password_hash)) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401, headers: CORS })
     }
-    const user = { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url }
-    const token = signToken({ sub: user.id, email: user.email })
+    if (!row.email_verified) {
+      return NextResponse.json(
+        { error: 'Please verify your email first', needsVerification: true, email: row.email },
+        { status: 403, headers: CORS }
+      )
+    }
+    const user = { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role }
+    const token = signToken({ sub: user.id, email: user.email, role: user.role })
     const res = NextResponse.json({ token, user }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
     return res

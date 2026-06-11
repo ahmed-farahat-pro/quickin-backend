@@ -37,14 +37,23 @@ CREATE TABLE IF NOT EXISTS listing_images (
 CREATE INDEX IF NOT EXISTS idx_listing_images_listing ON listing_images(listing_id);
 
 CREATE TABLE IF NOT EXISTS users (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  email         text UNIQUE NOT NULL,
-  password_hash text,
-  full_name     text,
-  provider      text NOT NULL DEFAULT 'email',
-  avatar_url    text,
-  created_at    timestamptz DEFAULT now()
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  email           text UNIQUE NOT NULL,
+  password_hash   text,
+  full_name       text,
+  provider        text NOT NULL DEFAULT 'email',
+  avatar_url      text,
+  role            text NOT NULL DEFAULT 'user',   -- 'user' | 'host' | 'admin'
+  email_verified  boolean NOT NULL DEFAULT false,
+  otp_code        text,
+  otp_expires_at  timestamptz,
+  created_at      timestamptz DEFAULT now()
 );
+-- Idempotent upgrades for databases created before these columns existed:
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role           text NOT NULL DEFAULT 'user';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified boolean NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code       text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS bookings (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -22,11 +22,19 @@ export async function GET(req: Request) {
     const claims = verifyToken(token)
     if (!claims) return NextResponse.json({ user: null }, { headers: CORS })
 
+    // Hardcoded admin token has no DB row.
+    if (claims.role === 'admin' && claims.sub === 'admin') {
+      return NextResponse.json(
+        { user: { id: 'admin', email: claims.email, full_name: 'Administrator', provider: 'admin', avatar_url: null, role: 'admin' } },
+        { headers: CORS }
+      )
+    }
+
     const row = await getUserRowByEmail(claims.email)
     if (!row) return NextResponse.json({ user: null }, { headers: CORS })
 
     return NextResponse.json(
-      { user: { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url } },
+      { user: { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role } },
       { headers: CORS }
     )
   } catch (err) {
