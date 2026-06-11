@@ -4,9 +4,15 @@ import crypto from 'node:crypto'
 // Verifies the RS256 signature against the provider's published JWKS and checks
 // the standard claims (iss / aud / exp). Used by /api/auth/google and /api/auth/apple.
 
-export const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''
-// Apple "aud" is your Services ID (web) or app bundle id (native iOS).
-export const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || ''
+// Accept ONE or SEVERAL client ids, comma-separated. Google issues tokens with a
+// different `aud` per platform (web client, iOS client, …) so list them all:
+//   GOOGLE_CLIENT_ID=<web-id>,<ios-id>
+//   APPLE_CLIENT_ID=com.quickin.ahmed         (native iOS bundle id; add the web Services ID later)
+function parseIds(v: string | undefined): string[] {
+  return (v || '').split(',').map((s) => s.trim()).filter(Boolean)
+}
+export const GOOGLE_CLIENT_IDS = parseIds(process.env.GOOGLE_CLIENT_ID)
+export const APPLE_CLIENT_IDS = parseIds(process.env.APPLE_CLIENT_ID)
 
 interface Jwk {
   kid: string
@@ -49,7 +55,7 @@ export interface VerifiedClaims {
 
 async function verifyIdToken(
   idToken: string,
-  opts: { jwksUrl: string; issuers: string[]; audience: string }
+  opts: { jwksUrl: string; issuers: string[]; audiences: string[] }
 ): Promise<VerifiedClaims> {
   const parts = idToken.split('.')
   if (parts.length !== 3) throw new Error('Malformed token')
@@ -70,36 +76,38 @@ async function verifyIdToken(
   )
   if (!ok) throw new Error('Invalid token signature')
 
-  // 2. Standard claims.
+  // 2. Standard claims — issuer + audience (any configured id) + expiry.
   if (!opts.issuers.includes(payload.iss)) throw new Error(`Unexpected issuer: ${payload.iss}`)
   const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud]
-  if (opts.audience && !aud.includes(opts.audience)) throw new Error('Audience mismatch')
+  if (opts.audiences.length && !opts.audiences.some((a) => aud.includes(a))) {
+    throw new Error('Audience mismatch')
+  }
   if (typeof payload.exp === 'number' && payload.exp * 1000 < Date.now()) throw new Error('Token expired')
 
   return payload
 }
 
-/** Verify a Google ID token (the `credential` from Google Identity Services / a Google sign-in). */
+/** Verify a Google ID token (web GIS `credential`, or the id_token from the iOS/Android native flow). */
 export async function verifyGoogleIdToken(idToken: string): Promise<VerifiedClaims> {
-  if (!GOOGLE_CLIENT_ID) throw new Error('GOOGLE_CLIENT_ID is not configured')
+  if (!GOOGLE_CLIENT_IDS.length) throw new Error('GOOGLE_CLIENT_ID is not configured')
   return verifyIdToken(idToken, {
     jwksUrl: 'https://www.googleapis.com/oauth2/v3/certs',
     issuers: ['accounts.google.com', 'https://accounts.google.com'],
-    audience: GOOGLE_CLIENT_ID,
+    audiences: GOOGLE_CLIENT_IDS,
   })
 }
 
 /** Verify an Apple identity token (returned by Sign in with Apple). */
 export async function verifyAppleIdToken(idToken: string): Promise<VerifiedClaims> {
-  if (!APPLE_CLIENT_ID) throw new Error('APPLE_CLIENT_ID is not configured')
+  if (!APPLE_CLIENT_IDS.length) throw new Error('APPLE_CLIENT_ID is not configured')
   return verifyIdToken(idToken, {
     jwksUrl: 'https://appleid.apple.com/auth/keys',
     issuers: ['https://appleid.apple.com'],
-    audience: APPLE_CLIENT_ID,
+    audiences: APPLE_CLIENT_IDS,
   })
 }
 
 export const oauthConfigured = {
-  google: () => Boolean(GOOGLE_CLIENT_ID),
-  apple: () => Boolean(APPLE_CLIENT_ID),
+  google: () => GOOGLE_CLIENT_IDS.length > 0,
+  apple: () => APPLE_CLIENT_IDS.length > 0,
 }

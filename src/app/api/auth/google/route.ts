@@ -48,7 +48,7 @@ export async function POST(req: Request) {
       provider: 'google',
       avatarUrl: typeof claims.picture === 'string' ? claims.picture : undefined,
     })
-    const token = signToken({ sub: user.id, email: user.email })
+    const token = signToken({ sub: user.id, email: user.email, role: user.role })
     const res = NextResponse.json({ token, user }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
     return res
