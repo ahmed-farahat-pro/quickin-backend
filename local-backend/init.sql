@@ -130,3 +130,35 @@ BEGIN
   END LOOP;
   RAISE NOTICE 'seeded % listings', array_length(rows_arr,1);
 END $$;
+
+-- Services: a host offers a standalone experience (jet ski, diving, tour …); a user
+-- "subscribes"/requests it and, like a booking, it goes pending -> confirmed/rejected.
+CREATE TABLE IF NOT EXISTS services (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  host_id      uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title        text NOT NULL,
+  description  text,
+  category     text,
+  location     text,
+  price        numeric NOT NULL DEFAULT 0,
+  currency     text DEFAULT 'USD',
+  image_url    text,
+  lat          double precision,
+  lng          double precision,
+  is_published boolean DEFAULT true,
+  created_at   timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_services_host ON services(host_id);
+
+CREATE TABLE IF NOT EXISTS service_requests (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  service_id     uuid NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+  user_id        uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status         text NOT NULL DEFAULT 'pending',
+  preferred_date date,
+  note           text,
+  request_code   text,
+  created_at     timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_requests_user ON service_requests(user_id);
+CREATE INDEX IF NOT EXISTS idx_service_requests_service ON service_requests(service_id);
