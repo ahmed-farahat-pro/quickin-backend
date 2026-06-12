@@ -69,6 +69,13 @@ CREATE TABLE IF NOT EXISTS bookings (
 CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id);
 CREATE INDEX IF NOT EXISTS idx_bookings_listing ON bookings(listing_id);
 
+-- Reservation lifecycle: hosts own listings; bookings go pending -> confirmed/rejected;
+-- each booking carries a short reservation_code used for the QR / wallet pass.
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS host_id uuid REFERENCES users(id);
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reservation_code text;
+ALTER TABLE bookings ALTER COLUMN status SET DEFAULT 'pending';
+CREATE INDEX IF NOT EXISTS idx_listings_host ON listings(host_id);
+
 -- ---- Seed listings (only if the table is empty) -----------------------------
 DO $$
 DECLARE
