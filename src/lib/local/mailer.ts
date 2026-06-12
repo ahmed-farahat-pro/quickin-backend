@@ -16,6 +16,34 @@ const FROM = process.env.SMTP_FROM || USER
 
 export const smtpConfigured = Boolean(USER && PASS)
 
+/** Mask a secret-ish value so logs/probes can confirm it's present + non-blank
+ *  (and catch stray whitespace) without leaking it. */
+function mask(v: string): string {
+  const s = v.trim()
+  if (s.length <= 4) return '*'.repeat(s.length)
+  return s.slice(0, 2) + '***' + s.slice(-2)
+}
+
+/** Non-secret view of the SMTP config — powers the /api/auth/smtp-status probe and
+ *  the "not configured" log line. Reveals only booleans, host/port, and a masked
+ *  user, so it's safe to expose while diagnosing a deployment. */
+export function smtpDiagnostics() {
+  const missing: string[] = []
+  if (!USER) missing.push('SMTP_USER')
+  if (!PASS) missing.push('SMTP_PASS')
+  return {
+    configured: smtpConfigured,
+    host: HOST,
+    port: PORT,
+    secure: PORT === 465,
+    userSet: Boolean(USER),
+    passSet: Boolean(PASS),
+    fromSet: Boolean(FROM),
+    userMasked: USER ? mask(USER) : null,
+    missing,
+  }
+}
+
 let transporter: nodemailer.Transporter | null = null
 function getTransporter(): nodemailer.Transporter {
   if (!transporter) {
@@ -52,17 +80,29 @@ function otpEmailHtml(code: string): string {
   </div>`
 }
 
-/** Send the sign-up OTP. With no SMTP creds, logs the code (dev fallback) instead of failing. */
+/** Send the sign-up OTP. With no SMTP creds, logs the code (dev fallback) instead of
+ *  failing. With creds present, a send failure (auth/port/TLS) is thrown so the route
+ *  surfaces the real reason instead of silently dropping the email. */
 export async function sendOtpEmail(to: string, code: string): Promise<void> {
   if (!smtpConfigured) {
-    console.log(`[mailer] SMTP not configured — OTP for ${to} is ${code}`)
+    const { missing } = smtpDiagnostics()
+    console.log(
+      `[mailer] SMTP not configured — missing ${missing.join(', ') || '(unknown)'} ` +
+        `— OTP for ${to} is ${code}`
+    )
     return
   }
-  await getTransporter().sendMail({
-    from: `QuickIn <${FROM}>`,
-    to,
-    subject: `Your QuickIn verification code: ${code}`,
-    text: `Your QuickIn verification code is ${code}. It expires in 10 minutes.`,
-    html: otpEmailHtml(code),
-  })
+  try {
+    const info = await getTransporter().sendMail({
+      from: `QuickIn <${FROM}>`,
+      to,
+      subject: `Your QuickIn verification code: ${code}`,
+      text: `Your QuickIn verification code is ${code}. It expires in 10 minutes.`,
+      html: otpEmailHtml(code),
+    })
+    console.log(`[mailer] OTP emailed to ${to} via ${HOST}:${PORT} (messageId ${info.messageId})`)
+  } catch (err) {
+    console.error(`[mailer] SMTP send failed for ${to} via ${HOST}:${PORT}:`, err)
+    throw new Error(`SMTP send failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
