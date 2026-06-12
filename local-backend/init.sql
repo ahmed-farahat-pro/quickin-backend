@@ -76,6 +76,16 @@ ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reservation_code text;
 ALTER TABLE bookings ALTER COLUMN status SET DEFAULT 'pending';
 CREATE INDEX IF NOT EXISTS idx_listings_host ON listings(host_id);
 
+-- Per-booking chat between the guest and the listing's host.
+CREATE TABLE IF NOT EXISTS messages (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  booking_id  uuid NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+  sender_id   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  body        text NOT NULL,
+  created_at  timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_messages_booking ON messages(booking_id, created_at);
+
 -- ---- Seed listings (only if the table is empty) -----------------------------
 DO $$
 DECLARE

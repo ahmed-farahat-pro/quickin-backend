@@ -273,3 +273,43 @@ export async function getBookingById(bookingId: string): Promise<Booking | null>
   )
   return (rows[0] as Booking) ?? null
 }
+
+// ---- Chat: per-booking messages between guest and host ----------------------
+
+export interface Message {
+  id: string
+  booking_id: string
+  sender_id: string
+  sender_name: string | null
+  body: string
+  created_at: string
+}
+
+/** All messages for a booking, oldest first, with the sender's display name. */
+export async function getBookingMessages(bookingId: string): Promise<Message[]> {
+  if (!isUuid(bookingId)) return []
+  const { rows } = await pool.query(
+    `SELECT m.id, m.booking_id, m.sender_id, u.full_name AS sender_name, m.body, m.created_at
+       FROM messages m JOIN users u ON u.id = m.sender_id
+      WHERE m.booking_id = $1
+      ORDER BY m.created_at ASC`,
+    [bookingId]
+  )
+  return rows as Message[]
+}
+
+/** Post a message to a booking thread. */
+export async function createMessage(bookingId: string, senderId: string, body: string): Promise<Message> {
+  if (!isUuid(bookingId) || !isUuid(senderId)) throw new Error('Invalid id')
+  const text = String(body || '').trim().slice(0, 2000)
+  if (!text) throw new Error('Message cannot be empty')
+  const { rows } = await pool.query(
+    `WITH ins AS (
+       INSERT INTO messages (booking_id, sender_id, body) VALUES ($1, $2, $3) RETURNING *
+     )
+     SELECT ins.id, ins.booking_id, ins.sender_id, u.full_name AS sender_name, ins.body, ins.created_at
+       FROM ins JOIN users u ON u.id = ins.sender_id`,
+    [bookingId, senderId, text]
+  )
+  return rows[0] as Message
+}
