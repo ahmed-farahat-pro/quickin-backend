@@ -125,6 +125,17 @@ export async function createUser(args: {
   return rows[0] as User
 }
 
+/** Promote a user to a new role — e.g. a verified guest who later registers "as a
+ *  host" keeps the same account/email and just gains hosting. Returns the updated row. */
+export async function setUserRole(id: string, role: Role): Promise<User> {
+  const { rows } = await pool.query(
+    `UPDATE users SET role = $2 WHERE id = $1 RETURNING ${USER_COLS}`,
+    [id, role]
+  )
+  if (!rows[0]) throw new Error('Failed to update role')
+  return rows[0] as User
+}
+
 /** Create an UNVERIFIED user awaiting email OTP verification. */
 export async function createPendingUser(args: {
   email: string
