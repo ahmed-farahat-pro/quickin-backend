@@ -42,6 +42,33 @@ function pemFromB64(name: string): string {
   return Buffer.from(envStr(name), 'base64').toString('utf8')
 }
 
+const SIGN_DIR = join(process.cwd(), 'pass-assets', 'signing')
+function readMaybe(path: string): string {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+/** Pass signing material — from env (base64 PEMs) when set, otherwise the committed
+ *  PEM files in pass-assets/signing/. The file fallback lets Production sign passes
+ *  with zero env configuration. Returns null only if neither source is complete. */
+function loadSigning(): { wwdr: string; signerCert: string; signerKey: string } | null {
+  if (envStr('PASS_SIGNER_CERT_B64') && envStr('PASS_SIGNER_KEY_B64') && envStr('PASS_WWDR_B64')) {
+    return {
+      wwdr: pemFromB64('PASS_WWDR_B64'),
+      signerCert: pemFromB64('PASS_SIGNER_CERT_B64'),
+      signerKey: pemFromB64('PASS_SIGNER_KEY_B64'),
+    }
+  }
+  const wwdr = readMaybe(join(SIGN_DIR, 'wwdr.pem'))
+  const signerCert = readMaybe(join(SIGN_DIR, 'signerCert.pem'))
+  const signerKey = readMaybe(join(SIGN_DIR, 'signerKey.pem'))
+  if (wwdr && signerCert && signerKey) return { wwdr, signerCert, signerKey }
+  return null
+}
+
 /** Load the committed pass template images as Buffers. */
 function loadAssets(): Record<string, Buffer> {
   const dir = join(process.cwd(), 'pass-assets')
@@ -58,14 +85,12 @@ function money(amount: number | null | undefined): string {
 }
 
 export async function GET(req: Request, ctx: { params: Promise<{ bookingId: string }> }) {
-  // 1. Refuse if any signing material is missing → 501.
-  const passTypeId = envStr('PASS_TYPE_ID')
-  const teamId = envStr('PASS_TEAM_ID')
-  const orgName = envStr('PASS_ORG_NAME')
-  const certB64 = envStr('PASS_SIGNER_CERT_B64')
-  const keyB64 = envStr('PASS_SIGNER_KEY_B64')
-  const wwdrB64 = envStr('PASS_WWDR_B64')
-  if (!passTypeId || !teamId || !orgName || !certB64 || !keyB64 || !wwdrB64) {
+  // 1. Resolve signing material (env base64, else committed PEM files) + metadata.
+  const passTypeId = envStr('PASS_TYPE_ID') || 'pass.com.quick'
+  const teamId = envStr('PASS_TEAM_ID') || '97DNR5Y3Y5'
+  const orgName = envStr('PASS_ORG_NAME') || 'QuickIn'
+  const signing = loadSigning()
+  if (!signing) {
     return NextResponse.json({ error: 'Wallet pass not configured' }, { status: 501, headers: CORS })
   }
 
@@ -84,11 +109,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ bookingId: stri
     // 2. Build the signed pass.
     const pass = new PKPass(
       loadAssets(),
-      {
-        wwdr: pemFromB64('PASS_WWDR_B64'),
-        signerCert: pemFromB64('PASS_SIGNER_CERT_B64'),
-        signerKey: pemFromB64('PASS_SIGNER_KEY_B64'),
-      },
+      signing,
       {
         organizationName: orgName,
         description: 'QuickIn reservation',
