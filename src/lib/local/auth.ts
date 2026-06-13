@@ -269,22 +269,68 @@ export async function setUserOtp(args: {
   return (rowCount ?? 0) > 0
 }
 
-/** Validate an OTP; on success mark the account verified and return the user. */
+/**
+ * Arm an OTP on an ALREADY-VERIFIED account for a role change it must confirm by
+ * email (a guest registering "as a host"). Does NOT touch role/password/verified
+ * yet — verifyUserOtp promotes role := pending_role only once the code is entered,
+ * so nobody can gain hosting (or reset anything) just by knowing the email.
+ */
+export async function setPendingRoleOtp(args: {
+  email: string
+  pendingRole: Role
+  otp: string
+  otpExpires: Date
+  fullName?: string
+}): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE users
+        SET pending_role = $2,
+            otp_code = $3,
+            otp_expires_at = $4,
+            full_name = COALESCE($5, full_name)
+      WHERE lower(email) = lower($1)`,
+    [args.email, args.pendingRole, args.otp, args.otpExpires.toISOString(), args.fullName ?? null]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/** Validate an OTP; on success activate the account (and apply any pending role) and return the user. */
 export async function verifyUserOtp(email: string, code: string): Promise<User | null> {
   const { rows } = await pool.query(
-    `SELECT id, otp_code, otp_expires_at, email_verified FROM users WHERE lower(email) = lower($1)`,
+    `SELECT id, otp_code, otp_expires_at, email_verified, pending_role FROM users WHERE lower(email) = lower($1)`,
     [email]
   )
   const r = rows[0]
   if (!r) return null
+
+  const otpOk =
+    !!r.otp_code &&
+    r.otp_code === code &&
+    !(r.otp_expires_at && new Date(r.otp_expires_at).getTime() < Date.now())
+
   if (r.email_verified) {
+    // A verified account with a pending role upgrade (guest -> host) must present
+    // a valid OTP to apply it.
+    if (r.pending_role) {
+      if (!otpOk) return null
+      const { rows: up } = await pool.query(
+        `UPDATE users SET role = $2, pending_role = null, otp_code = null, otp_expires_at = null
+          WHERE id = $1 RETURNING ${USER_COLS}`,
+        [r.id, r.pending_role]
+      )
+      return (up[0] as User) ?? null
+    }
+    // Already verified, nothing pending — idempotent success.
     const u = await pool.query(`SELECT ${USER_COLS} FROM users WHERE id = $1`, [r.id])
     return (u.rows[0] as User) ?? null
   }
-  if (!r.otp_code || r.otp_code !== code) return null
-  if (r.otp_expires_at && new Date(r.otp_expires_at).getTime() < Date.now()) return null
+
+  // First-time activation. Apply pending_role if one was stashed at signup.
+  if (!otpOk) return null
   const { rows: updated } = await pool.query(
-    `UPDATE users SET email_verified = true, otp_code = null, otp_expires_at = null
+    `UPDATE users SET email_verified = true,
+            role = COALESCE(pending_role, role),
+            pending_role = null, otp_code = null, otp_expires_at = null
       WHERE id = $1 RETURNING ${USER_COLS}`,
     [r.id]
   )

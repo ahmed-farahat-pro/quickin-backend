@@ -2,11 +2,9 @@ import { NextResponse } from 'next/server'
 import {
   getUserRowByEmail,
   hashPassword,
-  verifyPassword,
-  setUserRole,
-  signToken,
   createPendingUser,
   setUserOtp,
+  setPendingRoleOtp,
   generateOtp,
   OTP_TTL_MS,
 } from '@/lib/local/auth'
@@ -50,21 +48,19 @@ export async function POST(req: Request) {
 
     const existing = await getUserRowByEmail(cleanEmail)
     if (existing && existing.email_verified) {
-      // One email = one account that can be BOTH a guest and a host (Airbnb-style).
-      // A verified guest who now registers "as a host" with their correct password
-      // gains the host role and is logged straight in — no "email already exists".
+      // One email = one account that can be BOTH a guest and a host (Airbnb-style),
+      // but EVERY registration goes through the full OTP flow. A verified guest who
+      // registers "as a host" must confirm a FRESH code emailed to them; the host
+      // role is stashed in pending_role and only applied by verify-otp once the code
+      // is entered (so nobody gains hosting just by knowing the email).
       const alreadyHost = existing.role === 'host' || existing.role === 'admin'
       if (chosenRole === 'host' && !alreadyHost) {
-        if (!verifyPassword(String(password), existing.password_hash)) {
-          return NextResponse.json(
-            { error: 'This email is already registered. Use your existing password to add hosting.' },
-            { status: 409, headers: CORS }
-          )
-        }
-        const upgraded = await setUserRole(existing.id, 'host')
-        const token = signToken({ sub: upgraded.id, email: upgraded.email, role: 'host' })
+        const otp = generateOtp()
+        const otpExpires = new Date(Date.now() + OTP_TTL_MS)
+        await setPendingRoleOtp({ email: cleanEmail, pendingRole: 'host', otp, otpExpires, fullName })
+        await sendOtpEmail(cleanEmail, otp)
         return NextResponse.json(
-          { upgraded: true, token, role: 'host', user: upgraded },
+          { pending: true, email: cleanEmail, role: 'host', addingHost: true, ...(smtpConfigured ? {} : { devCode: otp }) },
           { headers: CORS }
         )
       }
