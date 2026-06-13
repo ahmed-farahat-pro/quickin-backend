@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, verifyPassword, signToken } from '@/lib/local/auth'
+import { getUserRowByEmail, verifyPassword, signToken, setUserRole } from '@/lib/local/auth'
 
 export const dynamic = 'force-dynamic'
 
@@ -29,7 +29,7 @@ export async function OPTIONS() {
 // unverified email accounts (so the client can route to OTP), and returns role.
 export async function POST(req: Request) {
   try {
-    const { email, password } = await req.json()
+    const { email, password, role } = await req.json()
     if (!email || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: CORS })
     }
@@ -58,8 +58,20 @@ export async function POST(req: Request) {
         { status: 403, headers: CORS }
       )
     }
-    const user = { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role }
-    const token = signToken({ sub: user.id, email: user.email, role: user.role })
+    // Two roles per email: at sign-in you choose to enter as a guest or a host.
+    //  - Pick "host" → if this account isn't a host yet, it GAINS the host role now
+    //    (so one email can hold both); admins are left as admins.
+    //  - Pick "user" (guest) → act as a guest this session even if the account can host.
+    //  - No choice → use the account's stored role.
+    const desired = role === 'host' ? 'host' : role === 'user' ? 'user' : null
+    let activeRole: string = row.role
+    if (desired === 'host' && row.role !== 'admin') {
+      activeRole = row.role === 'host' ? 'host' : (await setUserRole(row.id, 'host')).role
+    } else if (desired === 'user' && row.role !== 'admin') {
+      activeRole = 'user'
+    }
+    const user = { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: activeRole }
+    const token = signToken({ sub: user.id, email: user.email, role: activeRole })
     const res = NextResponse.json({ token, user }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
     return res
