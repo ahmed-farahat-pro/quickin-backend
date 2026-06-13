@@ -56,11 +56,11 @@ export interface ServiceRequest {
   requester_email: string | null
 }
 
-const SERVICE_COLS = `
+export const SERVICE_COLS = `
   s.id, s.host_id, u.full_name AS host_name, s.title, s.description, s.category,
   s.location, s.price::float8 AS price, s.currency, s.image_url, s.lat, s.lng,
   s.is_published, s.created_at`
-const SERVICE_FROM = `services s JOIN users u ON u.id = s.host_id`
+export const SERVICE_FROM = `services s JOIN users u ON u.id = s.host_id`
 
 const REQUEST_COLS = `
   r.id, r.service_id, r.user_id, r.status, r.preferred_date, r.note, r.request_code, r.created_at,

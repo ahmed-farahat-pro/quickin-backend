@@ -106,3 +106,56 @@ export async function sendOtpEmail(to: string, code: string): Promise<void> {
     throw new Error(`SMTP send failed: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
+
+// Branded transactional template for booking/notification emails.
+function brandedHtml(heading: string, paragraphs: string[], cta?: { label: string; url: string }): string {
+  const body = paragraphs
+    .map((p) => `<p style="margin:0 0 14px;color:#6B6055;font-size:14px;line-height:1.6">${p}</p>`)
+    .join('')
+  const button = cta
+    ? `<div style="margin:6px 0 2px"><a href="${cta.url}" style="display:inline-block;background:#5B0F16;color:#F6F1E6;text-decoration:none;font-weight:700;font-size:14px;padding:12px 22px;border-radius:14px">${cta.label}</a></div>`
+    : ''
+  return `
+  <div style="background:#E4DECF;padding:32px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+    <div style="max-width:460px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;border:1px solid #EFE6D8">
+      <div style="background:linear-gradient(135deg,#5B0F16,#8a2530);padding:22px 28px">
+        <span style="color:#F6F1E6;font-size:22px;font-weight:700;letter-spacing:.5px">QuickIn</span>
+      </div>
+      <div style="padding:28px">
+        <h1 style="margin:0 0 12px;color:#2A2220;font-size:20px">${heading}</h1>
+        ${body}${button}
+        <p style="margin:18px 0 0;color:#9a9088;font-size:12px">Find It. Book It. Live It.</p>
+      </div>
+    </div>
+  </div>`
+}
+
+/**
+ * Best-effort branded transactional email (booking confirmations, requests, etc.).
+ * NEVER throws — a mail failure must not break the booking mutation that triggered it.
+ */
+export async function sendNotificationEmail(
+  to: string,
+  subject: string,
+  heading: string,
+  paragraphs: string[],
+  cta?: { label: string; url: string }
+): Promise<void> {
+  if (!to) return
+  if (!smtpConfigured) {
+    console.log(`[mailer] (no SMTP) would email ${to}: ${subject}`)
+    return
+  }
+  try {
+    await getTransporter().sendMail({
+      from: `QuickIn <${FROM}>`,
+      to,
+      subject,
+      text: `${heading}\n\n${paragraphs.join('\n\n')}${cta ? `\n\n${cta.label}: ${cta.url}` : ''}`,
+      html: brandedHtml(heading, paragraphs, cta),
+    })
+    console.log(`[mailer] notification emailed to ${to} (${subject})`)
+  } catch (err) {
+    console.error(`[mailer] notification send failed for ${to}:`, err)
+  }
+}

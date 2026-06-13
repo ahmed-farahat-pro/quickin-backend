@@ -1,6 +1,21 @@
 import { pool } from './pool'
 import { randomInt } from 'node:crypto'
 import { createNotification } from './notifications'
+import { sendNotificationEmail } from './mailer'
+import { sendPush } from './push'
+
+const WEB_URL = process.env.WEB_URL || 'https://quickin-frontend.vercel.app'
+
+// Look up a user's email for transactional notifications (best-effort).
+async function userEmail(id: string): Promise<string | null> {
+  if (!/^[0-9a-fA-F-]{36}$/.test(id)) return null
+  try {
+    const { rows } = await pool.query(`SELECT email FROM users WHERE id = $1`, [id])
+    return rows[0]?.email ?? null
+  } catch {
+    return null
+  }
+}
 
 // Data access via node-postgres (parameterized queries). Works locally and on
 // Vercel/Neon. No Supabase, no psql CLI.
@@ -31,6 +46,8 @@ export interface Listing {
   listing_code: string | null
   lat: number | null
   lng: number | null
+  rating: number
+  review_count: number
   listing_images: ListingImage[]
 }
 
@@ -77,12 +94,14 @@ export interface Booking {
   amenities: string[]
 }
 
-const LISTING_COLS = `
+export const LISTING_COLS = `
   l.id, l.title, l.description, l.location, l.country,
   l.price_per_night::float8 AS price_per_night, l.currency,
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
   COALESCE(l.amenities, '{}') AS amenities,
+  COALESCE((SELECT round(avg(rv.rating)::numeric, 2) FROM reviews rv WHERE rv.listing_id = l.id), 0)::float8 AS rating,
+  COALESCE((SELECT count(*) FROM reviews rv WHERE rv.listing_id = l.id), 0)::int AS review_count,
   COALESCE(
     (SELECT json_agg(json_build_object('url', li.url, 'order', li."order") ORDER BY li."order")
      FROM listing_images li WHERE li.listing_id = l.id), '[]'
@@ -225,13 +244,34 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
   )
   if (!rows[0]) throw new Error('Could not create booking (listing not found)')
   const booking = rows[0] as Booking
-  // Notify the host that a guest requested their listing.
+  // Notify the host that a guest requested their listing — in-app + push + email.
   await createNotification(booking.host_id, {
     type: 'booking_request',
     title: 'New booking request',
     body: `${booking.guests} guest(s) requested ${booking.title}`,
     link: '/host',
   })
+  if (booking.host_id) {
+    await sendPush(booking.host_id, {
+      title: 'New booking request',
+      body: `${booking.guests} guest(s) requested ${booking.title}`,
+      link: '/host',
+    })
+    const hostEmail = await userEmail(booking.host_id)
+    if (hostEmail) {
+      await sendNotificationEmail(
+        hostEmail,
+        'New booking request — QuickIn',
+        'You have a new booking request',
+        [
+          `${booking.guests} guest(s) requested <strong>${booking.title}</strong>.`,
+          `Dates: ${booking.check_in} → ${booking.check_out}.`,
+          'Open your host dashboard to confirm or decline.',
+        ],
+        { label: 'Open host dashboard', url: `${WEB_URL}/host` }
+      )
+    }
+  }
   return booking
 }
 
@@ -333,14 +373,47 @@ export async function setBookingStatus(
     [bookingId, hostUserId]
   )
   const updated = (rows[0] as Booking) ?? null
-  // Notify the guest that the host confirmed/declined their request.
+  // Notify the guest that the host confirmed/declined their request — in-app + push + email.
   if (updated) {
+    const confirmed = status === 'confirmed'
     await createNotification(updated.user_id, {
       type: `booking_${status}`,
-      title: status === 'confirmed' ? 'Reservation confirmed' : 'Reservation declined',
+      title: confirmed ? 'Reservation confirmed' : 'Reservation declined',
       body: `Your stay at ${updated.title}`,
       link: `/reservation/${updated.id}`,
     })
+    await sendPush(updated.user_id, {
+      title: confirmed ? 'Reservation confirmed 🎉' : 'Reservation update',
+      body: confirmed ? `Your stay at ${updated.title} is confirmed` : `Your request for ${updated.title} wasn’t accepted`,
+      link: `/reservation/${updated.id}`,
+    })
+    const guestEmail = await userEmail(updated.user_id)
+    if (guestEmail) {
+      if (confirmed) {
+        await sendNotificationEmail(
+          guestEmail,
+          'Your reservation is confirmed 🎉 — QuickIn',
+          'Your stay is confirmed',
+          [
+            `Your reservation at <strong>${updated.title}</strong> is confirmed.`,
+            `Dates: ${updated.check_in} → ${updated.check_out}.`,
+            `Reservation code: <strong>${updated.reservation_code ?? ''}</strong>.`,
+          ],
+          { label: 'View reservation', url: `${WEB_URL}/reservation/${updated.id}` }
+        )
+      } else {
+        await sendNotificationEmail(
+          guestEmail,
+          'Update on your reservation — QuickIn',
+          'Your request wasn’t accepted',
+          [
+            `Unfortunately your request for <strong>${updated.title}</strong> wasn’t accepted this time.`,
+            'There are plenty of other boutique stays waiting for you.',
+          ],
+          { label: 'Explore stays', url: `${WEB_URL}/explore` }
+        )
+      }
+    }
   }
   return updated
 }
