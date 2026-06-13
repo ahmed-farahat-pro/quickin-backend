@@ -1,5 +1,6 @@
 import { pool } from './pool'
 import { randomInt } from 'node:crypto'
+import { createNotification } from './notifications'
 
 // Data access via node-postgres (parameterized queries). Works locally and on
 // Vercel/Neon. No Supabase, no psql CLI.
@@ -153,7 +154,15 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
     [listingId, userId, checkIn, checkOut, g, reservationCode]
   )
   if (!rows[0]) throw new Error('Could not create booking (listing not found)')
-  return rows[0] as Booking
+  const booking = rows[0] as Booking
+  // Notify the host that a guest requested their listing.
+  await createNotification(booking.host_id, {
+    type: 'booking_request',
+    title: 'New booking request',
+    body: `${booking.guests} guest(s) requested ${booking.title}`,
+    link: '/host',
+  })
+  return booking
 }
 
 export async function getUserBookings(userId: string): Promise<Booking[]> {
@@ -250,7 +259,17 @@ export async function setBookingStatus(
       WHERE b.id = $1 AND l.host_id = $2`,
     [bookingId, hostUserId]
   )
-  return (rows[0] as Booking) ?? null
+  const updated = (rows[0] as Booking) ?? null
+  // Notify the guest that the host confirmed/declined their request.
+  if (updated) {
+    await createNotification(updated.user_id, {
+      type: `booking_${status}`,
+      title: status === 'confirmed' ? 'Reservation confirmed' : 'Reservation declined',
+      body: `Your stay at ${updated.title}`,
+      link: `/reservation/${updated.id}`,
+    })
+  }
+  return updated
 }
 
 /** All bookings across a host's listings (host "requests" view). */

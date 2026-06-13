@@ -1,5 +1,6 @@
 import { randomInt } from 'node:crypto'
 import { pool } from './pool'
+import { createNotification } from './notifications'
 
 // Services = a "booking system" for standalone experiences (jet ski, diving, tours…).
 // A host posts a service; a user "subscribes"/requests it; like a booking it goes
@@ -155,6 +156,13 @@ export async function createServiceRequest(
   if (!rows[0]) throw new Error('Service not found')
   const created = await getServiceRequestById(rows[0].id as string)
   if (!created) throw new Error('Failed to create request')
+  // Notify the host of the new service request.
+  await createNotification(created.host_id, {
+    type: 'service_request',
+    title: 'New service request',
+    body: `Someone requested ${created.service_title}`,
+    link: '/host',
+  })
   return created
 }
 
@@ -201,5 +209,15 @@ export async function setServiceRequestStatus(
     `SELECT ${REQUEST_COLS} FROM ${REQUEST_FROM} WHERE r.id = $1 AND s.host_id = $2`,
     [requestId, hostUserId]
   )
-  return (rows[0] as ServiceRequest) ?? null
+  const updated = (rows[0] as ServiceRequest) ?? null
+  // Notify the subscriber that the host confirmed/declined their request.
+  if (updated) {
+    await createNotification(updated.user_id, {
+      type: `service_${status}`,
+      title: status === 'confirmed' ? 'Service request confirmed' : 'Service request declined',
+      body: updated.service_title,
+      link: '/subscriptions',
+    })
+  }
+  return updated
 }
