@@ -95,7 +95,7 @@ export async function createService(hostUserId: string, input: CreateServiceInpu
 
   const { rows } = await pool.query(
     `INSERT INTO services (host_id, title, description, category, location, price, currency, image_url, lat, lng, is_published)
-     VALUES ($1,$2,$3,$4,$5,$6,'USD',$7,$8,$9,true) RETURNING id`,
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,true) RETURNING id`,
     [
       hostUserId, input.title.trim(), input.description ?? null, input.category ?? null,
       input.location ?? null, price, input.imageUrl ?? null, input.lat ?? null, input.lng ?? null,

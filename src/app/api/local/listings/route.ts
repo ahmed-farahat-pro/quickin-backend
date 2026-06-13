@@ -62,6 +62,7 @@ export async function POST(req: Request) {
       lat: b.lat,
       lng: b.lng,
       images: Array.isArray(b.images) ? b.images : undefined,
+      amenities: Array.isArray(b.amenities) ? b.amenities : undefined,
     })
     return NextResponse.json(listing, { status: 201, headers: CORS })
   } catch (err) {

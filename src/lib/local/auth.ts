@@ -136,6 +136,46 @@ export async function setUserRole(id: string, role: Role): Promise<User> {
   return rows[0] as User
 }
 
+export interface Profile {
+  id: string
+  email: string
+  full_name: string | null
+  role: string
+  provider: string
+  avatar_url: string | null
+  age: number | null
+  id_document: string | null
+  phone: string | null
+}
+
+/** The signed-in user's full profile (incl. phone) — only ever returned to themselves. */
+export async function getFullProfile(id: string): Promise<Profile | null> {
+  const { rows } = await pool.query(
+    `SELECT id, email, full_name, role, provider, avatar_url, age, id_document, phone
+       FROM users WHERE id = $1`,
+    [id]
+  )
+  return (rows[0] as Profile) ?? null
+}
+
+/** Update editable profile fields (name, age, id document, phone). COALESCE keeps
+ *  any field the caller omits (passes null). */
+export async function updateProfile(
+  id: string,
+  fields: { fullName?: string | null; age?: number | null; idDocument?: string | null; phone?: string | null }
+): Promise<Profile | null> {
+  await pool.query(
+    `UPDATE users SET
+        full_name   = COALESCE($2, full_name),
+        age         = COALESCE($3, age),
+        id_document = COALESCE($4, id_document),
+        phone       = COALESCE($5, phone)
+      WHERE id = $1`,
+    [id, fields.fullName ?? null, fields.age ?? null, fields.idDocument ?? null, fields.phone ?? null]
+  )
+  return getFullProfile(id)
+}
+
 /** Create an UNVERIFIED user awaiting email OTP verification. */
 export async function createPendingUser(args: {
   email: string

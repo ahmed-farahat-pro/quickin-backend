@@ -55,6 +55,7 @@ export interface Booking {
   image: string | null
   reservation_code: string | null
   host_id: string | null
+  amenities: string[]
 }
 
 const LISTING_COLS = `
@@ -62,6 +63,7 @@ const LISTING_COLS = `
   l.price_per_night::float8 AS price_per_night, l.currency,
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
+  COALESCE(l.amenities, '{}') AS amenities,
   COALESCE(
     (SELECT json_agg(json_build_object('url', li.url, 'order', li."order") ORDER BY li."order")
      FROM listing_images li WHERE li.listing_id = l.id), '[]'
@@ -199,6 +201,7 @@ export interface CreateListingInput {
   lat?: number
   lng?: number
   images?: string[]
+  amenities?: string[]
 }
 
 /** A host (or admin) creates a listing. Returns the full listing with images. */
@@ -211,14 +214,15 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   const { rows } = await pool.query(
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
-        bedrooms, beds, bathrooms, max_guests, property_type, lat, lng, listing_code, is_published)
-     VALUES ($1,$2,$3,$4,$5,$6,'USD',$7,$8,$9,$10,$11,$12,$13,$14,true)
+        bedrooms, beds, bathrooms, max_guests, property_type, lat, lng, listing_code, is_published, amenities)
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,true,$15)
      RETURNING id`,
     [
       hostUserId, input.title.trim(), input.description ?? null, input.location ?? null, input.country ?? null,
       price, Math.max(0, Math.floor(input.bedrooms ?? 1)), Math.max(0, Math.floor(input.beds ?? 1)),
       Math.max(0, Math.floor(input.bathrooms ?? 1)), Math.max(1, Math.floor(input.maxGuests ?? 2)),
       input.propertyType ?? 'Apartment', input.lat ?? null, input.lng ?? null, genReservationCode(),
+      input.amenities ?? [],
     ]
   )
   const id = rows[0].id as string
