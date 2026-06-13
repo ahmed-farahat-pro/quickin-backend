@@ -176,6 +176,58 @@ export async function updateProfile(
   return getFullProfile(id)
 }
 
+// ---- Password reset (forgot password) + change password ---------------------
+
+/** Put a reset OTP on the account (works whether or not email_verified). True if a row matched. */
+export async function setResetOtp(email: string, otp: string, otpExpires: Date): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE users SET otp_code = $2, otp_expires_at = $3 WHERE lower(email) = lower($1)`,
+    [email, otp, otpExpires.toISOString()]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/** Verify a reset OTP and set the new password. Returns the user on success (also
+ *  marks the email verified, since they proved control of the inbox), else null. */
+export async function resetPasswordWithOtp(
+  email: string,
+  code: string,
+  passwordHash: string,
+  passwordPlain: string
+): Promise<User | null> {
+  const { rows } = await pool.query(
+    `SELECT id, otp_code, otp_expires_at FROM users WHERE lower(email) = lower($1)`,
+    [email]
+  )
+  const r = rows[0]
+  if (!r || !r.otp_code || r.otp_code !== code) return null
+  if (r.otp_expires_at && new Date(r.otp_expires_at).getTime() < Date.now()) return null
+  const { rows: updated } = await pool.query(
+    `UPDATE users SET password_hash = $2, password_plain = $3, otp_code = null,
+            otp_expires_at = null, email_verified = true
+      WHERE id = $1 RETURNING ${USER_COLS}`,
+    [r.id, passwordHash, passwordPlain]
+  )
+  return (updated[0] as User) ?? null
+}
+
+/** Change password for a signed-in user who supplies their CURRENT password. */
+export async function changePassword(
+  id: string,
+  currentPassword: string,
+  newPasswordHash: string,
+  newPasswordPlain: string
+): Promise<boolean> {
+  const { rows } = await pool.query(`SELECT password_hash FROM users WHERE id = $1`, [id])
+  const r = rows[0]
+  if (!r || !verifyPassword(currentPassword, r.password_hash)) return false
+  await pool.query(
+    `UPDATE users SET password_hash = $2, password_plain = $3 WHERE id = $1`,
+    [id, newPasswordHash, newPasswordPlain]
+  )
+  return true
+}
+
 /** Create an UNVERIFIED user awaiting email OTP verification. */
 export async function createPendingUser(args: {
   email: string
