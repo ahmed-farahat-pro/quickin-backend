@@ -39,8 +39,14 @@ export async function createReview(args: {
   const b = rows[0]
   if (!b) throw new Error('Reservation not found')
   if (b.user_id !== userId) throw new Error('You can only review your own stay')
-  if (b.status !== 'confirmed') throw new Error('You can review a stay once it has been confirmed and completed')
-  if (new Date(b.check_out).getTime() > Date.now()) throw new Error('You can leave a review after your stay is over')
+  // "Stay done" = the host/admin marked it completed, OR it's a confirmed booking
+  // whose check-out date has passed.
+  if (b.status !== 'completed' && b.status !== 'confirmed') {
+    throw new Error('You can review a stay once it has been confirmed and completed')
+  }
+  if (b.status === 'confirmed' && new Date(b.check_out).getTime() > Date.now()) {
+    throw new Error('You can leave a review after your stay is over')
+  }
 
   const ins = await pool.query(
     `INSERT INTO reviews (listing_id, user_id, booking_id, rating, comment)
@@ -75,7 +81,8 @@ export async function getReviewableBookings(userId: string): Promise<
   const { rows } = await pool.query(
     `SELECT b.id AS booking_id, b.listing_id, l.title, b.check_out
        FROM bookings b JOIN listings l ON l.id = b.listing_id
-      WHERE b.user_id = $1 AND b.status = 'confirmed' AND b.check_out < now()
+      WHERE b.user_id = $1
+        AND (b.status = 'completed' OR (b.status = 'confirmed' AND b.check_out < now()))
         AND NOT EXISTS (SELECT 1 FROM reviews r WHERE r.booking_id = b.id)
       ORDER BY b.check_out DESC`,
     [userId]

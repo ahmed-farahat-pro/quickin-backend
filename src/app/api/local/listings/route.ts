@@ -35,6 +35,7 @@ export async function GET(req: Request) {
       q: sp.get('q') || undefined,
       location: sp.get('location') || undefined,
       region: sp.get('region') || undefined,
+      host: sp.get('host') || undefined,
       guests: num('guests'),
       checkIn: sp.get('checkIn') || undefined,
       checkOut: sp.get('checkOut') || undefined,

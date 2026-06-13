@@ -42,6 +42,8 @@ export interface Listing {
   max_guests: number | null
   property_type: string | null
   region: string | null
+  host_id: string | null
+  host_name: string | null
   is_guest_favorite: boolean
   listing_code: string | null
   lat: number | null
@@ -65,6 +67,8 @@ export interface SearchFilters {
   location?: string
   /** Exact region chip (one of REGIONS). */
   region?: string
+  /** All published listings by a given host (for "more from this host"). */
+  host?: string
   guests?: number
   checkIn?: string
   checkOut?: string
@@ -98,6 +102,7 @@ export const LISTING_COLS = `
   l.id, l.title, l.description, l.location, l.country,
   l.price_per_night::float8 AS price_per_night, l.currency,
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
+  l.host_id, (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
   COALESCE(l.amenities, '{}') AS amenities,
   COALESCE((SELECT round(avg(rv.rating)::numeric, 2) FROM reviews rv WHERE rv.listing_id = l.id), 0)::float8 AS rating,
@@ -126,6 +131,11 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
   if (filters.region && filters.region.trim()) {
     params.push(filters.region.trim())
     where.push(`l.region ILIKE $${params.length}`)
+  }
+  // A specific host's listings.
+  if (filters.host && /^[0-9a-fA-F-]{36}$/.test(filters.host)) {
+    params.push(filters.host)
+    where.push(`l.host_id = $${params.length}`)
   }
   if (filters.guests && Number.isFinite(filters.guests) && filters.guests > 0) {
     params.push(Math.floor(filters.guests))

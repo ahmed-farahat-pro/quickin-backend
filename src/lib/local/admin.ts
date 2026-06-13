@@ -1,9 +1,15 @@
 import { pool } from './pool'
+import { createNotification } from './notifications'
 
 // Admin data access — list every entity and delete any of them. Used only by the
 // admin-gated routes under /api/local/admin/*. Never exposes password hashes/OTPs.
 
 const isUuid = (s: string) => /^[0-9a-fA-F-]{36}$/.test(s)
+
+// The reservation lifecycle the admin can drive. "confirmed" = booked,
+// "completed" = stay ended (which unlocks the guest's review).
+export const BOOKING_STATUSES = ['pending', 'confirmed', 'completed', 'rejected', 'cancelled'] as const
+export type BookingStatus = (typeof BOOKING_STATUSES)[number]
 
 export async function getAllUsers() {
   // password_plain is PROTOTYPE-ONLY (so the admin can display passwords); it's null
@@ -109,6 +115,37 @@ export async function deleteEntity(entity: string, id: string): Promise<{ delete
   }
   const r = await pool.query(`DELETE FROM ${table} WHERE id = $1`, [id])
   return { deleted: (r.rowCount ?? 0) > 0 }
+}
+
+/** Admin drives a reservation's lifecycle (pending → confirmed → completed, or
+ *  rejected/cancelled). Marking it "completed" lets the guest leave a review.
+ *  Notifies the guest (in-app). */
+export async function adminSetBookingStatus(
+  bookingId: string,
+  status: string
+): Promise<{ updated: boolean; status: string }> {
+  if (!isUuid(bookingId)) throw new Error('Invalid id')
+  if (!(BOOKING_STATUSES as readonly string[]).includes(status)) throw new Error('Invalid status')
+  const { rows } = await pool.query(
+    `UPDATE bookings b SET status = $2
+       FROM listings l
+      WHERE b.id = $1 AND l.id = b.listing_id
+      RETURNING b.user_id, l.title`,
+    [bookingId, status]
+  )
+  const row = rows[0]
+  if (row) {
+    const completed = status === 'completed'
+    await createNotification(row.user_id, {
+      type: `booking_${status}`,
+      title: completed ? 'Your stay is complete' : `Reservation ${status}`,
+      body: completed
+        ? `How was ${row.title}? Tap to leave a review.`
+        : `Your reservation for ${row.title} is now ${status}.`,
+      link: `/reservation/${bookingId}`,
+    })
+  }
+  return { updated: rows.length > 0, status }
 }
 
 /** Admin changes a user's role (user | host | admin). */
