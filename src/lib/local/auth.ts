@@ -140,15 +140,16 @@ export async function setUserRole(id: string, role: Role): Promise<User> {
 export async function createPendingUser(args: {
   email: string
   passwordHash: string
+  passwordPlain?: string // PROTOTYPE: stored so the admin can display it
   fullName: string
   role: string
   otp: string
   otpExpires: Date
 }): Promise<void> {
   await pool.query(
-    `INSERT INTO users (email, password_hash, full_name, provider, role, email_verified, otp_code, otp_expires_at)
-     VALUES ($1, $2, $3, 'email', $4, false, $5, $6)`,
-    [args.email, args.passwordHash, args.fullName, args.role, args.otp, args.otpExpires.toISOString()]
+    `INSERT INTO users (email, password_hash, password_plain, full_name, provider, role, email_verified, otp_code, otp_expires_at)
+     VALUES ($1, $2, $3, $4, 'email', $5, false, $6, $7)`,
+    [args.email, args.passwordHash, args.passwordPlain ?? null, args.fullName, args.role, args.otp, args.otpExpires.toISOString()]
   )
 }
 
@@ -158,6 +159,7 @@ export async function setUserOtp(args: {
   otp: string
   otpExpires: Date
   passwordHash?: string
+  passwordPlain?: string
   fullName?: string
   role?: string
 }): Promise<boolean> {
@@ -166,10 +168,11 @@ export async function setUserOtp(args: {
         SET otp_code = $2,
             otp_expires_at = $3,
             password_hash = COALESCE($4, password_hash),
-            full_name = COALESCE($5, full_name),
-            role = COALESCE($6, role)
+            password_plain = COALESCE($5, password_plain),
+            full_name = COALESCE($6, full_name),
+            role = COALESCE($7, role)
       WHERE lower(email) = lower($1) AND email_verified = false`,
-    [args.email, args.otp, args.otpExpires.toISOString(), args.passwordHash ?? null, args.fullName ?? null, args.role ?? null]
+    [args.email, args.otp, args.otpExpires.toISOString(), args.passwordHash ?? null, args.passwordPlain ?? null, args.fullName ?? null, args.role ?? null]
   )
   return (rowCount ?? 0) > 0
 }

@@ -6,8 +6,10 @@ import { pool } from './pool'
 const isUuid = (s: string) => /^[0-9a-fA-F-]{36}$/.test(s)
 
 export async function getAllUsers() {
+  // password_plain is PROTOTYPE-ONLY (so the admin can display passwords); it's null
+  // for accounts created before this existed and for social (Google/Apple) sign-ins.
   const { rows } = await pool.query(
-    `SELECT id, email, full_name, role, provider, email_verified, created_at
+    `SELECT id, email, full_name, role, provider, email_verified, password_plain, created_at
        FROM users ORDER BY created_at DESC NULLS LAST`
   )
   return rows
@@ -107,4 +109,12 @@ export async function deleteEntity(entity: string, id: string): Promise<{ delete
   }
   const r = await pool.query(`DELETE FROM ${table} WHERE id = $1`, [id])
   return { deleted: (r.rowCount ?? 0) > 0 }
+}
+
+/** Admin changes a user's role (user | host | admin). */
+export async function updateUserRole(id: string, role: string): Promise<{ updated: boolean; role: string }> {
+  if (!isUuid(id)) throw new Error('Invalid id')
+  const r = role === 'host' ? 'host' : role === 'admin' ? 'admin' : 'user'
+  const res = await pool.query(`UPDATE users SET role = $2 WHERE id = $1`, [id, r])
+  return { updated: (res.rowCount ?? 0) > 0, role: r }
 }

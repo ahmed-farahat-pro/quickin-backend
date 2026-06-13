@@ -54,6 +54,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS role           text NOT NULL DEFAULT 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified boolean NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code       text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at timestamptz;
+-- PROTOTYPE-ONLY: plaintext password so the admin panel can display it. NEVER do this
+-- in production — passwords should only ever be stored hashed (password_hash).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_plain text;
 
 CREATE TABLE IF NOT EXISTS bookings (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),

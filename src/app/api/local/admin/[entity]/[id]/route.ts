@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { deleteEntity } from '@/lib/local/admin'
+import { deleteEntity, updateUserRole } from '@/lib/local/admin'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // DELETE /api/local/admin/:entity/:id — admin removes any row.
@@ -16,10 +16,31 @@ export async function OPTIONS() {
     status: 204,
     headers: {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'DELETE,OPTIONS',
+      'Access-Control-Allow-Methods': 'DELETE,PATCH,OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type,Authorization',
     },
   })
+}
+
+// Change a user's role: PATCH /api/local/admin/users/:id { role: 'user'|'host'|'admin' }
+export async function PATCH(req: Request, ctx: { params: Promise<{ entity: string; id: string }> }) {
+  try {
+    const { entity, id } = await ctx.params
+    const user = await getUserFromRequest(req)
+    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
+    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    if (entity !== 'users') return NextResponse.json({ error: 'Only users can be updated' }, { status: 400, headers: CORS })
+    const body = await req.json().catch(() => ({}))
+    const role = String(body.role ?? '')
+    if (!['user', 'host', 'admin'].includes(role)) {
+      return NextResponse.json({ error: 'role must be user, host, or admin' }, { status: 400, headers: CORS })
+    }
+    const result = await updateUserRole(id, role)
+    return NextResponse.json(result, { headers: CORS })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return NextResponse.json({ error: msg }, { status: /Invalid id/.test(msg) ? 400 : 500, headers: CORS })
+  }
 }
 
 export async function DELETE(req: Request, ctx: { params: Promise<{ entity: string; id: string }> }) {

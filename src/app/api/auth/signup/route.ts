@@ -76,9 +76,9 @@ export async function POST(req: Request) {
 
     if (existing) {
       // Unverified account re-signing up → refresh its OTP + details.
-      await setUserOtp({ email: cleanEmail, otp, otpExpires, passwordHash: hashPassword(String(password)), fullName, role: chosenRole })
+      await setUserOtp({ email: cleanEmail, otp, otpExpires, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole })
     } else {
-      await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), fullName, role: chosenRole, otp, otpExpires })
+      await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole, otp, otpExpires })
     }
 
     await sendOtpEmail(cleanEmail, otp)
