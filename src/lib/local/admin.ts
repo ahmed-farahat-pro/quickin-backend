@@ -24,6 +24,9 @@ export async function getAllUsers() {
 export async function getAllListings() {
   const { rows } = await pool.query(
     `SELECT l.id, l.title, l.location, l.country, l.price_per_night::float8 AS price_per_night,
+            l.is_published, l.region,
+            COALESCE((SELECT round(avg(rv.rating)::numeric,2) FROM reviews rv WHERE rv.listing_id = l.id),0)::float8 AS rating,
+            COALESCE((SELECT count(*) FROM reviews rv WHERE rv.listing_id = l.id),0)::int AS review_count,
             l.host_id, u.email AS host_email, u.full_name AS host_name, l.created_at
        FROM listings l LEFT JOIN users u ON u.id = l.host_id
       ORDER BY l.created_at DESC NULLS LAST`
@@ -146,6 +149,17 @@ export async function adminSetBookingStatus(
     })
   }
   return { updated: rows.length > 0, status }
+}
+
+/** Admin activates / deactivates a listing (its published state). An inactive
+ *  listing disappears from search/explore but isn't deleted. */
+export async function adminSetListingPublished(
+  id: string,
+  isPublished: boolean
+): Promise<{ updated: boolean; is_published: boolean }> {
+  if (!isUuid(id)) throw new Error('Invalid id')
+  const res = await pool.query(`UPDATE listings SET is_published = $2 WHERE id = $1`, [id, isPublished])
+  return { updated: (res.rowCount ?? 0) > 0, is_published: isPublished }
 }
 
 /** Admin changes a user's role (user | host | admin). */

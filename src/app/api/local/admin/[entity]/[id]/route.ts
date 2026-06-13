@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { deleteEntity, updateUserRole, adminSetBookingStatus } from '@/lib/local/admin'
+import { deleteEntity, updateUserRole, adminSetBookingStatus, adminSetListingPublished } from '@/lib/local/admin'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // DELETE /api/local/admin/:entity/:id — admin removes any row.
@@ -35,8 +35,14 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ entity: strin
       const result = await adminSetBookingStatus(id, String(body.status ?? ''))
       return NextResponse.json(result, { headers: CORS })
     }
+    // Listing active/inactive: PATCH /api/local/admin/listings/:id { is_published }
+    if (entity === 'listings') {
+      const isPublished = body.is_published ?? body.active
+      const result = await adminSetListingPublished(id, Boolean(isPublished))
+      return NextResponse.json(result, { headers: CORS })
+    }
     if (entity !== 'users') {
-      return NextResponse.json({ error: 'Only users and bookings can be updated' }, { status: 400, headers: CORS })
+      return NextResponse.json({ error: 'Only users, listings and bookings can be updated' }, { status: 400, headers: CORS })
     }
     const role = String(body.role ?? '')
     if (!['user', 'host', 'admin'].includes(role)) {
