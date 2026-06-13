@@ -25,12 +25,24 @@ export async function OPTIONS() {
 
 export async function GET(req: Request) {
   try {
-    const url = new URL(req.url)
+    const sp = new URL(req.url).searchParams
+    const num = (k: string) => (sp.get(k) ? Number(sp.get(k)) : undefined)
+    const amenities = sp.get('amenities')
+      ? sp.get('amenities')!.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined
     const listings = await getListings({
-      location: url.searchParams.get('location') || undefined,
-      guests: url.searchParams.get('guests') ? Number(url.searchParams.get('guests')) : undefined,
-      checkIn: url.searchParams.get('checkIn') || undefined,
-      checkOut: url.searchParams.get('checkOut') || undefined,
+      // `q` is the new free-text param; `location` is kept for back-compat.
+      q: sp.get('q') || undefined,
+      location: sp.get('location') || undefined,
+      region: sp.get('region') || undefined,
+      guests: num('guests'),
+      checkIn: sp.get('checkIn') || undefined,
+      checkOut: sp.get('checkOut') || undefined,
+      minPrice: num('minPrice'),
+      maxPrice: num('maxPrice'),
+      propertyType: sp.get('propertyType') || undefined,
+      amenities,
+      sort: (sp.get('sort') as 'recommended' | 'price_asc' | 'price_desc' | 'newest' | null) || undefined,
     })
     return NextResponse.json(listings, { headers: CORS })
   } catch (err) {
@@ -59,6 +71,7 @@ export async function POST(req: Request) {
       bathrooms: b.bathrooms,
       maxGuests: b.max_guests ?? b.maxGuests,
       propertyType: b.property_type ?? b.propertyType,
+      region: b.region,
       lat: b.lat,
       lng: b.lng,
       images: Array.isArray(b.images) ? b.images : undefined,

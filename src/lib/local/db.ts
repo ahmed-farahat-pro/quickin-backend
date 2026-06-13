@@ -26,6 +26,7 @@ export interface Listing {
   bathrooms: number | null
   max_guests: number | null
   property_type: string | null
+  region: string | null
   is_guest_favorite: boolean
   listing_code: string | null
   lat: number | null
@@ -33,11 +34,29 @@ export interface Listing {
   listing_images: ListingImage[]
 }
 
+// The coarse, host-picked areas QuickIn covers. The host chooses one of these
+// first; search can filter by it (chips) and it's matched by free-text too.
+export const REGIONS = ['North Coast', 'Ain Sokhna', 'El Gouna', 'Cairo'] as const
+export type Region = (typeof REGIONS)[number]
+
+export type ListingSort = 'recommended' | 'price_asc' | 'price_desc' | 'newest'
+
 export interface SearchFilters {
+  /** Free text — matched across title, location, region and country. */
+  q?: string
+  /** Back-compat alias for q (the explore bar still sends `location`). */
   location?: string
+  /** Exact region chip (one of REGIONS). */
+  region?: string
   guests?: number
   checkIn?: string
   checkOut?: string
+  minPrice?: number
+  maxPrice?: number
+  propertyType?: string
+  /** Listings must have ALL of these amenities. */
+  amenities?: string[]
+  sort?: ListingSort
 }
 
 export interface Booking {
@@ -61,7 +80,7 @@ export interface Booking {
 const LISTING_COLS = `
   l.id, l.title, l.description, l.location, l.country,
   l.price_per_night::float8 AS price_per_night, l.currency,
-  l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type,
+  l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
   COALESCE(l.amenities, '{}') AS amenities,
   COALESCE(
@@ -74,13 +93,41 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
   const where: string[] = ['l.is_published = true']
   const params: unknown[] = []
 
-  if (filters.location && filters.location.trim()) {
-    params.push('%' + filters.location.trim() + '%')
-    where.push(`l.location ILIKE $${params.length}`)
+  // Free text: match the term across title, location, region and country, so
+  // "north coast" surfaces a whole area AND a property name still finds it.
+  const q = (filters.q ?? filters.location ?? '').trim()
+  if (q) {
+    params.push('%' + q + '%')
+    const p = params.length
+    where.push(
+      `(l.title ILIKE $${p} OR l.location ILIKE $${p} OR l.region ILIKE $${p} OR l.country ILIKE $${p})`
+    )
+  }
+  // Exact region chip.
+  if (filters.region && filters.region.trim()) {
+    params.push(filters.region.trim())
+    where.push(`l.region ILIKE $${params.length}`)
   }
   if (filters.guests && Number.isFinite(filters.guests) && filters.guests > 0) {
     params.push(Math.floor(filters.guests))
     where.push(`COALESCE(l.max_guests, 0) >= $${params.length}`)
+  }
+  if (Number.isFinite(filters.minPrice as number) && (filters.minPrice as number) >= 0) {
+    params.push(filters.minPrice)
+    where.push(`l.price_per_night >= $${params.length}`)
+  }
+  if (Number.isFinite(filters.maxPrice as number) && (filters.maxPrice as number) > 0) {
+    params.push(filters.maxPrice)
+    where.push(`l.price_per_night <= $${params.length}`)
+  }
+  if (filters.propertyType && filters.propertyType.trim()) {
+    params.push(filters.propertyType.trim())
+    where.push(`l.property_type ILIKE $${params.length}`)
+  }
+  // Has ALL the requested amenities (text[] contains).
+  if (Array.isArray(filters.amenities) && filters.amenities.length > 0) {
+    params.push(filters.amenities)
+    where.push(`COALESCE(l.amenities, '{}') @> $${params.length}::text[]`)
   }
   if (filters.checkIn && filters.checkOut && isDate(filters.checkIn) && isDate(filters.checkOut)) {
     params.push(filters.checkOut)
@@ -94,13 +141,34 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
     )`)
   }
 
+  const ORDER: Record<string, string> = {
+    price_asc: 'l.price_per_night ASC, l.created_at DESC',
+    price_desc: 'l.price_per_night DESC, l.created_at DESC',
+    newest: 'l.created_at DESC',
+    recommended: 'l.is_guest_favorite DESC, l.created_at DESC',
+  }
+  const orderBy = ORDER[filters.sort ?? 'recommended'] ?? ORDER.recommended
+
   const { rows } = await pool.query(
     `SELECT ${LISTING_COLS} FROM listings l
      WHERE ${where.join(' AND ')}
-     ORDER BY l.is_guest_favorite DESC, l.created_at DESC`,
+     ORDER BY ${orderBy}`,
     params
   )
   return rows as Listing[]
+}
+
+/** Region facet counts for published listings — powers the search chips. Always
+ *  returns the canonical REGIONS (count 0 when none) so the UI is stable. */
+export async function getRegionCounts(): Promise<{ region: string; count: number }[]> {
+  const { rows } = await pool.query(
+    `SELECT region, count(*)::int AS count
+       FROM listings
+      WHERE is_published = true AND region IS NOT NULL
+      GROUP BY region`
+  )
+  const map = new Map(rows.map((r) => [String(r.region), Number(r.count)]))
+  return REGIONS.map((region) => ({ region, count: map.get(region) ?? 0 }))
 }
 
 export async function getListingById(id: string): Promise<Listing | null> {
@@ -198,6 +266,7 @@ export interface CreateListingInput {
   bathrooms?: number
   maxGuests?: number
   propertyType?: string
+  region?: string
   lat?: number
   lng?: number
   images?: string[]
@@ -214,14 +283,14 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   const { rows } = await pool.query(
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
-        bedrooms, beds, bathrooms, max_guests, property_type, lat, lng, listing_code, is_published, amenities)
-     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,true,$15)
+        bedrooms, beds, bathrooms, max_guests, property_type, region, lat, lng, listing_code, is_published, amenities)
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,true,$16)
      RETURNING id`,
     [
       hostUserId, input.title.trim(), input.description ?? null, input.location ?? null, input.country ?? null,
       price, Math.max(0, Math.floor(input.bedrooms ?? 1)), Math.max(0, Math.floor(input.beds ?? 1)),
       Math.max(0, Math.floor(input.bathrooms ?? 1)), Math.max(1, Math.floor(input.maxGuests ?? 2)),
-      input.propertyType ?? 'Apartment', input.lat ?? null, input.lng ?? null, genReservationCode(),
+      input.propertyType ?? 'Apartment', input.region ?? null, input.lat ?? null, input.lng ?? null, genReservationCode(),
       input.amenities ?? [],
     ]
   )
