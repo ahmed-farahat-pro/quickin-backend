@@ -73,14 +73,26 @@ export async function getAllServiceRequests() {
   return rows
 }
 
+/** Registered FCM/APNs device push tokens, with the owning account. */
+export async function getAllDeviceTokens() {
+  const { rows } = await pool.query(
+    `SELECT d.id, d.token, d.platform, d.created_at,
+            u.email AS user_email, u.full_name AS user_name, u.role AS user_role
+       FROM device_tokens d LEFT JOIN users u ON u.id = d.user_id
+      ORDER BY d.created_at DESC NULLS LAST`
+  )
+  return rows
+}
+
 /** Everything, in one shot, for the admin dashboard. */
 export async function getAdminOverview() {
-  const [users, listings, bookings, services, serviceRequests] = await Promise.all([
+  const [users, listings, bookings, services, serviceRequests, deviceTokens] = await Promise.all([
     getAllUsers(),
     getAllListings(),
     getAllBookings(),
     getAllServices(),
     getAllServiceRequests(),
+    getAllDeviceTokens(),
   ])
   return {
     users,
@@ -88,12 +100,14 @@ export async function getAdminOverview() {
     bookings,
     services,
     serviceRequests,
+    deviceTokens,
     counts: {
       users: users.length,
       listings: listings.length,
       bookings: bookings.length,
       services: services.length,
       serviceRequests: serviceRequests.length,
+      deviceTokens: deviceTokens.length,
     },
   }
 }
@@ -105,6 +119,7 @@ const TABLES: Record<string, string> = {
   bookings: 'bookings',
   services: 'services',
   'service-requests': 'service_requests',
+  'device-tokens': 'device_tokens',
 }
 
 /** Delete any row by entity slug + id. Deleting a user also removes the listings
