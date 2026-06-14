@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, verifyPassword, signToken, setUserRole } from '@/lib/local/auth'
+import { getUserRowByEmail, verifyPassword, signToken } from '@/lib/local/auth'
 
 export const dynamic = 'force-dynamic'
 
@@ -58,15 +58,26 @@ export async function POST(req: Request) {
         { status: 403, headers: CORS }
       )
     }
-    // Two roles per email: at sign-in you choose to enter as a guest or a host.
-    //  - Pick "host" → if this account isn't a host yet, it GAINS the host role now
-    //    (so one email can hold both); admins are left as admins.
+    // Role at sign-in. Hosting is NOT granted here — becoming a host requires the
+    // dedicated host registration (its own OTP). So:
+    //  - Pick "host" → only allowed if the account already holds host (or admin);
+    //    otherwise tell them to register as a host. No silent upgrade.
     //  - Pick "user" (guest) → act as a guest this session even if the account can host.
     //  - No choice → use the account's stored role.
     const desired = role === 'host' ? 'host' : role === 'user' ? 'user' : null
     let activeRole: string = row.role
-    if (desired === 'host' && row.role !== 'admin') {
-      activeRole = row.role === 'host' ? 'host' : (await setUserRole(row.id, 'host')).role
+    if (desired === 'host') {
+      if (row.role !== 'host' && row.role !== 'admin') {
+        return NextResponse.json(
+          {
+            error: 'This account is not registered as a host yet. Register as a host to add hosting.',
+            needsHostRegistration: true,
+            email: row.email,
+          },
+          { status: 403, headers: CORS }
+        )
+      }
+      activeRole = row.role
     } else if (desired === 'user' && row.role !== 'admin') {
       activeRole = 'user'
     }
