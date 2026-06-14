@@ -2,8 +2,8 @@ import { NextResponse } from 'next/server'
 import { registerDeviceToken } from '@/lib/local/notifications'
 import { getUserFromRequest } from '@/lib/local/auth'
 
-// POST /api/local/notifications/register-device { token, platform } → store an FCM
-// device token for the signed-in user (used later to deliver push via Firebase).
+// Alias of /register-device — the Android app calls POST /api/local/notifications/device
+// { fcm_token, token, platform }. Stores the device's FCM token for the signed-in user.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -26,13 +26,12 @@ async function handle(req: Request) {
   const user = await getUserFromRequest(req)
   if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
   const b = await req.json().catch(() => ({}))
-  const tok = b.token ?? b.fcm_token ?? b.fcmToken ?? b.device_token
+  const tok = b.fcm_token ?? b.token ?? b.fcmToken ?? b.device_token
   if (!tok) return NextResponse.json({ error: 'token is required' }, { status: 400, headers: CORS })
   await registerDeviceToken(user.id, String(tok), b.platform)
   return NextResponse.json({ ok: true }, { headers: CORS })
 }
 
-// Accept POST and PATCH (clients differ) and several token field names.
 export async function POST(req: Request) {
   try {
     return await handle(req)
