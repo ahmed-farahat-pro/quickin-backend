@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, setUserOtp, generateOtp, OTP_TTL_MS } from '@/lib/local/auth'
+import { getUserRowByEmail, getUserRowByEmailRole, setUserOtp, generateOtp, OTP_TTL_MS } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
 
 export const dynamic = 'force-dynamic'
@@ -24,12 +24,16 @@ export async function OPTIONS() {
 // POST /api/auth/resend-otp — { email } → re-issues + re-sends the OTP for a pending account.
 export async function POST(req: Request) {
   try {
-    const { email } = await req.json()
+    const { email, role } = await req.json()
     if (!email) {
       return NextResponse.json({ error: 'Email is required' }, { status: 400, headers: CORS })
     }
     const cleanEmail = String(email).trim()
-    const existing = await getUserRowByEmail(cleanEmail)
+    // Scope to the (email, role) account being verified when role is provided.
+    const existing =
+      role === 'user' || role === 'host'
+        ? await getUserRowByEmailRole(cleanEmail, role)
+        : await getUserRowByEmail(cleanEmail)
     if (!existing) {
       return NextResponse.json({ error: 'No pending account for this email' }, { status: 404, headers: CORS })
     }
@@ -38,7 +42,7 @@ export async function POST(req: Request) {
     }
     const otp = generateOtp()
     const otpExpires = new Date(Date.now() + OTP_TTL_MS)
-    await setUserOtp({ email: cleanEmail, otp, otpExpires })
+    await setUserOtp({ email: cleanEmail, otp, otpExpires, role: existing.role })
     await sendOtpEmail(cleanEmail, otp)
     return NextResponse.json({ pending: true, email: cleanEmail, ...(smtpConfigured ? {} : { devCode: otp }) }, { headers: CORS })
   } catch (err) {

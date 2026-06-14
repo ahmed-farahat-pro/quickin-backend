@@ -81,7 +81,9 @@ export async function getUserFromRequest(
   if (claims.role === 'admin' && claims.sub === 'admin') {
     return { id: 'admin', email: claims.email, role: 'admin' }
   }
-  const row = await getUserRowByEmail(claims.email)
+  // Resolve by id (sub) — email is no longer unique now that one email can have
+  // a separate guest AND host account.
+  const row = await getUserById(claims.sub)
   return row ? { id: row.id, email: row.email, role: row.role } : null
 }
 
@@ -102,8 +104,31 @@ export interface UserRow {
 export async function getUserRowByEmail(email: string): Promise<UserRow | null> {
   const { rows } = await pool.query(
     `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified
-     FROM users WHERE lower(email) = lower($1)`,
+     FROM users WHERE lower(email) = lower($1) ORDER BY (role = 'user') DESC LIMIT 1`,
     [email]
+  )
+  return rows[0] ?? null
+}
+
+/** Look up the account for a specific (email, role). One email can have a separate
+ *  guest and host account, so role is required to disambiguate. */
+export async function getUserRowByEmailRole(email: string, role: string): Promise<UserRow | null> {
+  const r = role === 'host' ? 'host' : 'user'
+  const { rows } = await pool.query(
+    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified
+     FROM users WHERE lower(email) = lower($1) AND role = $2`,
+    [email, r]
+  )
+  return rows[0] ?? null
+}
+
+/** Resolve a user by id (the token's sub) — the unambiguous key. */
+export async function getUserById(id: string): Promise<UserRow | null> {
+  if (!/^[0-9a-fA-F-]{36}$/.test(id)) return null
+  const { rows } = await pool.query(
+    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified
+     FROM users WHERE id = $1`,
+    [id]
   )
   return rows[0] ?? null
 }
@@ -178,11 +203,13 @@ export async function updateProfile(
 
 // ---- Password reset (forgot password) + change password ---------------------
 
-/** Put a reset OTP on the account (works whether or not email_verified). True if a row matched. */
-export async function setResetOtp(email: string, otp: string, otpExpires: Date): Promise<boolean> {
+/** Put a reset OTP on the (email, role) account. True if a row matched. */
+export async function setResetOtp(email: string, otp: string, otpExpires: Date, role?: string): Promise<boolean> {
+  const useRole = role === 'user' || role === 'host'
   const { rowCount } = await pool.query(
-    `UPDATE users SET otp_code = $2, otp_expires_at = $3 WHERE lower(email) = lower($1)`,
-    [email, otp, otpExpires.toISOString()]
+    `UPDATE users SET otp_code = $2, otp_expires_at = $3
+      WHERE lower(email) = lower($1) ${useRole ? 'AND role = $4' : ''}`,
+    useRole ? [email, otp, otpExpires.toISOString(), role] : [email, otp, otpExpires.toISOString()]
   )
   return (rowCount ?? 0) > 0
 }
@@ -193,11 +220,15 @@ export async function resetPasswordWithOtp(
   email: string,
   code: string,
   passwordHash: string,
-  passwordPlain: string
+  passwordPlain: string,
+  role?: string
 ): Promise<User | null> {
+  const useRole = role === 'user' || role === 'host'
   const { rows } = await pool.query(
-    `SELECT id, otp_code, otp_expires_at FROM users WHERE lower(email) = lower($1)`,
-    [email]
+    `SELECT id, otp_code, otp_expires_at FROM users
+      WHERE lower(email) = lower($1) ${useRole ? 'AND role = $2' : ''}
+      ORDER BY (otp_code = ${useRole ? '$3' : '$2'}) DESC LIMIT 1`,
+    useRole ? [email, role, code] : [email, code]
   )
   const r = rows[0]
   if (!r || !r.otp_code || r.otp_code !== code) return null
@@ -263,7 +294,8 @@ export async function setUserOtp(args: {
             password_plain = COALESCE($5, password_plain),
             full_name = COALESCE($6, full_name),
             role = COALESCE($7, role)
-      WHERE lower(email) = lower($1) AND email_verified = false`,
+      WHERE lower(email) = lower($1) AND email_verified = false
+        AND ($7::text IS NULL OR role = $7)`,
     [args.email, args.otp, args.otpExpires.toISOString(), args.passwordHash ?? null, args.passwordPlain ?? null, args.fullName ?? null, args.role ?? null]
   )
   return (rowCount ?? 0) > 0
@@ -294,43 +326,31 @@ export async function setPendingRoleOtp(args: {
   return (rowCount ?? 0) > 0
 }
 
-/** Validate an OTP; on success activate the account (and apply any pending role) and return the user. */
-export async function verifyUserOtp(email: string, code: string): Promise<User | null> {
+/** Validate an OTP and activate that (email, role) account. When an email has both
+ *  a guest and a host account, `role` scopes it; otherwise the row whose OTP matches
+ *  the submitted code is chosen. */
+export async function verifyUserOtp(email: string, code: string, role?: string): Promise<User | null> {
+  const useRole = role === 'user' || role === 'host'
   const { rows } = await pool.query(
-    `SELECT id, otp_code, otp_expires_at, email_verified, pending_role FROM users WHERE lower(email) = lower($1)`,
-    [email]
+    `SELECT id, otp_code, otp_expires_at, email_verified FROM users
+      WHERE lower(email) = lower($1) ${useRole ? 'AND role = $3' : ''}
+      ORDER BY (otp_code = $2) DESC, email_verified ASC
+      LIMIT 1`,
+    useRole ? [email, code, role] : [email, code]
   )
   const r = rows[0]
   if (!r) return null
-
+  if (r.email_verified) {
+    const u = await pool.query(`SELECT ${USER_COLS} FROM users WHERE id = $1`, [r.id])
+    return (u.rows[0] as User) ?? null
+  }
   const otpOk =
     !!r.otp_code &&
     r.otp_code === code &&
     !(r.otp_expires_at && new Date(r.otp_expires_at).getTime() < Date.now())
-
-  if (r.email_verified) {
-    // A verified account with a pending role upgrade (guest -> host) must present
-    // a valid OTP to apply it.
-    if (r.pending_role) {
-      if (!otpOk) return null
-      const { rows: up } = await pool.query(
-        `UPDATE users SET role = $2, pending_role = null, otp_code = null, otp_expires_at = null
-          WHERE id = $1 RETURNING ${USER_COLS}`,
-        [r.id, r.pending_role]
-      )
-      return (up[0] as User) ?? null
-    }
-    // Already verified, nothing pending — idempotent success.
-    const u = await pool.query(`SELECT ${USER_COLS} FROM users WHERE id = $1`, [r.id])
-    return (u.rows[0] as User) ?? null
-  }
-
-  // First-time activation. Apply pending_role if one was stashed at signup.
   if (!otpOk) return null
   const { rows: updated } = await pool.query(
-    `UPDATE users SET email_verified = true,
-            role = COALESCE(pending_role, role),
-            pending_role = null, otp_code = null, otp_expires_at = null
+    `UPDATE users SET email_verified = true, otp_code = null, otp_expires_at = null
       WHERE id = $1 RETURNING ${USER_COLS}`,
     [r.id]
   )
@@ -345,15 +365,25 @@ export async function upsertSocialUser(args: {
   avatarUrl?: string
   role?: string
 }): Promise<User> {
+  const role = args.role === 'host' ? 'host' : 'user'
+  // One (email, role) account. Update the matching role's row if it exists, else insert.
+  const existing = await pool.query(
+    `SELECT id FROM users WHERE lower(email) = lower($1) AND role = $2`,
+    [args.email, role]
+  )
+  if (existing.rows[0]) {
+    const { rows } = await pool.query(
+      `UPDATE users SET full_name = COALESCE(full_name, $2),
+              avatar_url = COALESCE($3, avatar_url), email_verified = true
+        WHERE id = $1 RETURNING ${USER_COLS}`,
+      [existing.rows[0].id, args.fullName, args.avatarUrl || null]
+    )
+    return rows[0] as User
+  }
   const { rows } = await pool.query(
     `INSERT INTO users (email, full_name, provider, avatar_url, role, email_verified)
-     VALUES ($1, $2, $3, $4, $5, true)
-     ON CONFLICT (email) DO UPDATE
-       SET full_name = COALESCE(users.full_name, EXCLUDED.full_name),
-           avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-           email_verified = true
-     RETURNING ${USER_COLS}`,
-    [args.email, args.fullName, args.provider, args.avatarUrl || null, args.role === 'host' ? 'host' : 'user']
+     VALUES ($1, $2, $3, $4, $5, true) RETURNING ${USER_COLS}`,
+    [args.email, args.fullName, args.provider, args.avatarUrl || null, role]
   )
   if (!rows[0]) throw new Error('Failed to upsert social user')
   return rows[0] as User

@@ -23,7 +23,7 @@ export async function OPTIONS() {
 
 export async function POST(req: Request) {
   try {
-    const { email, code, password } = await req.json()
+    const { email, code, password, role } = await req.json()
     if (!email || !code || !password) {
       return NextResponse.json({ error: 'Email, code and new password are required' }, { status: 400, headers: CORS })
     }
@@ -34,7 +34,8 @@ export async function POST(req: Request) {
       String(email).trim(),
       String(code).trim(),
       hashPassword(String(password)),
-      String(password)
+      String(password),
+      typeof role === 'string' ? role : undefined
     )
     if (!user) return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400, headers: CORS })
     const token = signToken({ sub: user.id, email: user.email, role: user.role })

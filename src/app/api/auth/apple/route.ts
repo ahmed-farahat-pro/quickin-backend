@@ -51,6 +51,7 @@ export async function POST(req: Request) {
       email: String(claims.email),
       fullName,
       provider: 'apple',
+      role: body.role,
     })
     const token = signToken({ sub: user.id, email: user.email, role: user.role })
     const res = NextResponse.json({ token, user }, { headers: CORS })

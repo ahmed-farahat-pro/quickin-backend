@@ -24,11 +24,12 @@ export async function OPTIONS() {
 // and returns { token, user } (also sets the qk_token cookie for web).
 export async function POST(req: Request) {
   try {
-    const { email, code } = await req.json()
+    const { email, code, role } = await req.json()
     if (!email || !code) {
       return NextResponse.json({ error: 'Email and code are required' }, { status: 400, headers: CORS })
     }
-    const user = await verifyUserOtp(String(email).trim(), String(code).trim())
+    // role scopes to the correct (email, role) account when an email has both.
+    const user = await verifyUserOtp(String(email).trim(), String(code).trim(), typeof role === 'string' ? role : undefined)
     if (!user) {
       return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400, headers: CORS })
     }

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, setResetOtp, generateOtp, OTP_TTL_MS } from '@/lib/local/auth'
+import { getUserRowByEmail, getUserRowByEmailRole, setResetOtp, generateOtp, OTP_TTL_MS } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
 
 // POST /api/auth/forgot-password { email } → emails a 6-digit reset code.
@@ -25,13 +25,16 @@ export async function OPTIONS() {
 
 export async function POST(req: Request) {
   try {
-    const { email } = await req.json()
+    const { email, role } = await req.json()
     if (!email) return NextResponse.json({ error: 'Email is required' }, { status: 400, headers: CORS })
     const clean = String(email).trim()
-    const existing = await getUserRowByEmail(clean)
+    const existing =
+      role === 'user' || role === 'host'
+        ? await getUserRowByEmailRole(clean, role)
+        : await getUserRowByEmail(clean)
     if (existing) {
       const otp = generateOtp()
-      await setResetOtp(clean, otp, new Date(Date.now() + OTP_TTL_MS))
+      await setResetOtp(clean, otp, new Date(Date.now() + OTP_TTL_MS), existing.role)
       await sendOtpEmail(clean, otp)
       return NextResponse.json({ sent: true, ...(smtpConfigured ? {} : { devCode: otp }) }, { headers: CORS })
     }

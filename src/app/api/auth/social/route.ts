@@ -35,7 +35,7 @@ export async function POST(req: Request) {
       (provider === 'apple' ? 'Nora Salem' : 'Omar Khaled')
     const avatarUrl: string | undefined = body.avatar_url
 
-    const user = await upsertSocialUser({ email, fullName, provider, avatarUrl })
+    const user = await upsertSocialUser({ email, fullName, provider, avatarUrl, role: body.role })
     const token = signToken({ sub: user.id, email: user.email })
     const res = NextResponse.json({ token, user }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })

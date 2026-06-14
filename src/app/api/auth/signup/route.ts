@@ -1,10 +1,9 @@
 import { NextResponse } from 'next/server'
 import {
-  getUserRowByEmail,
+  getUserRowByEmailRole,
   hashPassword,
   createPendingUser,
   setUserOtp,
-  setPendingRoleOtp,
   generateOtp,
   OTP_TTL_MS,
 } from '@/lib/local/auth'
@@ -46,32 +45,22 @@ export async function POST(req: Request) {
     const cleanEmail = String(email).trim()
     const fullName = String(full_name || '').trim() || cleanEmail.split('@')[0]
 
-    const existing = await getUserRowByEmail(cleanEmail)
+    // One email can hold TWO SEPARATE accounts: one guest, one host. Each is keyed
+    // by (email, role), registers independently, and verifies its own OTP. So we
+    // only look at the account for THIS role.
+    const existing = await getUserRowByEmailRole(cleanEmail, chosenRole)
     if (existing && existing.email_verified) {
-      // One email = one account that can be BOTH a guest and a host (Airbnb-style),
-      // but EVERY registration goes through the full OTP flow. A verified guest who
-      // registers "as a host" must confirm a FRESH code emailed to them; the host
-      // role is stashed in pending_role and only applied by verify-otp once the code
-      // is entered (so nobody gains hosting just by knowing the email).
-      const alreadyHost = existing.role === 'host' || existing.role === 'admin'
-      if (chosenRole === 'host' && !alreadyHost) {
-        const otp = generateOtp()
-        const otpExpires = new Date(Date.now() + OTP_TTL_MS)
-        await setPendingRoleOtp({ email: cleanEmail, pendingRole: 'host', otp, otpExpires, fullName })
-        await sendOtpEmail(cleanEmail, otp)
-        return NextResponse.json(
-          { pending: true, email: cleanEmail, role: 'host', addingHost: true, ...(smtpConfigured ? {} : { devCode: otp }) },
-          { headers: CORS }
-        )
-      }
-      return NextResponse.json({ error: 'An account with this email already exists' }, { status: 409, headers: CORS })
+      return NextResponse.json(
+        { error: `You already have a ${chosenRole === 'host' ? 'host' : 'guest'} account with this email. Please sign in.` },
+        { status: 409, headers: CORS }
+      )
     }
 
     const otp = generateOtp()
     const otpExpires = new Date(Date.now() + OTP_TTL_MS)
 
     if (existing) {
-      // Unverified account re-signing up → refresh its OTP + details.
+      // Unverified (email, role) re-signing up → refresh its OTP + details.
       await setUserOtp({ email: cleanEmail, otp, otpExpires, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole })
     } else {
       await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole, otp, otpExpires })

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, verifyPassword, signToken } from '@/lib/local/auth'
+import { getUserRowByEmailRole, verifyPassword, signToken } from '@/lib/local/auth'
 
 export const dynamic = 'force-dynamic'
 
@@ -48,9 +48,16 @@ export async function POST(req: Request) {
     }
 
     // ---- Regular email/password user ----
-    const row = await getUserRowByEmail(ident)
+    // The (email, role) account. One email can have a SEPARATE guest and host
+    // account; the chosen role selects which one to sign into. Each has its own
+    // password, profile and data.
+    const desired = role === 'host' ? 'host' : 'user'
+    const row = await getUserRowByEmailRole(ident, desired)
     if (!row || !verifyPassword(String(password), row.password_hash)) {
-      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401, headers: CORS })
+      return NextResponse.json(
+        { error: `No ${desired === 'host' ? 'host' : 'guest'} account matches that email and password. Register first if you haven't.` },
+        { status: 401, headers: CORS }
+      )
     }
     if (!row.email_verified) {
       return NextResponse.json(
@@ -58,31 +65,8 @@ export async function POST(req: Request) {
         { status: 403, headers: CORS }
       )
     }
-    // Role at sign-in. Hosting is NOT granted here — becoming a host requires the
-    // dedicated host registration (its own OTP). So:
-    //  - Pick "host" → only allowed if the account already holds host (or admin);
-    //    otherwise tell them to register as a host. No silent upgrade.
-    //  - Pick "user" (guest) → act as a guest this session even if the account can host.
-    //  - No choice → use the account's stored role.
-    const desired = role === 'host' ? 'host' : role === 'user' ? 'user' : null
-    let activeRole: string = row.role
-    if (desired === 'host') {
-      if (row.role !== 'host' && row.role !== 'admin') {
-        return NextResponse.json(
-          {
-            error: 'This account is not registered as a host yet. Register as a host to add hosting.',
-            needsHostRegistration: true,
-            email: row.email,
-          },
-          { status: 403, headers: CORS }
-        )
-      }
-      activeRole = row.role
-    } else if (desired === 'user' && row.role !== 'admin') {
-      activeRole = 'user'
-    }
-    const user = { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: activeRole }
-    const token = signToken({ sub: user.id, email: user.email, role: activeRole })
+    const user = { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role }
+    const token = signToken({ sub: user.id, email: user.email, role: row.role })
     const res = NextResponse.json({ token, user }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
     return res

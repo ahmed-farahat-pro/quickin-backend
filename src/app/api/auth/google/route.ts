@@ -47,6 +47,7 @@ export async function POST(req: Request) {
       fullName: String(claims.name || String(claims.email).split('@')[0]),
       provider: 'google',
       avatarUrl: typeof claims.picture === 'string' ? claims.picture : undefined,
+      role: body.role,
     })
     const token = signToken({ sub: user.id, email: user.email, role: user.role })
     const res = NextResponse.json({ token, user }, { headers: CORS })

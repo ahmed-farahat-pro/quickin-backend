@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { cookies } from 'next/headers'
-import { verifyToken, getUserRowByEmail } from '@/lib/local/auth'
+import { verifyToken, getUserById } from '@/lib/local/auth'
 
 export const dynamic = 'force-dynamic'
 
@@ -30,7 +30,7 @@ export async function GET(req: Request) {
       )
     }
 
-    const row = await getUserRowByEmail(claims.email)
+    const row = await getUserById(claims.sub)
     if (!row) return NextResponse.json({ user: null }, { headers: CORS })
 
     return NextResponse.json(
