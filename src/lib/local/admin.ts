@@ -1,5 +1,9 @@
 import { pool } from './pool'
 import { createNotification } from './notifications'
+import { sendPush } from './push'
+import { sendNotificationEmail } from './mailer'
+
+const WEB_URL = process.env.WEB_URL || 'https://quickin-frontend.vercel.app'
 
 // Admin data access — list every entity and delete any of them. Used only by the
 // admin-gated routes under /api/local/admin/*. Never exposes password hashes/OTPs.
@@ -160,6 +164,50 @@ export async function adminSetListingPublished(
   if (!isUuid(id)) throw new Error('Invalid id')
   const res = await pool.query(`UPDATE listings SET is_published = $2 WHERE id = $1`, [id, isPublished])
   return { updated: (res.rowCount ?? 0) > 0, is_published: isPublished }
+}
+
+/**
+ * Admin broadcast — "fire a notification" to web/iOS/Android users. Writes an
+ * in-app notification for every targeted user, sends an FCM push (if a device
+ * token + FIREBASE_SERVICE_ACCOUNT exist), and optionally an email. Best-effort
+ * per user — one failure never aborts the rest.
+ */
+export async function adminBroadcast(args: {
+  title: string
+  body?: string | null
+  link?: string | null
+  audience?: 'all' | 'guests' | 'hosts'
+  push?: boolean
+  email?: boolean
+}): Promise<{ recipients: number; emailed: number }> {
+  const title = (args.title ?? '').toString().trim()
+  if (!title) throw new Error('Title is required')
+  const body = (args.body ?? '').toString().trim() || null
+  const link = (args.link ?? '').toString().trim() || null
+  const audience = args.audience === 'guests' ? 'guests' : args.audience === 'hosts' ? 'hosts' : 'all'
+
+  const filter =
+    audience === 'guests' ? `role = 'user'` : audience === 'hosts' ? `role IN ('host','admin')` : `true`
+  const { rows } = await pool.query(`SELECT id, email FROM users WHERE ${filter}`)
+
+  let emailed = 0
+  for (const u of rows as { id: string; email: string | null }[]) {
+    await createNotification(u.id, { type: 'announcement', title, body, link })
+    if (args.push !== false) {
+      await sendPush(u.id, { title, body, link })
+    }
+    if (args.email && u.email) {
+      await sendNotificationEmail(
+        u.email,
+        title,
+        title,
+        body ? [body] : ['You have a new update from QuickIn.'],
+        link ? { label: 'Open QuickIn', url: link.startsWith('http') ? link : `${WEB_URL}${link}` } : undefined
+      )
+      emailed++
+    }
+  }
+  return { recipients: rows.length, emailed }
 }
 
 /** Admin changes a user's role (user | host | admin). */
