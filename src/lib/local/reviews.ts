@@ -1,4 +1,6 @@
 import { pool } from './pool'
+import { createNotification } from './notifications'
+import { sendPush } from './push'
 
 // Reviews & star ratings. A guest may review a stay only AFTER it's done
 // (booking confirmed + check-out date passed), one review per booking. Ratings
@@ -56,6 +58,21 @@ export async function createReview(args: {
      RETURNING id, listing_id, user_id, booking_id, rating, comment, created_at`,
     [b.listing_id, userId, bookingId, rating, (args.comment ?? '').toString().trim() || null]
   )
+
+  // Notify the host that their listing got a new review.
+  const host = await pool.query(`SELECT host_id, title FROM listings WHERE id = $1`, [b.listing_id])
+  const hostId = host.rows[0]?.host_id as string | undefined
+  if (hostId) {
+    const title = host.rows[0]?.title ?? 'your listing'
+    await createNotification(hostId, {
+      type: 'new_review',
+      title: 'New review',
+      body: `You received a ${rating}★ review on “${title}”.`,
+      link: '/host',
+    })
+    await sendPush(hostId, { title: 'New review ⭐', body: `${rating}★ on “${title}”`, link: '/host' })
+  }
+
   return { ...(ins.rows[0] as Review), reviewer_name: null }
 }
 

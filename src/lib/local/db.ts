@@ -351,6 +351,18 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   }
   const created = await getListingById(id)
   if (!created) throw new Error('Failed to create listing')
+  // Confirm to the host that their listing is published + live.
+  await createNotification(hostUserId, {
+    type: 'listing_live',
+    title: 'Your listing is live',
+    body: `“${created.title}” is now published and visible to guests.`,
+    link: '/host',
+  })
+  await sendPush(hostUserId, {
+    title: 'Your listing is live 🎉',
+    body: created.title,
+    link: '/host',
+  })
   return created
 }
 

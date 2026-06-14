@@ -162,8 +162,42 @@ export async function adminSetListingPublished(
   isPublished: boolean
 ): Promise<{ updated: boolean; is_published: boolean }> {
   if (!isUuid(id)) throw new Error('Invalid id')
-  const res = await pool.query(`UPDATE listings SET is_published = $2 WHERE id = $1`, [id, isPublished])
-  return { updated: (res.rowCount ?? 0) > 0, is_published: isPublished }
+  const { rows } = await pool.query(
+    `UPDATE listings SET is_published = $2 WHERE id = $1 RETURNING host_id, title`,
+    [id, isPublished]
+  )
+  const row = rows[0] as { host_id: string | null; title: string } | undefined
+  if (row?.host_id) {
+    await createNotification(row.host_id, {
+      type: isPublished ? 'listing_approved' : 'listing_deactivated',
+      title: isPublished ? 'Your listing is approved' : 'Your listing was deactivated',
+      body: isPublished
+        ? `“${row.title}” is now live and visible to guests.`
+        : `“${row.title}” is hidden from guests for now.`,
+      link: '/host',
+    })
+    await sendPush(row.host_id, {
+      title: isPublished ? 'Listing approved 🎉' : 'Listing deactivated',
+      body: `“${row.title}”`,
+      link: '/host',
+    })
+    const u = await pool.query(`SELECT email FROM users WHERE id = $1`, [row.host_id])
+    const email = u.rows[0]?.email
+    if (email) {
+      await sendNotificationEmail(
+        email,
+        isPublished ? 'Your QuickIn listing is approved 🎉' : 'Your QuickIn listing was deactivated',
+        isPublished ? 'Your listing is live' : 'Listing deactivated',
+        [
+          isPublished
+            ? `“${row.title}” has been approved and is now visible to guests on QuickIn.`
+            : `“${row.title}” is temporarily hidden from guests.`,
+        ],
+        { label: 'Open host dashboard', url: `${WEB_URL}/host` }
+      )
+    }
+  }
+  return { updated: rows.length > 0, is_published: isPublished }
 }
 
 /**
