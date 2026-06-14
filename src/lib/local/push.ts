@@ -1,5 +1,6 @@
 import { pool } from './pool'
 import { createSign } from 'node:crypto'
+import { FIREBASE_SERVICE_ACCOUNT as HARDCODED_SA } from './firebase-service-account'
 
 // FCM HTTP v1 push — dependency-free. Sends device push ONLY when a Firebase
 // service account is configured via the FIREBASE_SERVICE_ACCOUNT env (the JSON
@@ -13,19 +14,26 @@ interface ServiceAccount {
 }
 
 function serviceAccount(): ServiceAccount | null {
+  // The FIREBASE_SERVICE_ACCOUNT env wins when set; otherwise fall back to the
+  // hardcoded prototype account so push works out of the box.
+  let j: { client_email?: string; private_key?: string; project_id?: string } | null = null
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT
-  if (!raw) return null
-  try {
-    const j = JSON.parse(raw)
-    if (j.client_email && j.private_key && j.project_id) {
-      return {
-        client_email: j.client_email,
-        private_key: String(j.private_key).replace(/\\n/g, '\n'),
-        project_id: j.project_id,
-      }
+  if (raw) {
+    try {
+      j = JSON.parse(raw)
+    } catch {
+      j = null
     }
-  } catch {
-    /* malformed — treat as not configured */
+  }
+  if (!j || !j.client_email || !j.private_key || !j.project_id) {
+    j = HARDCODED_SA
+  }
+  if (j && j.client_email && j.private_key && j.project_id) {
+    return {
+      client_email: j.client_email,
+      private_key: String(j.private_key).replace(/\\n/g, '\n'),
+      project_id: j.project_id,
+    }
   }
   return null
 }
