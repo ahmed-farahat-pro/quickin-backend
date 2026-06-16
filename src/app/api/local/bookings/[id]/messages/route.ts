@@ -58,6 +58,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     return NextResponse.json(message, { status: 201, headers: CORS })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: /empty|Invalid/i.test(msg) ? 400 : 500, headers: CORS })
+    return NextResponse.json({ error: msg }, { status: /empty|Invalid|aren’t allowed|isn’t allowed|not allowed|phone/i.test(msg) ? 400 : 500, headers: CORS })
   }
 }

@@ -90,6 +90,35 @@ export async function createReview(args: {
   return { ...(ins.rows[0] as Review), reviewer_name: null }
 }
 
+export interface HostReview {
+  id: string
+  rating: number
+  comment: string | null
+  photos: string[]
+  created_at: string
+  reviewer_name: string | null
+  listing_id: string
+  listing_title: string
+}
+
+/** Recent reviews across ALL of a host's listings — powers the host profile page
+ *  ("reviews about this host"). Newest first. */
+export async function getHostReviews(hostId: string, limit = 40): Promise<HostReview[]> {
+  if (!isUuid(hostId)) return []
+  const { rows } = await pool.query(
+    `SELECT r.id, r.rating, r.comment, COALESCE(r.photos, '{}') AS photos, r.created_at,
+            u.full_name AS reviewer_name, l.id AS listing_id, l.title AS listing_title
+       FROM reviews r
+       JOIN listings l ON l.id = r.listing_id
+       JOIN users u ON u.id = r.user_id
+      WHERE l.host_id = $1
+      ORDER BY r.created_at DESC
+      LIMIT $2`,
+    [hostId, Math.min(100, Math.max(1, limit))]
+  )
+  return rows as HostReview[]
+}
+
 /** Public reviews for a listing, newest first, with the reviewer's first name. */
 export async function getListingReviews(listingId: string): Promise<Review[]> {
   if (!isUuid(listingId)) return []

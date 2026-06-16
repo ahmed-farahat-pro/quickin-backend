@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getListingById, updateListingPolicy, setListingOwnershipDoc, updateListingDiscounts } from '@/lib/local/db'
+import { getListingById, updateListingPolicy, setListingOwnershipDoc, updateListingDiscounts, updateListingPricing } from '@/lib/local/db'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // GET   /api/local/listings/:id → a single listing (no Supabase).
@@ -66,6 +66,15 @@ export async function PATCH(
     const monthly = b.monthly_discount ?? b.monthlyDiscount
     if (weekly !== undefined || monthly !== undefined) {
       const updated = await updateListingDiscounts(id, user.id, Number(weekly ?? 0), Number(monthly ?? 0))
+      if (!updated) return NextResponse.json({ error: 'Only the listing host can edit this listing' }, { status: 403, headers: CORS })
+      return NextResponse.json(updated, { headers: CORS })
+    }
+
+    // Host updates seasonal pricing (weekend price + per-month overrides).
+    const weekendPrice = b.weekend_price ?? b.weekendPrice
+    const monthlyPrices = b.monthly_prices ?? b.monthlyPrices
+    if (weekendPrice !== undefined || monthlyPrices !== undefined) {
+      const updated = await updateListingPricing(id, user.id, weekendPrice, monthlyPrices)
       if (!updated) return NextResponse.json({ error: 'Only the listing host can edit this listing' }, { status: 403, headers: CORS })
       return NextResponse.json(updated, { headers: CORS })
     }

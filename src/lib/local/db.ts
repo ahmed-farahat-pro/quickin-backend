@@ -3,6 +3,7 @@ import { randomInt } from 'node:crypto'
 import { createNotification } from './notifications'
 import { sendNotificationEmail } from './mailer'
 import { sendPush } from './push'
+import { containsPhoneNumber, combinesIntoPhoneNumber, PHONE_BLOCK_MESSAGE } from './contentguard'
 
 const WEB_URL = process.env.WEB_URL || 'https://quickin-frontend.vercel.app'
 
@@ -35,6 +36,8 @@ export interface Listing {
   location: string | null
   country: string | null
   price_per_night: number
+  weekend_price: number | null
+  monthly_prices: Record<string, number>
   currency: string
   bedrooms: number | null
   beds: number | null
@@ -116,7 +119,10 @@ export interface Booking {
 
 export const LISTING_COLS = `
   l.id, l.title, l.description, l.location, l.country,
-  l.price_per_night::float8 AS price_per_night, l.currency,
+  l.price_per_night::float8 AS price_per_night,
+  l.weekend_price::float8 AS weekend_price,
+  COALESCE(l.monthly_prices, '{}'::jsonb) AS monthly_prices,
+  l.currency,
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
   COALESCE(l.approval_status, 'approved') AS approval_status,
@@ -370,7 +376,16 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
        INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests, total_price, status, reservation_code)
        SELECT $1, $2, $3, $4, $5,
          round(
-           ($4::date - $3::date) * l.price_per_night
+           -- Seasonal per-night sum: weekend price (Fri/Sat) → monthly override → base.
+           (SELECT COALESCE(sum(
+              CASE
+                WHEN extract(dow from d)::int IN (5, 6) AND l.weekend_price IS NOT NULL THEN l.weekend_price
+                WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$'
+                     THEN (l.monthly_prices ->> extract(month from d)::int::text)::numeric
+                ELSE l.price_per_night
+              END), 0)
+            FROM generate_series($3::date, $4::date - interval '1 day', interval '1 day') AS d)
+           -- Length-of-stay discount on the whole stay.
            * (1 - (CASE
                WHEN ($4::date - $3::date) >= 28 THEN COALESCE(l.monthly_discount, 0)
                WHEN ($4::date - $3::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
@@ -645,6 +660,73 @@ export async function updateListingDiscounts(
   return getListingById(listingId)
 }
 
+/** Host sets seasonal pricing: weekend nightly price + per-month overrides. */
+export async function updateListingPricing(
+  listingId: string,
+  hostUserId: string,
+  weekendPrice: unknown,
+  monthlyPrices: unknown
+): Promise<Listing | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+  const { rowCount } = await pool.query(
+    `UPDATE listings SET weekend_price = $3, monthly_prices = $4::jsonb WHERE id = $1 AND host_id = $2`,
+    [listingId, hostUserId, cleanPrice(weekendPrice), cleanMonthlyPrices(monthlyPrices)]
+  )
+  if (!rowCount) return null
+  return getListingById(listingId)
+}
+
+export interface StayQuote {
+  nights: number
+  subtotal: number
+  discountPercent: number
+  total: number
+  nightlyAvg: number
+  currency: string
+  hasSeasonalPricing: boolean
+}
+
+/** Authoritative price for a date range — honors weekend + monthly pricing and
+ *  the length-of-stay discount (same maths the booking uses). Lets clients show
+ *  the exact total for the chosen dates without duplicating the logic. */
+export async function getStayQuote(listingId: string, checkIn: string, checkOut: string): Promise<StayQuote | null> {
+  if (!isUuid(listingId) || !isDate(checkIn) || !isDate(checkOut) || checkOut <= checkIn) return null
+  const { rows } = await pool.query(
+    `SELECT
+       ($2::date - $1::date) AS nights,
+       (SELECT COALESCE(sum(
+          CASE
+            WHEN extract(dow from d)::int IN (5, 6) AND l.weekend_price IS NOT NULL THEN l.weekend_price
+            WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$'
+                 THEN (l.monthly_prices ->> extract(month from d)::int::text)::numeric
+            ELSE l.price_per_night
+          END), 0)
+        FROM generate_series($1::date, $2::date - interval '1 day', interval '1 day') d)::float8 AS subtotal,
+       (CASE WHEN ($2::date - $1::date) >= 28 THEN COALESCE(l.monthly_discount, 0)
+             WHEN ($2::date - $1::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
+             ELSE 0 END)::int AS discount_percent,
+       (l.weekend_price IS NOT NULL OR l.monthly_prices <> '{}'::jsonb) AS has_seasonal,
+       l.currency
+     FROM listings l WHERE l.id = $3`,
+    [checkIn, checkOut, listingId]
+  )
+  const r = rows[0]
+  if (!r) return null
+  const nights = Number(r.nights)
+  const subtotal = Math.round(Number(r.subtotal))
+  const discountPercent = Number(r.discount_percent)
+  const total = Math.round(subtotal * (1 - discountPercent / 100))
+  return {
+    nights,
+    subtotal,
+    discountPercent,
+    total,
+    nightlyAvg: nights > 0 ? Math.round(subtotal / nights) : subtotal,
+    currency: r.currency ?? 'EGP',
+    hasSeasonalPricing: Boolean(r.has_seasonal),
+  }
+}
+
 // ---- Listing approval queue (S7) -------------------------------------------
 
 /** Listings awaiting moderation, with the host's name/email + the ownership doc
@@ -782,12 +864,33 @@ export interface CreateListingInput {
   ownershipDoc?: string
   weeklyDiscount?: number
   monthlyDiscount?: number
+  weekendPrice?: number | null
+  monthlyPrices?: unknown
 }
 
 /** Clamp a percent discount to 0..90 (integers). */
 function clampDiscount(v: unknown): number {
   const n = Math.floor(Number(v) || 0)
   return Math.max(0, Math.min(90, n))
+}
+
+/** A positive nightly price, or null. */
+function cleanPrice(v: unknown): number | null {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : null
+}
+
+/** Keep only months "1".."12" → positive price. Returns a JSON string for jsonb. */
+function cleanMonthlyPrices(v: unknown): string {
+  const out: Record<string, number> = {}
+  if (v && typeof v === 'object') {
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      const m = Number(k)
+      const p = cleanPrice(val)
+      if (Number.isInteger(m) && m >= 1 && m <= 12 && p) out[String(m)] = p
+    }
+  }
+  return JSON.stringify(out)
 }
 
 /** A host (or admin) creates a listing. Returns the full listing with images. */
@@ -806,8 +909,8 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
         bedrooms, beds, bathrooms, max_guests, property_type, region, lat, lng, listing_code, is_published, amenities,
-        cancellation_policy, approval_status, ownership_doc, weekly_discount, monthly_discount)
-     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18,$19,$20)
+        cancellation_policy, approval_status, ownership_doc, weekly_discount, monthly_discount, weekend_price, monthly_prices)
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18,$19,$20,$21,$22::jsonb)
      RETURNING id`,
     [
       hostUserId, input.title.trim(), input.description ?? null, input.location ?? null, input.country ?? null,
@@ -816,6 +919,7 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
       input.propertyType ?? 'Apartment', input.region ?? null, input.lat ?? null, input.lng ?? null, genReservationCode(),
       input.amenities ?? [], normalizePolicy(input.cancellationPolicy), ownershipDoc,
       clampDiscount(input.weeklyDiscount), clampDiscount(input.monthlyDiscount),
+      cleanPrice(input.weekendPrice), cleanMonthlyPrices(input.monthlyPrices),
     ]
   )
   const id = rows[0].id as string
@@ -959,11 +1063,23 @@ export async function getBookingMessages(bookingId: string): Promise<Message[]> 
   return rows as Message[]
 }
 
-/** Post a message to a booking thread. */
+/** Post a message to a booking thread. Phone numbers are blocked by any trick
+ *  (see contentguard) — including splitting a number across several messages. */
 export async function createMessage(bookingId: string, senderId: string, body: string): Promise<Message> {
   if (!isUuid(bookingId) || !isUuid(senderId)) throw new Error('Invalid id')
   const text = String(body || '').trim().slice(0, 2000)
   if (!text) throw new Error('Message cannot be empty')
+
+  // Block phone numbers — this single message, or completing one split across the
+  // sender's recent messages in this thread.
+  if (containsPhoneNumber(text)) throw new Error(PHONE_BLOCK_MESSAGE)
+  const recent = await pool.query(
+    `SELECT body FROM messages WHERE booking_id = $1 AND sender_id = $2 ORDER BY created_at DESC LIMIT 6`,
+    [bookingId, senderId]
+  )
+  const priorBodies = recent.rows.map((r) => String(r.body || '')).reverse()
+  if (combinesIntoPhoneNumber(priorBodies, text)) throw new Error(PHONE_BLOCK_MESSAGE)
+
   const { rows } = await pool.query(
     `WITH ins AS (
        INSERT INTO messages (booking_id, sender_id, body) VALUES ($1, $2, $3) RETURNING *

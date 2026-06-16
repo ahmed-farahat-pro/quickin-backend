@@ -65,7 +65,7 @@ const HOSTS = [
   {
     email: 'host.nour@demo.quickin.app', name: 'Nour El-Din', country: 'Egypt',
     listings: [
-      { title: 'Sahel Beach Villa', region: 'North Coast', location: 'Sidi Abdel Rahman, North Coast', price_per_night: 5200, max_guests: 6, bedrooms: 3, beds: 4, bathrooms: 2, property_type: 'Villa', lat: 30.95, lng: 28.75, image: IMG.villa, amenities: ['WiFi', 'Pool', 'Beach access', 'Air conditioning', 'Free parking'], cancellation_policy: 'moderate', weekly_discount: 10, monthly_discount: 20 },
+      { title: 'Sahel Beach Villa', region: 'North Coast', location: 'Sidi Abdel Rahman, North Coast', price_per_night: 5200, max_guests: 6, bedrooms: 3, beds: 4, bathrooms: 2, property_type: 'Villa', lat: 30.95, lng: 28.75, image: IMG.villa, amenities: ['WiFi', 'Pool', 'Beach access', 'Air conditioning', 'Free parking'], cancellation_policy: 'moderate', weekly_discount: 10, monthly_discount: 20, weekend_price: 6800, monthly_prices: { 6: 7000, 7: 8500, 8: 9000, 9: 7500 } },
       { title: 'Marassi Marina Apartment', region: 'North Coast', location: 'Marassi, North Coast', price_per_night: 2800, max_guests: 4, bedrooms: 2, beds: 2, bathrooms: 2, property_type: 'Apartment', lat: 30.99, lng: 28.62, image: IMG.apt, amenities: ['WiFi', 'Pool', 'Air conditioning', 'TV'], cancellation_policy: 'flexible', weekly_discount: 5, monthly_discount: 15 },
     ],
     services: [
@@ -98,7 +98,7 @@ const HOSTS = [
     email: 'host.hana@demo.quickin.app', name: 'Hana Saleh', country: 'Egypt',
     listings: [
       { title: 'Hacienda Bay Chalet', region: 'North Coast', location: 'Hacienda Bay, North Coast', price_per_night: 4100, max_guests: 5, bedrooms: 3, beds: 3, bathrooms: 2, property_type: 'Chalet', lat: 31.02, lng: 28.45, image: IMG.beach, amenities: ['WiFi', 'Pool', 'Beach access', 'Air conditioning', 'BBQ grill'], cancellation_policy: 'moderate', weekly_discount: 10, monthly_discount: 22 },
-      { title: 'El Gouna Garden Villa', region: 'El Gouna', location: 'El Gouna, Red Sea', price_per_night: 4600, max_guests: 8, bedrooms: 4, beds: 5, bathrooms: 3, property_type: 'Villa', lat: 27.41, lng: 33.67, image: IMG.villa, amenities: ['WiFi', 'Pool', 'Kitchen', 'Air conditioning', 'Free parking', 'Washer'], cancellation_policy: 'strict', weekly_discount: 15, monthly_discount: 28 },
+      { title: 'El Gouna Garden Villa', region: 'El Gouna', location: 'El Gouna, Red Sea', price_per_night: 4600, max_guests: 8, bedrooms: 4, beds: 5, bathrooms: 3, property_type: 'Villa', lat: 27.41, lng: 33.67, image: IMG.villa, amenities: ['WiFi', 'Pool', 'Kitchen', 'Air conditioning', 'Free parking', 'Washer'], cancellation_policy: 'strict', weekly_discount: 15, monthly_discount: 28, weekend_price: 5500, monthly_prices: { 12: 6500, 1: 6000, 7: 5800, 8: 5800 } },
     ],
     services: [
       { title: 'Private Chef Dinner', category: 'Dining', location: 'North Coast', price: 2500, image: 'https://images.unsplash.com/photo-1555244162-803834f70033?w=1200&q=80' },
@@ -229,6 +229,7 @@ function buildHtml(guests, hosts, sample, sub) {
         property_type: l.property_type, region: l.region, lat: l.lat, lng: l.lng, images: [l.image],
         amenities: l.amenities, cancellation_policy: l.cancellation_policy,
         weekly_discount: l.weekly_discount, monthly_discount: l.monthly_discount,
+        weekend_price: l.weekend_price, monthly_prices: l.monthly_prices,
       }, token)
       if (res.status === 201 && res.body.id) {
         created.push({ id: res.body.id, title: l.title, region: l.region, price: l.price_per_night })
@@ -263,6 +264,37 @@ function buildHtml(guests, hosts, sample, sub) {
     )
     console.log(`\n  ✅ approved + published ${r.rowCount} seeded listings`)
   }
+
+  // Seed reviews so listings show ratings + comments. Inserted directly (the API
+  // requires a completed stay); reviewers are the seeded guests. booking_id NULL
+  // is fine (the UNIQUE(booking_id) constraint treats NULLs as distinct).
+  const REVIEW_TEXTS = [
+    [5, 'Stunning place, spotless and exactly as pictured. The host was wonderful!'],
+    [5, 'Best stay we’ve had on the coast — woke up to the sea every morning.'],
+    [4, 'Lovely spot, great location. Would happily come back.'],
+    [5, 'Super clean, comfy beds, and the pool was perfect for the kids.'],
+    [4, 'Great value and a very responsive host. Highly recommend.'],
+    [5, 'Felt like a boutique hotel. Every detail was thought through.'],
+  ]
+  const guestRows = (await pool.query(
+    `select id from users where email = any($1) order by email`,
+    [GUESTS.map((g) => g.email)]
+  )).rows.map((x) => x.id)
+  let reviewCount = 0
+  for (let i = 0; i < createdListingIds.length; i++) {
+    const lid = createdListingIds[i]
+    // 2 reviews per listing from two different guests.
+    for (let j = 0; j < 2; j++) {
+      const guest = guestRows[(i + j) % guestRows.length]
+      const [rating, comment] = REVIEW_TEXTS[(i * 2 + j) % REVIEW_TEXTS.length]
+      const res = await pool.query(
+        `INSERT INTO reviews (listing_id, user_id, booking_id, rating, comment) VALUES ($1,$2,NULL,$3,$4) RETURNING id`,
+        [lid, guest, rating, comment]
+      )
+      if (res.rowCount) reviewCount++
+    }
+  }
+  console.log(`  ✅ seeded ${reviewCount} listing reviews`)
 
   // Sample pending booking: first guest books the first host's first listing.
   let sample = null
