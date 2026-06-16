@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { verifyUserOtp, signToken } from '@/lib/local/auth'
+import { recordReferral } from '@/lib/local/promote'
 
 export const dynamic = 'force-dynamic'
 
@@ -24,7 +25,7 @@ export async function OPTIONS() {
 // and returns { token, user } (also sets the qk_token cookie for web).
 export async function POST(req: Request) {
   try {
-    const { email, code, role } = await req.json()
+    const { email, code, role, referral_code, referralCode } = await req.json()
     if (!email || !code) {
       return NextResponse.json({ error: 'Email and code are required' }, { status: 400, headers: CORS })
     }
@@ -32,6 +33,11 @@ export async function POST(req: Request) {
     const user = await verifyUserOtp(String(email).trim(), String(code).trim(), typeof role === 'string' ? role : undefined)
     if (!user) {
       return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400, headers: CORS })
+    }
+    // If they signed up via a referral code, record it (mock reward to the owner).
+    const refCode = referral_code ?? referralCode
+    if (typeof refCode === 'string' && refCode.trim()) {
+      await recordReferral(user.id, refCode).catch(() => {})
     }
     const token = signToken({ sub: user.id, email: user.email, role: user.role })
     const res = NextResponse.json({ token, user }, { headers: CORS })

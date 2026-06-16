@@ -44,6 +44,8 @@ export interface Listing {
   region: string | null
   cancellation_policy: string
   approval_status: string
+  weekly_discount: number
+  monthly_discount: number
   host_id: string | null
   host_name: string | null
   host_verified: boolean
@@ -108,6 +110,8 @@ export interface Booking {
   cancellation_policy: string
   cancelled_at: string | null
   refund_percent: number | null
+  promo_code: string | null
+  promo_discount: number | null
 }
 
 export const LISTING_COLS = `
@@ -116,6 +120,8 @@ export const LISTING_COLS = `
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
   COALESCE(l.approval_status, 'approved') AS approval_status,
+  COALESCE(l.weekly_discount, 0) AS weekly_discount,
+  COALESCE(l.monthly_discount, 0) AS monthly_discount,
   l.host_id, (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
   COALESCE((SELECT u.verification_status = 'verified' FROM users u WHERE u.id = l.host_id), false) AS host_verified,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
@@ -323,6 +329,8 @@ const BOOKING_COLS = `
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
   to_char(b.cancelled_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS cancelled_at,
   b.refund_percent,
+  b.promo_code,
+  b.promo_discount::float8 AS promo_discount,
   to_char(b.created_at, 'YYYY-MM-DD') AS created_at,
   l.title, l.location, l.region, l.host_id,
   (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image
@@ -360,7 +368,15 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
   const { rows } = await pool.query(
     `WITH ins AS (
        INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests, total_price, status, reservation_code)
-       SELECT $1, $2, $3, $4, $5, ($4::date - $3::date) * l.price_per_night, 'pending', $6
+       SELECT $1, $2, $3, $4, $5,
+         round(
+           ($4::date - $3::date) * l.price_per_night
+           * (1 - (CASE
+               WHEN ($4::date - $3::date) >= 28 THEN COALESCE(l.monthly_discount, 0)
+               WHEN ($4::date - $3::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
+               ELSE 0 END)::numeric / 100)
+         ),
+         'pending', $6
        FROM listings l WHERE l.id = $1
        RETURNING *
      )
@@ -452,6 +468,20 @@ export async function markBookingPaid(
     })
   }
   return booking
+}
+
+/** Records the promo code + discount applied to a booking (set at pay time). */
+export async function setBookingPromo(
+  bookingId: string,
+  userId: string,
+  code: string,
+  discount: number
+): Promise<void> {
+  if (!isUuid(bookingId) || !isUuid(userId)) return
+  await pool.query(
+    `UPDATE bookings SET promo_code = $3, promo_discount = $4 WHERE id = $1 AND user_id = $2`,
+    [bookingId, userId, code.toUpperCase().slice(0, 40), Math.max(0, Math.round(discount))]
+  )
 }
 
 /** Host attaches free-text notes to a stay (directions, gate code, city tips…)
@@ -599,6 +629,22 @@ export async function updateListingPolicy(
   return getListingById(listingId)
 }
 
+/** Host updates the length-of-stay discounts (% off) on their own listing. */
+export async function updateListingDiscounts(
+  listingId: string,
+  hostUserId: string,
+  weekly: number,
+  monthly: number
+): Promise<Listing | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+  const { rowCount } = await pool.query(
+    `UPDATE listings SET weekly_discount = $3, monthly_discount = $4 WHERE id = $1 AND host_id = $2`,
+    [listingId, hostUserId, clampDiscount(weekly), clampDiscount(monthly)]
+  )
+  if (!rowCount) return null
+  return getListingById(listingId)
+}
+
 // ---- Listing approval queue (S7) -------------------------------------------
 
 /** Listings awaiting moderation, with the host's name/email + the ownership doc
@@ -734,6 +780,14 @@ export interface CreateListingInput {
   amenities?: string[]
   cancellationPolicy?: string
   ownershipDoc?: string
+  weeklyDiscount?: number
+  monthlyDiscount?: number
+}
+
+/** Clamp a percent discount to 0..90 (integers). */
+function clampDiscount(v: unknown): number {
+  const n = Math.floor(Number(v) || 0)
+  return Math.max(0, Math.min(90, n))
 }
 
 /** A host (or admin) creates a listing. Returns the full listing with images. */
@@ -752,8 +806,8 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
         bedrooms, beds, bathrooms, max_guests, property_type, region, lat, lng, listing_code, is_published, amenities,
-        cancellation_policy, approval_status, ownership_doc)
-     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18)
+        cancellation_policy, approval_status, ownership_doc, weekly_discount, monthly_discount)
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18,$19,$20)
      RETURNING id`,
     [
       hostUserId, input.title.trim(), input.description ?? null, input.location ?? null, input.country ?? null,
@@ -761,6 +815,7 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
       Math.max(0, Math.floor(input.bathrooms ?? 1)), Math.max(1, Math.floor(input.maxGuests ?? 2)),
       input.propertyType ?? 'Apartment', input.region ?? null, input.lat ?? null, input.lng ?? null, genReservationCode(),
       input.amenities ?? [], normalizePolicy(input.cancellationPolicy), ownershipDoc,
+      clampDiscount(input.weeklyDiscount), clampDiscount(input.monthlyDiscount),
     ]
   )
   const id = rows[0].id as string

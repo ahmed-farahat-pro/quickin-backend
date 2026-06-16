@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
-import { getBookingById, markBookingPaid } from '@/lib/local/db'
+import { getBookingById, markBookingPaid, setBookingPromo } from '@/lib/local/db'
+import { redeemPromo } from '@/lib/local/promote'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // POST /api/local/bookings/:id/pay — MOCK checkout. There is no real gateway yet
@@ -56,7 +57,19 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const serviceFee = Math.round(subtotal * SERVICE_FEE_RATE)
     // Signed: positive surcharge for card, negative discount for bank transfer.
     const methodFee = Math.round(subtotal * (METHOD_RATE[method] ?? 0))
-    const total = subtotal + serviceFee + methodFee
+    // Optional promo code — redeemed against the subtotal (one-time increment).
+    let promoCode: string | null = null
+    let promoDiscount = 0
+    const rawPromo = typeof body?.promo_code === 'string' ? body.promo_code : typeof body?.promoCode === 'string' ? body.promoCode : ''
+    if (rawPromo && rawPromo.trim()) {
+      promoDiscount = await redeemPromo(rawPromo, subtotal)
+      if (promoDiscount > 0) {
+        const normalized = rawPromo.trim().toUpperCase()
+        promoCode = normalized
+        await setBookingPromo(id, user.id, normalized, promoDiscount)
+      }
+    }
+    const total = Math.max(0, subtotal + serviceFee + methodFee - promoDiscount)
     const receipt = {
       currency: 'EGP',
       nights,
@@ -65,6 +78,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       serviceFee,
       method,
       methodFee, // +ve = card surcharge, −ve = bank-transfer discount
+      promoCode,
+      promoDiscount, // amount subtracted by the promo code (0 if none)
       total,
       reference: booking.reservation_code,
       paidAt: booking.paid_at,

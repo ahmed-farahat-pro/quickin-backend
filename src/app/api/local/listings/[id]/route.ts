@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getListingById, updateListingPolicy, setListingOwnershipDoc } from '@/lib/local/db'
+import { getListingById, updateListingPolicy, setListingOwnershipDoc, updateListingDiscounts } from '@/lib/local/db'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // GET   /api/local/listings/:id → a single listing (no Supabase).
@@ -61,9 +61,18 @@ export async function PATCH(
       return NextResponse.json(updated, { headers: CORS })
     }
 
+    // Host updates length-of-stay discounts (% off for ≥7 / ≥28 nights).
+    const weekly = b.weekly_discount ?? b.weeklyDiscount
+    const monthly = b.monthly_discount ?? b.monthlyDiscount
+    if (weekly !== undefined || monthly !== undefined) {
+      const updated = await updateListingDiscounts(id, user.id, Number(weekly ?? 0), Number(monthly ?? 0))
+      if (!updated) return NextResponse.json({ error: 'Only the listing host can edit this listing' }, { status: 403, headers: CORS })
+      return NextResponse.json(updated, { headers: CORS })
+    }
+
     const policy = b.cancellation_policy ?? b.cancellationPolicy
     if (typeof policy !== 'string') {
-      return NextResponse.json({ error: 'cancellation_policy or ownership_doc is required' }, { status: 400, headers: CORS })
+      return NextResponse.json({ error: 'cancellation_policy, ownership_doc or discounts required' }, { status: 400, headers: CORS })
     }
     const updated = await updateListingPolicy(id, user.id, policy)
     if (!updated) {
