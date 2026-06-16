@@ -168,6 +168,7 @@ export interface Profile {
   role: string
   provider: string
   avatar_url: string | null
+  bio: string | null
   age: number | null
   id_document: string | null
   phone: string | null
@@ -176,27 +177,44 @@ export interface Profile {
 /** The signed-in user's full profile (incl. phone) — only ever returned to themselves. */
 export async function getFullProfile(id: string): Promise<Profile | null> {
   const { rows } = await pool.query(
-    `SELECT id, email, full_name, role, provider, avatar_url, age, id_document, phone
+    `SELECT id, email, full_name, role, provider, avatar_url, bio, age, id_document, phone
        FROM users WHERE id = $1`,
     [id]
   )
   return (rows[0] as Profile) ?? null
 }
 
-/** Update editable profile fields (name, age, id document, phone). COALESCE keeps
- *  any field the caller omits (passes null). */
+/** Update editable profile fields (name, bio, avatar, age, id document, phone).
+ *  COALESCE keeps any field the caller omits (passes null). */
 export async function updateProfile(
   id: string,
-  fields: { fullName?: string | null; age?: number | null; idDocument?: string | null; phone?: string | null }
+  fields: {
+    fullName?: string | null
+    bio?: string | null
+    avatarUrl?: string | null
+    age?: number | null
+    idDocument?: string | null
+    phone?: string | null
+  }
 ): Promise<Profile | null> {
   await pool.query(
     `UPDATE users SET
         full_name   = COALESCE($2, full_name),
         age         = COALESCE($3, age),
         id_document = COALESCE($4, id_document),
-        phone       = COALESCE($5, phone)
+        phone       = COALESCE($5, phone),
+        bio         = COALESCE($6, bio),
+        avatar_url  = COALESCE($7, avatar_url)
       WHERE id = $1`,
-    [id, fields.fullName ?? null, fields.age ?? null, fields.idDocument ?? null, fields.phone ?? null]
+    [
+      id,
+      fields.fullName ?? null,
+      fields.age ?? null,
+      fields.idDocument ?? null,
+      fields.phone ?? null,
+      fields.bio ?? null,
+      fields.avatarUrl ?? null,
+    ]
   )
   return getFullProfile(id)
 }

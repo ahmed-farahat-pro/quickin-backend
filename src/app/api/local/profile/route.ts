@@ -53,6 +53,8 @@ export async function PATCH(req: Request) {
       age: ageRaw === '' || ageRaw == null ? null : Number(ageRaw),
       idDocument: b.id_document ?? b.idDocument ?? null,
       phone: b.phone ?? null,
+      bio: typeof b.bio === 'string' ? b.bio : null,
+      avatarUrl: b.avatar_url ?? b.avatarUrl ?? null,
     })
     return NextResponse.json(updated, { headers: CORS })
   } catch (err) {
