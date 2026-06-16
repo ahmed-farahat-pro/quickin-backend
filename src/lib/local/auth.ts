@@ -172,12 +172,14 @@ export interface Profile {
   age: number | null
   id_document: string | null
   phone: string | null
+  verification_status: string
 }
 
 /** The signed-in user's full profile (incl. phone) — only ever returned to themselves. */
 export async function getFullProfile(id: string): Promise<Profile | null> {
   const { rows } = await pool.query(
-    `SELECT id, email, full_name, role, provider, avatar_url, bio, age, id_document, phone
+    `SELECT id, email, full_name, role, provider, avatar_url, bio, age, id_document, phone,
+            COALESCE(verification_status, 'unverified') AS verification_status
        FROM users WHERE id = $1`,
     [id]
   )

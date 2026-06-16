@@ -45,6 +45,7 @@ export interface Listing {
   cancellation_policy: string
   host_id: string | null
   host_name: string | null
+  host_verified: boolean
   is_guest_favorite: boolean
   listing_code: string | null
   lat: number | null
@@ -114,6 +115,7 @@ export const LISTING_COLS = `
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
   l.host_id, (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
+  COALESCE((SELECT u.verification_status = 'verified' FROM users u WHERE u.id = l.host_id), false) AS host_verified,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
   COALESCE(l.amenities, '{}') AS amenities,
   COALESCE((SELECT round(avg(rv.rating)::numeric, 2) FROM reviews rv WHERE rv.listing_id = l.id), 0)::float8 AS rating,
