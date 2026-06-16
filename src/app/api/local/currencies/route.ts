@@ -22,5 +22,5 @@ export async function OPTIONS() {
 }
 
 export async function GET() {
-  return NextResponse.json(getCurrencies(), { headers: CORS })
+  return NextResponse.json(await getCurrencies(), { headers: CORS })
 }

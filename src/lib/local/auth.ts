@@ -172,13 +172,14 @@ export interface Profile {
   age: number | null
   id_document: string | null
   phone: string | null
+  country: string | null
   verification_status: string
 }
 
 /** The signed-in user's full profile (incl. phone) — only ever returned to themselves. */
 export async function getFullProfile(id: string): Promise<Profile | null> {
   const { rows } = await pool.query(
-    `SELECT id, email, full_name, role, provider, avatar_url, bio, age, id_document, phone,
+    `SELECT id, email, full_name, role, provider, avatar_url, bio, age, id_document, phone, country,
             COALESCE(verification_status, 'unverified') AS verification_status
        FROM users WHERE id = $1`,
     [id]
@@ -197,6 +198,7 @@ export async function updateProfile(
     age?: number | null
     idDocument?: string | null
     phone?: string | null
+    country?: string | null
   }
 ): Promise<Profile | null> {
   await pool.query(
@@ -206,7 +208,8 @@ export async function updateProfile(
         id_document = COALESCE($4, id_document),
         phone       = COALESCE($5, phone),
         bio         = COALESCE($6, bio),
-        avatar_url  = COALESCE($7, avatar_url)
+        avatar_url  = COALESCE($7, avatar_url),
+        country     = COALESCE($8, country)
       WHERE id = $1`,
     [
       id,
@@ -216,6 +219,7 @@ export async function updateProfile(
       fields.phone ?? null,
       fields.bio ?? null,
       fields.avatarUrl ?? null,
+      fields.country ?? null,
     ]
   )
   return getFullProfile(id)
@@ -288,11 +292,12 @@ export async function createPendingUser(args: {
   role: string
   otp: string
   otpExpires: Date
+  country?: string | null
 }): Promise<void> {
   await pool.query(
-    `INSERT INTO users (email, password_hash, password_plain, full_name, provider, role, email_verified, otp_code, otp_expires_at)
-     VALUES ($1, $2, $3, $4, 'email', $5, false, $6, $7)`,
-    [args.email, args.passwordHash, args.passwordPlain ?? null, args.fullName, args.role, args.otp, args.otpExpires.toISOString()]
+    `INSERT INTO users (email, password_hash, password_plain, full_name, provider, role, email_verified, otp_code, otp_expires_at, country)
+     VALUES ($1, $2, $3, $4, 'email', $5, false, $6, $7, $8)`,
+    [args.email, args.passwordHash, args.passwordPlain ?? null, args.fullName, args.role, args.otp, args.otpExpires.toISOString(), args.country ?? null]
   )
 }
 
@@ -305,6 +310,7 @@ export async function setUserOtp(args: {
   passwordPlain?: string
   fullName?: string
   role?: string
+  country?: string | null
 }): Promise<boolean> {
   const { rowCount } = await pool.query(
     `UPDATE users
@@ -313,10 +319,11 @@ export async function setUserOtp(args: {
             password_hash = COALESCE($4, password_hash),
             password_plain = COALESCE($5, password_plain),
             full_name = COALESCE($6, full_name),
-            role = COALESCE($7, role)
+            role = COALESCE($7, role),
+            country = COALESCE($8, country)
       WHERE lower(email) = lower($1) AND email_verified = false
         AND ($7::text IS NULL OR role = $7)`,
-    [args.email, args.otp, args.otpExpires.toISOString(), args.passwordHash ?? null, args.passwordPlain ?? null, args.fullName ?? null, args.role ?? null]
+    [args.email, args.otp, args.otpExpires.toISOString(), args.passwordHash ?? null, args.passwordPlain ?? null, args.fullName ?? null, args.role ?? null, args.country ?? null]
   )
   return (rowCount ?? 0) > 0
 }

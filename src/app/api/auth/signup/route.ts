@@ -33,10 +33,11 @@ export async function OPTIONS() {
 // the client then calls /api/auth/verify-otp with the code to activate + receive a token.
 export async function POST(req: Request) {
   try {
-    const { email, password, full_name, role } = await req.json()
+    const { email, password, full_name, role, country: rawCountry } = await req.json()
     if (!email || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: CORS })
     }
+    const country = typeof rawCountry === 'string' && rawCountry.trim() ? rawCountry.trim().slice(0, 80) : null
     if (String(password).length < 6) {
       return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400, headers: CORS })
     }
@@ -61,9 +62,9 @@ export async function POST(req: Request) {
 
     if (existing) {
       // Unverified (email, role) re-signing up → refresh its OTP + details.
-      await setUserOtp({ email: cleanEmail, otp, otpExpires, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole })
+      await setUserOtp({ email: cleanEmail, otp, otpExpires, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole, country })
     } else {
-      await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole, otp, otpExpires })
+      await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole, otp, otpExpires, country })
     }
 
     await sendOtpEmail(cleanEmail, otp)

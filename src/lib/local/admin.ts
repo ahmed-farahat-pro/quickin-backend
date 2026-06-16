@@ -19,7 +19,8 @@ export async function getAllUsers() {
   // password_plain is PROTOTYPE-ONLY (so the admin can display passwords); it's null
   // for accounts created before this existed and for social (Google/Apple) sign-ins.
   const { rows } = await pool.query(
-    `SELECT id, email, full_name, role, provider, email_verified, password_plain, created_at
+    `SELECT id, email, full_name, role, provider, email_verified, password_plain, country,
+            COALESCE(verification_status, 'unverified') AS verification_status, created_at
        FROM users ORDER BY created_at DESC NULLS LAST`
   )
   return rows

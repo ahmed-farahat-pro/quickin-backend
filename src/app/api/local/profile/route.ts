@@ -55,6 +55,7 @@ export async function PATCH(req: Request) {
       phone: b.phone ?? null,
       bio: typeof b.bio === 'string' ? b.bio : null,
       avatarUrl: b.avatar_url ?? b.avatarUrl ?? null,
+      country: typeof b.country === 'string' ? b.country : null,
     })
     return NextResponse.json(updated, { headers: CORS })
   } catch (err) {

@@ -10,7 +10,10 @@ const METHOD_RATE: Record<string, number> = { card: 0.05, bank_transfer: -0.05 }
 // Platform commission withheld from the host (host keeps the rest).
 const HOST_COMMISSION = 0.1
 
-// Static display rates: 1 EGP → X. Display-only; bookings are always charged EGP.
+// Currencies QuickIn displays (EGP base). Display-only — bookings are always EGP.
+const DISPLAY_CURRENCIES = ['EGP', 'USD', 'EUR', 'GBP', 'SAR', 'AED'] as const
+
+// Static fallback (1 EGP → X) used when the live feed is unreachable.
 export const CURRENCY_RATES: Record<string, number> = {
   EGP: 1,
   USD: 0.0203,
@@ -20,8 +23,44 @@ export const CURRENCY_RATES: Record<string, number> = {
   AED: 0.0746,
 }
 
-export function getCurrencies(): { base: string; rates: Record<string, number> } {
-  return { base: 'EGP', rates: CURRENCY_RATES }
+// Live EGP rates source. There is no official public JSON API from CIB / the
+// Central Bank of Egypt, so we use a keyless interbank FX feed (EGP base) that
+// tracks the same market rates the CBE publishes. Override with FX_RATES_URL
+// (must return JSON `{ rates: { USD: .., ... } }` with EGP as the base).
+const FX_URL = process.env.FX_RATES_URL?.trim() || 'https://open.er-api.com/v6/latest/EGP'
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000 // 6h — rates move slowly; keep upstream calls cheap.
+
+let cache: { at: number; rates: Record<string, number>; source: string } | null = null
+
+/** EGP-based display rates: live (cached 6h) with a static fallback. */
+export async function getCurrencies(): Promise<{ base: string; rates: Record<string, number>; source: string; updatedAt: string | null }> {
+  // Serve a warm cache.
+  if (cache && Date.now() - cache.at < CACHE_TTL_MS) {
+    return { base: 'EGP', rates: cache.rates, source: cache.source, updatedAt: new Date(cache.at).toISOString() }
+  }
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 5000)
+    const res = await fetch(FX_URL, { signal: ctrl.signal, headers: { Accept: 'application/json' } })
+    clearTimeout(timer)
+    if (!res.ok) throw new Error(`FX feed ${res.status}`)
+    const data = await res.json()
+    const live = data?.rates ?? data?.conversion_rates ?? null
+    if (!live || typeof live !== 'object') throw new Error('FX feed: no rates')
+    const rates: Record<string, number> = { EGP: 1 }
+    for (const code of DISPLAY_CURRENCIES) {
+      const v = Number(live[code])
+      if (Number.isFinite(v) && v > 0) rates[code] = v
+      else if (CURRENCY_RATES[code]) rates[code] = CURRENCY_RATES[code] // backfill any missing code
+    }
+    const at = Date.now()
+    cache = { at, rates, source: 'live' }
+    return { base: 'EGP', rates, source: 'live', updatedAt: new Date(at).toISOString() }
+  } catch {
+    // Unreachable / slow → static fallback (and cache it briefly to avoid hammering).
+    cache = { at: Date.now(), rates: CURRENCY_RATES, source: 'fallback' }
+    return { base: 'EGP', rates: CURRENCY_RATES, source: 'fallback', updatedAt: null }
+  }
 }
 
 export interface GuestReceipt {
