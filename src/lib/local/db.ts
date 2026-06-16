@@ -184,6 +184,10 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
       SELECT 1 FROM bookings bk
       WHERE bk.listing_id = l.id AND bk.status <> 'cancelled'
         AND bk.check_in < $${a} AND bk.check_out > $${b}
+    ) AND NOT EXISTS (
+      SELECT 1 FROM listing_blocked_dates bd
+      WHERE bd.listing_id = l.id
+        AND bd.start_date < $${a} AND bd.end_date > $${b}
     )`)
   }
 
@@ -223,6 +227,80 @@ export async function getListingById(id: string): Promise<Listing | null> {
   return (rows[0] as Listing) ?? null
 }
 
+// ---- Availability -----------------------------------------------------------
+
+/** One unavailable span on a listing's calendar. `kind` says why: an active
+ *  booking ('booked') or a manual host block ('blocked'). Half-open [start,end). */
+export interface UnavailableRange {
+  id: string
+  start: string
+  end: string
+  kind: 'booked' | 'blocked'
+  note: string | null
+}
+
+/** Every span a listing is NOT bookable: non-cancelled bookings + host blocks.
+ *  Public (no guest data leaks — only dates). Used to grey out calendar days. */
+export async function getListingAvailability(listingId: string): Promise<UnavailableRange[]> {
+  if (!isUuid(listingId)) return []
+  const { rows } = await pool.query(
+    `SELECT id::text AS id,
+            to_char(check_in, 'YYYY-MM-DD') AS start,
+            to_char(check_out, 'YYYY-MM-DD') AS "end",
+            'booked'::text AS kind, NULL::text AS note
+       FROM bookings
+      WHERE listing_id = $1 AND status <> 'cancelled'
+     UNION ALL
+     SELECT id::text AS id,
+            to_char(start_date, 'YYYY-MM-DD') AS start,
+            to_char(end_date, 'YYYY-MM-DD') AS "end",
+            'blocked'::text AS kind, note
+       FROM listing_blocked_dates
+      WHERE listing_id = $1
+      ORDER BY start ASC`,
+    [listingId]
+  )
+  return rows as UnavailableRange[]
+}
+
+/** Host blocks a date range on their own listing (returns null if not the host
+ *  or the listing doesn't exist). Half-open [start,end); end must be after start. */
+export async function blockListingDates(
+  listingId: string,
+  hostUserId: string,
+  start: string,
+  end: string,
+  note: string | null = null
+): Promise<UnavailableRange | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+  if (!isDate(start) || !isDate(end)) throw new Error('Invalid dates (use YYYY-MM-DD)')
+  if (end <= start) throw new Error('End must be after start')
+  const owns = await pool.query(`SELECT 1 FROM listings WHERE id = $1 AND host_id = $2`, [listingId, hostUserId])
+  if (!owns.rowCount) return null
+  const { rows } = await pool.query(
+    `INSERT INTO listing_blocked_dates (listing_id, start_date, end_date, note)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id::text AS id,
+               to_char(start_date, 'YYYY-MM-DD') AS start,
+               to_char(end_date, 'YYYY-MM-DD') AS "end",
+               'blocked'::text AS kind, note`,
+    [listingId, start, end, note]
+  )
+  return (rows[0] as UnavailableRange) ?? null
+}
+
+/** Host removes one of their own blocks. Returns true if a row was deleted. */
+export async function unblockListingDates(blockId: string, hostUserId: string): Promise<boolean> {
+  if (!isUuid(blockId) || !isUuid(hostUserId)) return false
+  const { rowCount } = await pool.query(
+    `DELETE FROM listing_blocked_dates b
+      USING listings l
+      WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2`,
+    [blockId, hostUserId]
+  )
+  return (rowCount ?? 0) > 0
+}
+
 // ---- Bookings ---------------------------------------------------------------
 
 const BOOKING_COLS = `
@@ -255,8 +333,13 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
 
   const clash = await pool.query(
     `SELECT 1 FROM bookings
-     WHERE listing_id = $1 AND status <> 'cancelled'
-       AND check_in < $2 AND check_out > $3 LIMIT 1`,
+       WHERE listing_id = $1 AND status <> 'cancelled'
+         AND check_in < $2 AND check_out > $3
+     UNION ALL
+     SELECT 1 FROM listing_blocked_dates
+       WHERE listing_id = $1
+         AND start_date < $2 AND end_date > $3
+     LIMIT 1`,
     [listingId, checkOut, checkIn]
   )
   if (clash.rowCount && clash.rowCount > 0) throw new Error('Those dates are not available')
