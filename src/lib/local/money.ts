@@ -143,3 +143,86 @@ export async function getHostEarnings(hostId: string): Promise<HostEarnings> {
     recent: recent.slice(0, 50),
   }
 }
+
+export interface HostAnalytics {
+  currency: string
+  listings: number
+  totalBookings: number
+  paidBookings: number
+  cancelledBookings: number
+  revenue: number
+  avgRating: number
+  reviewCount: number
+  conversionRate: number // paid / total bookings
+  byMonth: { month: string; bookings: number; revenue: number }[]
+  topListings: { title: string; bookings: number; revenue: number }[]
+}
+
+/** A host's performance dashboard: bookings, revenue (host net), rating,
+ *  conversion, a 6-month trend, and top listings. All derived (no tracking). */
+export async function getHostAnalytics(hostId: string): Promise<HostAnalytics> {
+  const empty: HostAnalytics = {
+    currency: 'EGP', listings: 0, totalBookings: 0, paidBookings: 0, cancelledBookings: 0,
+    revenue: 0, avgRating: 0, reviewCount: 0, conversionRate: 0, byMonth: [], topListings: [],
+  }
+  if (!isUuid(hostId)) return empty
+
+  const head = await pool.query(
+    `SELECT
+       (SELECT count(*) FROM listings l WHERE l.host_id = $1)::int AS listings,
+       (SELECT count(*) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1)::int AS total_bookings,
+       (SELECT count(*) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1 AND COALESCE(b.payment_status,'unpaid') = 'paid')::int AS paid_bookings,
+       (SELECT count(*) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1 AND b.status = 'cancelled')::int AS cancelled_bookings,
+       COALESCE((SELECT sum(b.total_price) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1 AND COALESCE(b.payment_status,'unpaid') = 'paid'), 0)::float8 AS gross_revenue,
+       COALESCE((SELECT round(avg(r.rating)::numeric, 2) FROM reviews r JOIN listings l ON l.id = r.listing_id WHERE l.host_id = $1), 0)::float8 AS avg_rating,
+       (SELECT count(*) FROM reviews r JOIN listings l ON l.id = r.listing_id WHERE l.host_id = $1)::int AS review_count`,
+    [hostId]
+  )
+  const h = head.rows[0]
+
+  const monthly = await pool.query(
+    `SELECT to_char(date_trunc('month', b.paid_at), 'YYYY-MM') AS month,
+            count(*)::int AS bookings,
+            COALESCE(sum(b.total_price), 0)::float8 AS revenue
+       FROM bookings b JOIN listings l ON l.id = b.listing_id
+      WHERE l.host_id = $1 AND COALESCE(b.payment_status,'unpaid') = 'paid' AND b.paid_at IS NOT NULL
+        AND b.paid_at > now() - interval '6 months'
+      GROUP BY 1 ORDER BY 1`,
+    [hostId]
+  )
+
+  const top = await pool.query(
+    `SELECT l.title,
+            count(b.id)::int AS bookings,
+            COALESCE(sum(CASE WHEN COALESCE(b.payment_status,'unpaid') = 'paid' THEN b.total_price ELSE 0 END), 0)::float8 AS revenue
+       FROM listings l LEFT JOIN bookings b ON b.listing_id = l.id AND b.status <> 'cancelled'
+      WHERE l.host_id = $1
+      GROUP BY l.id, l.title ORDER BY revenue DESC, bookings DESC LIMIT 5`,
+    [hostId]
+  )
+
+  const totalBookings = Number(h.total_bookings)
+  const paidBookings = Number(h.paid_bookings)
+  return {
+    currency: 'EGP',
+    listings: Number(h.listings),
+    totalBookings,
+    paidBookings,
+    cancelledBookings: Number(h.cancelled_bookings),
+    // Revenue = host net (90% of paid gross), consistent with the earnings view.
+    revenue: Math.round(Number(h.gross_revenue) * (1 - HOST_COMMISSION)),
+    avgRating: Number(h.avg_rating),
+    reviewCount: Number(h.review_count),
+    conversionRate: totalBookings > 0 ? Math.round((paidBookings / totalBookings) * 100) / 100 : 0,
+    byMonth: monthly.rows.map((m) => ({
+      month: m.month,
+      bookings: Number(m.bookings),
+      revenue: Math.round(Number(m.revenue) * (1 - HOST_COMMISSION)),
+    })),
+    topListings: top.rows.map((t) => ({
+      title: t.title,
+      bookings: Number(t.bookings),
+      revenue: Math.round(Number(t.revenue) * (1 - HOST_COMMISSION)),
+    })),
+  }
+}

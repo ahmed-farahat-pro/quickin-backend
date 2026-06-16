@@ -131,3 +131,36 @@ export async function createTravelChatStream(
     },
   })
 }
+
+/**
+ * One-shot (non-streaming) chat completion. Returns the assistant's text.
+ * Pass `json: true` to ask for a JSON object back (response_format json_object).
+ * Throws if the key is missing or the request fails.
+ */
+export async function createCompletion(
+  messages: ChatMessage[],
+  opts: { json?: boolean; temperature?: number; maxTokens?: number } = {}
+): Promise<string> {
+  const apiKey = process.env.OPENAI_API_KEY?.trim()
+  if (!apiKey) throw new Error('OPENAI_API_KEY is not set')
+  const model = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini'
+  const res = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      temperature: opts.temperature ?? 0.7,
+      max_tokens: opts.maxTokens ?? 600,
+      ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
+      messages,
+    }),
+  })
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(`OpenAI request failed (${res.status}): ${detail.slice(0, 300)}`)
+  }
+  const data = await res.json()
+  const content = data?.choices?.[0]?.message?.content
+  if (typeof content !== 'string') throw new Error('OpenAI returned no content')
+  return content.trim()
+}
