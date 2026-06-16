@@ -89,6 +89,8 @@ export async function POST(req: Request) {
       amenities: Array.isArray(b.amenities) ? b.amenities : undefined,
       cancellationPolicy: b.cancellation_policy ?? b.cancellationPolicy,
       ownershipDoc: b.ownership_doc ?? b.ownershipDoc,
+      weeklyDiscount: b.weekly_discount ?? b.weeklyDiscount,
+      monthlyDiscount: b.monthly_discount ?? b.monthlyDiscount,
     })
     return NextResponse.json(listing, { status: 201, headers: CORS })
   } catch (err) {
