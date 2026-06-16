@@ -78,10 +78,11 @@ function loadAssets(): Record<string, Buffer> {
   return buffers
 }
 
+// Bookings are charged in EGP, so the pass shows EGP (not a $ amount).
 function money(amount: number | null | undefined): string {
   const n = Number(amount)
   if (!Number.isFinite(n)) return '—'
-  return `$${n.toFixed(2)}`
+  return `EGP ${Math.round(n).toLocaleString('en-US')}`
 }
 
 export async function GET(req: Request, ctx: { params: Promise<{ bookingId: string }> }) {
