@@ -88,6 +88,7 @@ export async function POST(req: Request) {
       images: Array.isArray(b.images) ? b.images : undefined,
       amenities: Array.isArray(b.amenities) ? b.amenities : undefined,
       cancellationPolicy: b.cancellation_policy ?? b.cancellationPolicy,
+      ownershipDoc: b.ownership_doc ?? b.ownershipDoc,
     })
     return NextResponse.json(listing, { status: 201, headers: CORS })
   } catch (err) {

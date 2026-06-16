@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server'
-import { getListingById, updateListingPolicy } from '@/lib/local/db'
+import { getListingById, updateListingPolicy, setListingOwnershipDoc } from '@/lib/local/db'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // GET   /api/local/listings/:id → a single listing (no Supabase).
 // PATCH /api/local/listings/:id { cancellation_policy } → host updates the policy.
+//        ... { ownership_doc } → host (re)submits the ownership doc → re-queues for review.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -51,9 +52,18 @@ export async function PATCH(
     const user = await getUserFromRequest(req)
     if (!user) return NextResponse.json({ error: 'Please sign in' }, { status: 401, headers: CORS })
     const b = await req.json().catch(() => ({}))
+
+    // Host (re)submits ownership proof → re-queues the listing for review.
+    const doc = b.ownership_doc ?? b.ownershipDoc
+    if (typeof doc === 'string' && doc.trim()) {
+      const updated = await setListingOwnershipDoc(id, user.id, doc)
+      if (!updated) return NextResponse.json({ error: 'Only the listing host can edit this listing' }, { status: 403, headers: CORS })
+      return NextResponse.json(updated, { headers: CORS })
+    }
+
     const policy = b.cancellation_policy ?? b.cancellationPolicy
     if (typeof policy !== 'string') {
-      return NextResponse.json({ error: 'cancellation_policy is required' }, { status: 400, headers: CORS })
+      return NextResponse.json({ error: 'cancellation_policy or ownership_doc is required' }, { status: 400, headers: CORS })
     }
     const updated = await updateListingPolicy(id, user.id, policy)
     if (!updated) {

@@ -43,6 +43,7 @@ export interface Listing {
   property_type: string | null
   region: string | null
   cancellation_policy: string
+  approval_status: string
   host_id: string | null
   host_name: string | null
   host_verified: boolean
@@ -114,6 +115,7 @@ export const LISTING_COLS = `
   l.price_per_night::float8 AS price_per_night, l.currency,
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
+  COALESCE(l.approval_status, 'approved') AS approval_status,
   l.host_id, (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
   COALESCE((SELECT u.verification_status = 'verified' FROM users u WHERE u.id = l.host_id), false) AS host_verified,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
@@ -597,6 +599,74 @@ export async function updateListingPolicy(
   return getListingById(listingId)
 }
 
+// ---- Listing approval queue (S7) -------------------------------------------
+
+/** Listings awaiting moderation, with the host's name/email + the ownership doc
+ *  (admin only — the doc is never exposed publicly). */
+export async function listPendingListings(): Promise<
+  (Listing & { host_email: string | null; ownership_doc: string | null })[]
+> {
+  const { rows } = await pool.query(
+    `SELECT ${LISTING_COLS},
+            (SELECT u.email FROM users u WHERE u.id = l.host_id) AS host_email,
+            l.ownership_doc
+       FROM listings l
+      WHERE COALESCE(l.approval_status, 'approved') = 'pending'
+      ORDER BY l.created_at DESC`
+  )
+  return rows as (Listing & { host_email: string | null; ownership_doc: string | null })[]
+}
+
+/** Admin approves (publish + 'approved') or rejects (unpublish + 'rejected') a
+ *  listing; notifies the host. Returns the refreshed listing. */
+export async function setListingApproval(listingId: string, approve: boolean): Promise<Listing | null> {
+  if (!isUuid(listingId)) return null
+  const status = approve ? 'approved' : 'rejected'
+  const { rows } = await pool.query(
+    `UPDATE listings SET approval_status = $2, is_published = $3 WHERE id = $1
+     RETURNING id, host_id, title`,
+    [listingId, status, approve]
+  )
+  const r = rows[0]
+  if (!r) return null
+  if (r.host_id) {
+    await createNotification(r.host_id, {
+      type: approve ? 'listing_approved' : 'listing_rejected',
+      title: approve ? 'Your listing is live 🎉' : 'Listing needs changes',
+      body: approve
+        ? `“${r.title}” has been approved and is now visible to guests.`
+        : `“${r.title}” wasn’t approved. Please review the details and resubmit.`,
+      link: '/host',
+    })
+    await sendPush(r.host_id, {
+      title: approve ? 'Listing approved 🎉' : 'Listing not approved',
+      body: r.title,
+      link: '/host',
+    })
+  }
+  return getListingById(listingId)
+}
+
+/** Host uploads/replaces their ownership doc → re-queues the listing to
+ *  'pending' (and unpublishes) for re-review. Host-only. */
+export async function setListingOwnershipDoc(
+  listingId: string,
+  hostUserId: string,
+  doc: string
+): Promise<Listing | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+  const d = String(doc ?? '').trim()
+  if (!/^(data:image\/|https?:\/\/)/i.test(d)) throw new Error('Please attach a photo of the document')
+  if (d.length > 3_500_000) throw new Error('That image is too large')
+  const { rowCount } = await pool.query(
+    `UPDATE listings SET ownership_doc = $3, approval_status = 'pending', is_published = false
+      WHERE id = $1 AND host_id = $2`,
+    [listingId, hostUserId, d]
+  )
+  if (!rowCount) return null
+  return getListingById(listingId)
+}
+
 export interface StayPass {
   reservation_code: string | null
   title: string
@@ -663,6 +733,7 @@ export interface CreateListingInput {
   images?: string[]
   amenities?: string[]
   cancellationPolicy?: string
+  ownershipDoc?: string
 }
 
 /** A host (or admin) creates a listing. Returns the full listing with images. */
@@ -672,19 +743,24 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   const price = Number(input.pricePerNight)
   if (!Number.isFinite(price) || price <= 0) throw new Error('Price must be a positive number')
 
+  // New listings enter the moderation queue: unpublished + 'pending' until an
+  // admin approves them (S7). Ownership doc (if provided) is stored for review.
+  const ownershipDoc = typeof input.ownershipDoc === 'string' && /^(data:image\/|https?:\/\/)/i.test(input.ownershipDoc) && input.ownershipDoc.length < 3_500_000
+    ? input.ownershipDoc
+    : null
   const { rows } = await pool.query(
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
         bedrooms, beds, bathrooms, max_guests, property_type, region, lat, lng, listing_code, is_published, amenities,
-        cancellation_policy)
-     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,true,$16,$17)
+        cancellation_policy, approval_status, ownership_doc)
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18)
      RETURNING id`,
     [
       hostUserId, input.title.trim(), input.description ?? null, input.location ?? null, input.country ?? null,
       price, Math.max(0, Math.floor(input.bedrooms ?? 1)), Math.max(0, Math.floor(input.beds ?? 1)),
       Math.max(0, Math.floor(input.bathrooms ?? 1)), Math.max(1, Math.floor(input.maxGuests ?? 2)),
       input.propertyType ?? 'Apartment', input.region ?? null, input.lat ?? null, input.lng ?? null, genReservationCode(),
-      input.amenities ?? [], normalizePolicy(input.cancellationPolicy),
+      input.amenities ?? [], normalizePolicy(input.cancellationPolicy), ownershipDoc,
     ]
   )
   const id = rows[0].id as string
@@ -694,16 +770,16 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   }
   const created = await getListingById(id)
   if (!created) throw new Error('Failed to create listing')
-  // Confirm to the host that their listing is published + live.
+  // New listings await admin approval before going live (S7).
   await createNotification(hostUserId, {
-    type: 'listing_live',
-    title: 'Your listing is live',
-    body: `“${created.title}” is now published and visible to guests.`,
+    type: 'listing_submitted',
+    title: 'Listing submitted for review',
+    body: `“${created.title}” is under review. We’ll let you know once it’s approved.`,
     link: '/host',
   })
   await sendPush(hostUserId, {
-    title: 'Your listing is live 🎉',
-    body: created.title,
+    title: 'Listing submitted for review',
+    body: `${created.title} — pending approval`,
     link: '/host',
   })
   return created
