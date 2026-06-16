@@ -77,6 +77,8 @@ export interface SearchFilters {
   propertyType?: string
   /** Listings must have ALL of these amenities. */
   amenities?: string[]
+  /** Map viewport bounds for "search this area". */
+  bbox?: { minLat: number; minLng: number; maxLat: number; maxLng: number }
   sort?: ListingSort
 }
 
@@ -161,6 +163,17 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
   if (Array.isArray(filters.amenities) && filters.amenities.length > 0) {
     params.push(filters.amenities)
     where.push(`COALESCE(l.amenities, '{}') @> $${params.length}::text[]`)
+  }
+  // Map viewport bounds ("search this area"): keep listings inside the box.
+  if (filters.bbox) {
+    const { minLat, minLng, maxLat, maxLng } = filters.bbox
+    if ([minLat, minLng, maxLat, maxLng].every((n) => Number.isFinite(n))) {
+      params.push(minLat); const a = params.length
+      params.push(maxLat); const b = params.length
+      params.push(minLng); const c = params.length
+      params.push(maxLng); const d = params.length
+      where.push(`l.lat BETWEEN $${a} AND $${b} AND l.lng BETWEEN $${c} AND $${d}`)
+    }
   }
   if (filters.checkIn && filters.checkOut && isDate(filters.checkIn) && isDate(filters.checkOut)) {
     params.push(filters.checkOut)

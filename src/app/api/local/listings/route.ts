@@ -30,6 +30,15 @@ export async function GET(req: Request) {
     const amenities = sp.get('amenities')
       ? sp.get('amenities')!.split(',').map((s) => s.trim()).filter(Boolean)
       : undefined
+    // "Search this area": bbox=minLng,minLat,maxLng,maxLat (GeoJSON west,south,east,north order).
+    let bbox: { minLat: number; minLng: number; maxLat: number; maxLng: number } | undefined
+    if (sp.get('bbox')) {
+      const parts = sp.get('bbox')!.split(',').map((s) => Number(s.trim()))
+      if (parts.length === 4 && parts.every(Number.isFinite)) {
+        const [minLng, minLat, maxLng, maxLat] = parts
+        bbox = { minLat, minLng, maxLat, maxLng }
+      }
+    }
     const listings = await getListings({
       // `q` is the new free-text param; `location` is kept for back-compat.
       q: sp.get('q') || undefined,
@@ -43,6 +52,7 @@ export async function GET(req: Request) {
       maxPrice: num('maxPrice'),
       propertyType: sp.get('propertyType') || undefined,
       amenities,
+      bbox,
       sort: (sp.get('sort') as 'recommended' | 'price_asc' | 'price_desc' | 'newest' | null) || undefined,
     })
     return NextResponse.json(listings, { headers: CORS })
