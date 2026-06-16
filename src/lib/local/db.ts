@@ -42,6 +42,7 @@ export interface Listing {
   max_guests: number | null
   property_type: string | null
   region: string | null
+  cancellation_policy: string
   host_id: string | null
   host_name: string | null
   is_guest_favorite: boolean
@@ -102,12 +103,16 @@ export interface Booking {
   paid_at: string | null
   host_notes: string | null
   amenities: string[]
+  cancellation_policy: string
+  cancelled_at: string | null
+  refund_percent: number | null
 }
 
 export const LISTING_COLS = `
   l.id, l.title, l.description, l.location, l.country,
   l.price_per_night::float8 AS price_per_night, l.currency,
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
+  COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
   l.host_id, (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
   COALESCE(l.amenities, '{}') AS amenities,
@@ -311,6 +316,9 @@ const BOOKING_COLS = `
   COALESCE(b.payment_status, 'unpaid') AS payment_status,
   to_char(b.paid_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS paid_at,
   b.host_notes,
+  COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
+  to_char(b.cancelled_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS cancelled_at,
+  b.refund_percent,
   to_char(b.created_at, 'YYYY-MM-DD') AS created_at,
   l.title, l.location, l.region, l.host_id,
   (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image
@@ -459,6 +467,134 @@ export async function setBookingNotes(bookingId: string, hostUserId: string, not
   return (rows[0] as Booking) ?? null
 }
 
+// ---- Cancellation policy ----------------------------------------------------
+
+export type CancellationPolicy = 'flexible' | 'moderate' | 'strict'
+export const CANCELLATION_POLICIES: CancellationPolicy[] = ['flexible', 'moderate', 'strict']
+
+/** Coerce arbitrary input to a valid policy (defaults to 'moderate'). */
+export function normalizePolicy(p?: string | null): CancellationPolicy {
+  const v = String(p ?? '').toLowerCase().trim()
+  return (CANCELLATION_POLICIES as string[]).includes(v) ? (v as CancellationPolicy) : 'moderate'
+}
+
+export interface CancellationQuote {
+  policy: CancellationPolicy
+  daysUntilCheckIn: number
+  refundPercent: number
+  refundAmount: number
+  total: number
+  currency: string
+}
+
+/** Refund % a guest gets for cancelling `daysUntilCheckIn` before check-in,
+ *  given the listing's policy. Mock semantics (no real gateway yet):
+ *   flexible — 100% if ≥1 day out, else 0%.
+ *   moderate — 100% if ≥5 days out, else 50%.
+ *   strict   — 50% if ≥7 days out, else 0%. */
+export function refundPercentFor(policy: CancellationPolicy, daysUntilCheckIn: number): number {
+  switch (policy) {
+    case 'flexible':
+      return daysUntilCheckIn >= 1 ? 100 : 0
+    case 'strict':
+      return daysUntilCheckIn >= 7 ? 50 : 0
+    case 'moderate':
+    default:
+      return daysUntilCheckIn >= 5 ? 100 : 50
+  }
+}
+
+function daysUntil(dateStr: string): number {
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const target = new Date(dateStr + 'T00:00:00')
+  return Math.floor((target.getTime() - today.getTime()) / 86_400_000)
+}
+
+/** What the guest would get back if they cancelled now (no mutation). */
+export async function getCancellationQuote(bookingId: string, userId: string): Promise<CancellationQuote | null> {
+  if (!isUuid(bookingId) || !isUuid(userId)) return null
+  const { rows } = await pool.query(
+    `SELECT b.user_id, b.total_price::float8 AS total, b.status,
+            to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+            COALESCE(l.cancellation_policy, 'moderate') AS policy, l.currency
+       FROM bookings b JOIN listings l ON l.id = b.listing_id
+      WHERE b.id = $1`,
+    [bookingId]
+  )
+  const b = rows[0]
+  if (!b || b.user_id !== userId) return null
+  const policy = normalizePolicy(b.policy)
+  const days = daysUntil(b.check_in)
+  const refundPercent = refundPercentFor(policy, days)
+  const total = Number(b.total) || 0
+  return {
+    policy,
+    daysUntilCheckIn: days,
+    refundPercent,
+    refundAmount: Math.round((total * refundPercent) / 100),
+    total,
+    currency: b.currency ?? 'EGP',
+  }
+}
+
+/** A guest cancels their own (pending/confirmed) booking. Records the mock
+ *  refund per the listing's policy, sets status='cancelled', notifies the host.
+ *  Returns the updated booking + the quote, or null if it isn't the guest's /
+ *  can't be cancelled. */
+export async function cancelBooking(
+  bookingId: string,
+  userId: string
+): Promise<{ booking: Booking; quote: CancellationQuote } | null> {
+  const quote = await getCancellationQuote(bookingId, userId)
+  if (!quote) return null
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE bookings b SET
+         status = 'cancelled',
+         cancelled_at = now(),
+         refund_percent = $3,
+         refund_amount = $4
+       WHERE b.id = $1 AND b.user_id = $2 AND b.status IN ('pending', 'confirmed')
+       RETURNING *
+     )
+     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+    [bookingId, userId, quote.refundPercent, quote.refundAmount]
+  )
+  const booking = rows[0] as Booking | undefined
+  if (!booking) return null
+  if (booking.host_id) {
+    await createNotification(booking.host_id, {
+      type: 'booking_cancelled',
+      title: 'Reservation cancelled',
+      body: `${booking.title} — ${booking.check_in} → ${booking.check_out} was cancelled by the guest.`,
+      link: '/host',
+    })
+    await sendPush(booking.host_id, {
+      title: 'Reservation cancelled',
+      body: `${booking.title} (${booking.reservation_code ?? ''})`,
+      link: '/host',
+    })
+  }
+  return { booking, quote }
+}
+
+/** Host updates the cancellation policy on their own listing. Returns the
+ *  refreshed listing, or null if the caller isn't the host. */
+export async function updateListingPolicy(
+  listingId: string,
+  hostUserId: string,
+  policy: string
+): Promise<Listing | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+  const { rowCount } = await pool.query(
+    `UPDATE listings SET cancellation_policy = $3 WHERE id = $1 AND host_id = $2`,
+    [listingId, hostUserId, normalizePolicy(policy)]
+  )
+  if (!rowCount) return null
+  return getListingById(listingId)
+}
+
 export interface StayPass {
   reservation_code: string | null
   title: string
@@ -524,6 +660,7 @@ export interface CreateListingInput {
   lng?: number
   images?: string[]
   amenities?: string[]
+  cancellationPolicy?: string
 }
 
 /** A host (or admin) creates a listing. Returns the full listing with images. */
@@ -536,15 +673,16 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   const { rows } = await pool.query(
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
-        bedrooms, beds, bathrooms, max_guests, property_type, region, lat, lng, listing_code, is_published, amenities)
-     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,true,$16)
+        bedrooms, beds, bathrooms, max_guests, property_type, region, lat, lng, listing_code, is_published, amenities,
+        cancellation_policy)
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,true,$16,$17)
      RETURNING id`,
     [
       hostUserId, input.title.trim(), input.description ?? null, input.location ?? null, input.country ?? null,
       price, Math.max(0, Math.floor(input.bedrooms ?? 1)), Math.max(0, Math.floor(input.beds ?? 1)),
       Math.max(0, Math.floor(input.bathrooms ?? 1)), Math.max(1, Math.floor(input.maxGuests ?? 2)),
       input.propertyType ?? 'Apartment', input.region ?? null, input.lat ?? null, input.lng ?? null, genReservationCode(),
-      input.amenities ?? [],
+      input.amenities ?? [], normalizePolicy(input.cancellationPolicy),
     ]
   )
   const id = rows[0].id as string
