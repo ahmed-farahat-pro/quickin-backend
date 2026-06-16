@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/local/auth'
-import { createReview, getListingReviews, getReviewableBookings } from '@/lib/local/reviews'
+import { createGuestReview, getGuestReviews, getReviewableGuests } from '@/lib/local/reviews'
 
-// GET  /api/local/reviews?listing_id=...  → public reviews for a listing
-// GET  /api/local/reviews                 → (Bearer) the signed-in guest's reviewable stays
-// POST /api/local/reviews { booking_id, rating, comment }  → (Bearer) leave/replace a review
+// Two-way reviews: the host's review OF the guest.
+//   GET  /api/local/guest-reviews?guest_id=...  → public reviews about a guest
+//   GET  /api/local/guest-reviews               → (Bearer host) stays the host can review the guest for
+//   POST /api/local/guest-reviews { booking_id, rating, comment }  → (Bearer host) leave/replace a guest review
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -25,33 +26,32 @@ export async function OPTIONS() {
 
 export async function GET(req: Request) {
   try {
-    const listingId = new URL(req.url).searchParams.get('listing_id')
-    if (listingId) {
-      return NextResponse.json(await getListingReviews(listingId), { headers: CORS })
+    const guestId = new URL(req.url).searchParams.get('guest_id')
+    if (guestId) {
+      return NextResponse.json(await getGuestReviews(guestId), { headers: CORS })
     }
     const user = await getUserFromRequest(req)
     if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    return NextResponse.json(await getReviewableBookings(user.id), { headers: CORS })
+    return NextResponse.json(await getReviewableGuests(user.id), { headers: CORS })
   } catch (err) {
-    return NextResponse.json({ error: 'Failed to load reviews', detail: String(err) }, { status: 500, headers: CORS })
+    return NextResponse.json({ error: 'Failed to load guest reviews', detail: String(err) }, { status: 500, headers: CORS })
   }
 }
 
 export async function POST(req: Request) {
   try {
     const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Please sign in to leave a review' }, { status: 401, headers: CORS })
+    if (!user) return NextResponse.json({ error: 'Please sign in to review a guest' }, { status: 401, headers: CORS })
     const b = await req.json().catch(() => ({}))
-    const review = await createReview({
-      userId: user.id,
+    const review = await createGuestReview({
+      hostId: user.id,
       bookingId: String(b.booking_id ?? b.bookingId ?? ''),
       rating: Number(b.rating),
       comment: b.comment,
-      photos: b.photos,
     })
     return NextResponse.json(review, { status: 201, headers: CORS })
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Failed to submit review'
+    const msg = err instanceof Error ? err.message : 'Failed to submit guest review'
     return NextResponse.json({ error: msg }, { status: 400, headers: CORS })
   }
 }
