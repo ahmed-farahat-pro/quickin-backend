@@ -95,6 +95,8 @@ export interface Booking {
   image: string | null
   reservation_code: string | null
   host_id: string | null
+  payment_status: string
+  paid_at: string | null
   amenities: string[]
 }
 
@@ -213,6 +215,8 @@ const BOOKING_COLS = `
   to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
   to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
   b.guests, b.total_price::float8 AS total_price, b.status,
+  COALESCE(b.payment_status, 'unpaid') AS payment_status,
+  to_char(b.paid_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS paid_at,
   to_char(b.created_at, 'YYYY-MM-DD') AS created_at,
   l.title, l.location, l.host_id,
   (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image
@@ -293,6 +297,45 @@ export async function getUserBookings(userId: string): Promise<Booking[]> {
     [userId]
   )
   return rows as Booking[]
+}
+
+/** MOCK payment — there is no real gateway yet (Paymob comes later). Marks the
+ *  booking paid for its owner, confirms it (mock = instant book + pay), records a
+ *  fake reference, and returns the updated booking. Returns null if the booking
+ *  isn't the user's. Always "succeeds" for a valid owner. */
+export async function markBookingPaid(bookingId: string, userId: string): Promise<Booking | null> {
+  if (!isUuid(bookingId) || !isUuid(userId)) return null
+  const ref = 'QK-MOCK-' + genReservationCode().replace(/^QK-/, '')
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE bookings b SET
+         payment_status = 'paid',
+         paid_at = now(),
+         payment_method = 'mock',
+         payment_ref = $3,
+         status = CASE WHEN b.status = 'pending' THEN 'confirmed' ELSE b.status END
+       WHERE b.id = $1 AND b.user_id = $2
+       RETURNING *
+     )
+     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+    [bookingId, userId, ref]
+  )
+  const booking = rows[0] as Booking | undefined
+  if (!booking) return null
+  if (booking.host_id) {
+    await createNotification(booking.host_id, {
+      type: 'booking_paid',
+      title: 'Booking paid',
+      body: `${booking.title} is booked & paid · ${booking.check_in} → ${booking.check_out}`,
+      link: '/host',
+    })
+    await sendPush(booking.host_id, {
+      title: 'Booking paid 🎉',
+      body: `${booking.title} — ${booking.reservation_code ?? ''}`,
+      link: '/host',
+    })
+  }
+  return booking
 }
 
 // ---- Reservation lifecycle: host listings + booking confirmation -------------
