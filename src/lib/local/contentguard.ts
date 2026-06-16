@@ -94,14 +94,32 @@ export function containsPhoneNumber(text: string): boolean {
   return false
 }
 
-/** Cross-message check: does the sender's recent history + this new message
- *  combine into a phone number (the "split it across messages" trick)? Only
- *  flags when the NEW message itself contributes digits. */
+/** A "number fragment" is a message that's mostly digits with little/no prose —
+ *  the tell-tale shape of a phone number being spelled out across messages
+ *  ("010", "1 2 3", "double five", "٤٥"). Normal chat ("see you at 2pm",
+ *  "2 guests", "room 401") is NOT a fragment, so it never accumulates. */
+function isNumberFragment(text: string): boolean {
+  const norm = normalizeForPhone(text)
+  const digits = (norm.match(/\d/g) || []).length
+  if (digits === 0) return false
+  const letters = (norm.match(/[a-z؀-ۿ]/g) || []).length
+  return letters <= 3
+}
+
+/** Cross-message check: is the sender drip-feeding a phone number across messages
+ *  (one digit/chunk at a time, possibly with chatter in between)? Only acts when
+ *  the NEW message is itself a number fragment, then stitches together the digit
+ *  content of EVERY fragment in the recent window — so "0","1","0","1",… or
+ *  "010" / "1234567" / "8" all combine and get blocked, while legitimate stray
+ *  numbers (a guest count, a room number) don't. */
 export function combinesIntoPhoneNumber(previousBodies: string[], newBody: string): boolean {
-  const newNorm = collapseDigitSeparators(normalizeForPhone(newBody))
-  if (!/\d/.test(newNorm)) return false // new message adds no digits → not completing a split
-  const combined = [...previousBodies, newBody].join(' ')
-  return containsPhoneNumber(combined)
+  if (!isNumberFragment(newBody)) return false
+  const fragments = [...previousBodies, newBody].filter(isNumberFragment)
+  if (fragments.length < 2) return false
+  // Normalize EACH fragment first (so "zero"/"one" keep word boundaries), then
+  // stitch the digit forms together and test the concatenation.
+  const stitched = fragments.map((f) => normalizeForPhone(f)).join(' ')
+  return containsPhoneNumber(stitched)
 }
 
 export const PHONE_BLOCK_MESSAGE =

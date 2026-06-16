@@ -1074,7 +1074,7 @@ export async function createMessage(bookingId: string, senderId: string, body: s
   // sender's recent messages in this thread.
   if (containsPhoneNumber(text)) throw new Error(PHONE_BLOCK_MESSAGE)
   const recent = await pool.query(
-    `SELECT body FROM messages WHERE booking_id = $1 AND sender_id = $2 ORDER BY created_at DESC LIMIT 6`,
+    `SELECT body FROM messages WHERE booking_id = $1 AND sender_id = $2 ORDER BY created_at DESC LIMIT 16`,
     [bookingId, senderId]
   )
   const priorBodies = recent.rows.map((r) => String(r.body || '')).reverse()
