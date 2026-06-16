@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getBookingById, setBookingStatus } from '@/lib/local/db'
+import { getBookingById, setBookingStatus, setBookingNotes } from '@/lib/local/db'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // Single reservation.
@@ -46,6 +46,16 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     const user = await getUserFromRequest(req)
     if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
     const body = await req.json().catch(() => ({}))
+
+    // Host attaches/updates the notes shown on the stay's QR pass (no status change).
+    if (typeof body.host_notes === 'string') {
+      const updated = await setBookingNotes(id, user.id, body.host_notes)
+      if (!updated) {
+        return NextResponse.json({ error: 'Only the listing host can edit stay notes' }, { status: 403, headers: CORS })
+      }
+      return NextResponse.json(updated, { headers: CORS })
+    }
+
     const action = String(body.status ?? body.action ?? '')
     const status = /^confirm/i.test(action) ? 'confirmed' : /^reject/i.test(action) ? 'rejected' : null
     if (!status) {

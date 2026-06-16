@@ -14,6 +14,9 @@ const CORS = {
 }
 // Mocked guest service fee added on top of the stay subtotal.
 const SERVICE_FEE_RATE = 0.1
+// Payment-method adjustment on the subtotal: paying by card adds 5%, paying by
+// bank transfer takes 5% off. (Mock — no real gateway yet.)
+const METHOD_RATE: Record<string, number> = { card: 0.05, bank_transfer: -0.05 }
 
 export async function OPTIONS() {
   return new Response(null, {
@@ -37,9 +40,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     if (existing.user_id !== user.id) {
       return NextResponse.json({ error: 'Not allowed' }, { status: 403, headers: CORS })
     }
-    // (Card details in the body, if any, are ignored — this is a mock.)
+    // Payment method drives a ±5% adjustment (card +5%, bank transfer −5%).
+    // Card details, if any, are ignored — this is a mock.
+    const body = await req.json().catch(() => ({}))
+    const method = body?.method === 'bank_transfer' ? 'bank_transfer' : 'card'
 
-    const booking = await markBookingPaid(id, user.id)
+    const booking = await markBookingPaid(id, user.id, method)
     if (!booking) return NextResponse.json({ error: 'Payment could not be recorded' }, { status: 500, headers: CORS })
 
     const nights = Math.max(
@@ -48,17 +54,20 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     )
     const subtotal = Math.round(booking.total_price)
     const serviceFee = Math.round(subtotal * SERVICE_FEE_RATE)
-    const total = subtotal + serviceFee
+    // Signed: positive surcharge for card, negative discount for bank transfer.
+    const methodFee = Math.round(subtotal * (METHOD_RATE[method] ?? 0))
+    const total = subtotal + serviceFee + methodFee
     const receipt = {
       currency: 'EGP',
       nights,
       nightly: Math.round(subtotal / nights),
       subtotal,
       serviceFee,
+      method,
+      methodFee, // +ve = card surcharge, −ve = bank-transfer discount
       total,
       reference: booking.reservation_code,
       paidAt: booking.paid_at,
-      method: 'mock',
     }
     return NextResponse.json({ ok: true, booking, receipt }, { headers: CORS })
   } catch (err) {

@@ -92,11 +92,13 @@ export interface Booking {
   created_at: string
   title: string
   location: string | null
+  region: string | null
   image: string | null
   reservation_code: string | null
   host_id: string | null
   payment_status: string
   paid_at: string | null
+  host_notes: string | null
   amenities: string[]
 }
 
@@ -217,8 +219,9 @@ const BOOKING_COLS = `
   b.guests, b.total_price::float8 AS total_price, b.status,
   COALESCE(b.payment_status, 'unpaid') AS payment_status,
   to_char(b.paid_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS paid_at,
+  b.host_notes,
   to_char(b.created_at, 'YYYY-MM-DD') AS created_at,
-  l.title, l.location, l.host_id,
+  l.title, l.location, l.region, l.host_id,
   (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image
 `
 
@@ -303,22 +306,27 @@ export async function getUserBookings(userId: string): Promise<Booking[]> {
  *  booking paid for its owner, confirms it (mock = instant book + pay), records a
  *  fake reference, and returns the updated booking. Returns null if the booking
  *  isn't the user's. Always "succeeds" for a valid owner. */
-export async function markBookingPaid(bookingId: string, userId: string): Promise<Booking | null> {
+export async function markBookingPaid(
+  bookingId: string,
+  userId: string,
+  method = 'card'
+): Promise<Booking | null> {
   if (!isUuid(bookingId) || !isUuid(userId)) return null
+  const m = method === 'bank_transfer' ? 'bank_transfer' : method === 'mock' ? 'mock' : 'card'
   const ref = 'QK-MOCK-' + genReservationCode().replace(/^QK-/, '')
   const { rows } = await pool.query(
     `WITH upd AS (
        UPDATE bookings b SET
          payment_status = 'paid',
          paid_at = now(),
-         payment_method = 'mock',
+         payment_method = $4,
          payment_ref = $3,
          status = CASE WHEN b.status = 'pending' THEN 'confirmed' ELSE b.status END
        WHERE b.id = $1 AND b.user_id = $2
        RETURNING *
      )
      SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
-    [bookingId, userId, ref]
+    [bookingId, userId, ref, m]
   )
   const booking = rows[0] as Booking | undefined
   if (!booking) return null
@@ -336,6 +344,62 @@ export async function markBookingPaid(bookingId: string, userId: string): Promis
     })
   }
   return booking
+}
+
+/** Host attaches free-text notes to a stay (directions, gate code, city tips…)
+ *  shown on the QR-linked pass page. Only the listing's host may set them. */
+export async function setBookingNotes(bookingId: string, hostUserId: string, notes: string): Promise<Booking | null> {
+  if (!isUuid(bookingId) || !isUuid(hostUserId)) return null
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE bookings b SET host_notes = $3
+       FROM listings l
+       WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2
+       RETURNING b.*
+     )
+     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+    [bookingId, hostUserId, (notes ?? '').slice(0, 2000)]
+  )
+  return (rows[0] as Booking) ?? null
+}
+
+export interface StayPass {
+  reservation_code: string | null
+  title: string
+  location: string | null
+  region: string | null
+  check_in: string
+  check_out: string
+  guests: number
+  status: string
+  payment_status: string
+  host_notes: string | null
+  guest_name: string | null
+  host_name: string | null
+  image: string | null
+}
+
+/** Public stay "pass" data, looked up by the reservation code embedded in the
+ *  QR. Returns only non-sensitive fields (no emails/phones) so the QR link is
+ *  safe to open by anyone holding the code. */
+export async function getStayByCode(code: string): Promise<StayPass | null> {
+  const c = (code || '').trim().toUpperCase()
+  if (!c) return null
+  const { rows } = await pool.query(
+    `SELECT b.reservation_code,
+            l.title, l.location, l.region,
+            to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+            to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            b.guests, b.status, COALESCE(b.payment_status, 'unpaid') AS payment_status,
+            b.host_notes,
+            (SELECT split_part(u.full_name, ' ', 1) FROM users u WHERE u.id = b.user_id) AS guest_name,
+            (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
+            (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image
+       FROM bookings b JOIN listings l ON l.id = b.listing_id
+      WHERE upper(b.reservation_code) = $1 LIMIT 1`,
+    [c]
+  )
+  return (rows[0] as StayPass) ?? null
 }
 
 // ---- Reservation lifecycle: host listings + booking confirmation -------------
