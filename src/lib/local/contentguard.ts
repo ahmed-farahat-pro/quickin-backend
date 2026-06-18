@@ -113,13 +113,31 @@ function isNumberFragment(text: string): boolean {
  *  "010" / "1234567" / "8" all combine and get blocked, while legitimate stray
  *  numbers (a guest count, a room number) don't. */
 export function combinesIntoPhoneNumber(previousBodies: string[], newBody: string): boolean {
-  if (!isNumberFragment(newBody)) return false
-  const fragments = [...previousBodies, newBody].filter(isNumberFragment)
-  if (fragments.length < 2) return false
-  // Normalize EACH fragment first (so "zero"/"one" keep word boundaries), then
-  // stitch the digit forms together and test the concatenation.
-  const stitched = fragments.map((f) => normalizeForPhone(f)).join(' ')
-  return containsPhoneNumber(stitched)
+  const newNorm = normalizeForPhone(newBody)
+  if (!/\d/.test(newNorm)) return false // the new message adds no digits → can't complete a number
+
+  // Path 1 — bare number-fragments drip-fed one chunk at a time ("010","1234567","8").
+  if (isNumberFragment(newBody)) {
+    const fragments = [...previousBodies, newBody].filter(isNumberFragment)
+    // Normalize EACH fragment first (so "zero"/"one" keep word boundaries), then
+    // stitch the digit forms together and test the concatenation.
+    if (fragments.length >= 2 && containsPhoneNumber(fragments.map((f) => normalizeForPhone(f)).join(' '))) {
+      return true
+    }
+  }
+
+  // Path 2 — digits hidden inside ordinary sentences spread across several messages,
+  // but the recent window shows clear intent to share contact (a CONTACT_HINT like
+  // "reach me"/"my number"/"whatsapp"). Stitch every digit across the window and look
+  // for a phone-SHAPED number — not just any long run — so order/tracking/booking
+  // numbers stated in passing don't false-positive.
+  const windowNorm = normalizeForPhone([...previousBodies, newBody].join('  '))
+  if (CONTACT_HINT.test(windowNorm)) {
+    const digits = collapseDigitSeparators(windowNorm).replace(/\D/g, '')
+    if (/01[0125]\d{8}/.test(digits)) return true // Egyptian mobile (11 digits) split across messages
+    if (/(?:\+|00)\s*\d[\d\s.\-]{7,}/.test(windowNorm)) return true // international form anywhere in the window
+  }
+  return false
 }
 
 export const PHONE_BLOCK_MESSAGE =
