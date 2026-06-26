@@ -1,0 +1,266 @@
+[
+  {
+    "area": "Auth",
+    "name": "Guest login",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Auth",
+    "name": "Host login",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Auth",
+    "name": "Admin login",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Guest",
+    "name": "List published listings",
+    "ok": true,
+    "detail": "11 listings"
+  },
+  {
+    "area": "Guest",
+    "name": "Listing has real rating or 0 (no fake)",
+    "ok": true,
+    "detail": "rating=5 reviews=2"
+  },
+  {
+    "area": "Guest",
+    "name": "Listing detail",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Guest",
+    "name": "Availability",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Guest",
+    "name": "Seasonal quote",
+    "ok": true,
+    "detail": "total 39100 EGP, seasonal=true"
+  },
+  {
+    "area": "Guest",
+    "name": "Listing reviews",
+    "ok": true,
+    "detail": "2 reviews"
+  },
+  {
+    "area": "Guest",
+    "name": "Live currencies",
+    "ok": "live",
+    "detail": "source=live"
+  },
+  {
+    "area": "Guest",
+    "name": "Create booking",
+    "ok": true,
+    "detail": "status=pending"
+  },
+  {
+    "area": "Guest",
+    "name": "Pay (mock) → confirmed",
+    "ok": true,
+    "detail": "total 17940 EGP"
+  },
+  {
+    "area": "Guest",
+    "name": "Receipt currency is EGP",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Guest",
+    "name": "Wallet pass (confirmed)",
+    "ok": true,
+    "detail": "http 200"
+  },
+  {
+    "area": "Guest",
+    "name": "Cancellation quote",
+    "ok": "moderate",
+    "detail": "policy=moderate refund=100%"
+  },
+  {
+    "area": "Guest",
+    "name": "Cancel booking",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Guest",
+    "name": "My reservations",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Guest",
+    "name": "Receipts",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Guest",
+    "name": "Referrals",
+    "ok": true,
+    "detail": "code=82CC0EE2"
+  },
+  {
+    "area": "Guest",
+    "name": "Profile has country",
+    "ok": true,
+    "detail": "country=Egypt"
+  },
+  {
+    "area": "Guest",
+    "name": "Wishlist add",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Guest",
+    "name": "Wishlist remove",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Chat",
+    "name": "Normal message sends",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Chat",
+    "name": "Phone number blocked",
+    "ok": true,
+    "detail": "For your safety, sharing phone numbers i"
+  },
+  {
+    "area": "Chat",
+    "name": "Spelled-out phone blocked",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Host",
+    "name": "Public profile (no PII)",
+    "ok": true,
+    "detail": "verified=false superhost=false"
+  },
+  {
+    "area": "Host",
+    "name": "Host reviews",
+    "ok": true,
+    "detail": "4 reviews"
+  },
+  {
+    "area": "Host",
+    "name": "Host other listings",
+    "ok": true,
+    "detail": "2 listings"
+  },
+  {
+    "area": "Host",
+    "name": "Earnings",
+    "ok": true,
+    "detail": "earned 0 pending 0"
+  },
+  {
+    "area": "Host",
+    "name": "Analytics",
+    "ok": true,
+    "detail": "bookings 2 rating 4.75"
+  },
+  {
+    "area": "Host",
+    "name": "Booking requests",
+    "ok": true,
+    "detail": "2"
+  },
+  {
+    "area": "Host",
+    "name": "Reviewable guests",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Host",
+    "name": "Create listing enters pending review",
+    "ok": true,
+    "detail": "status=pending"
+  },
+  {
+    "area": "Host",
+    "name": "Edit cancellation policy",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Host",
+    "name": "Edit discounts",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Host",
+    "name": "Edit seasonal pricing",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Admin",
+    "name": "Overview",
+    "ok": true,
+    "detail": "14 users"
+  },
+  {
+    "area": "Admin",
+    "name": "Pending listings queue",
+    "ok": true,
+    "detail": "2 pending"
+  },
+  {
+    "area": "Admin",
+    "name": "Approve listing → now public",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Admin",
+    "name": "Verifications queue",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Admin",
+    "name": "Reports queue",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Admin",
+    "name": "Create promo",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "area": "Admin",
+    "name": "Promo validates",
+    "ok": true,
+    "detail": "discount 100"
+  },
+  {
+    "area": "Cleanup",
+    "name": "Removed E2E test data",
+    "ok": true,
+    "detail": ""
+  }
+]
