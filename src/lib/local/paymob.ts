@@ -49,13 +49,14 @@ export async function createIntention(opts: {
   billing: PaymobBilling
   notificationUrl: string
   redirectionUrl: string
+  integrationId?: string | number
 }): Promise<{ clientSecret: string; intentionId: string; checkoutUrl: string }> {
   if (!paymobConfigured) throw new Error('Paymob not configured')
   const NA = 'NA'
   const body = {
     amount: opts.amountCents,
     currency: opts.currency,
-    payment_methods: [Number(INTEGRATION_ID)],
+    payment_methods: [Number(opts.integrationId || INTEGRATION_ID)],
     special_reference: opts.specialReference,
     notification_url: opts.notificationUrl,
     redirection_url: opts.redirectionUrl,
