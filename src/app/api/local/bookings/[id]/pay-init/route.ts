@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getBookingById } from '@/lib/local/db'
 import { getUserFromRequest, getUserById } from '@/lib/local/auth'
-import { createPayment, paymobConfigured, paymobDiagnostics } from '@/lib/local/paymob'
+import { createIntention, paymobConfigured, paymobDiagnostics } from '@/lib/local/paymob'
 
 // POST /api/local/bookings/:id/pay-init — start a REAL Paymob card payment for a booking.
 // Returns the hosted-iframe URL the client opens (WebView/browser). The booking is marked
@@ -43,14 +43,23 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       email: u?.email || me.email,
       phone_number: 'NA',
     }
-    const merchantOrderId = `${id}__${Date.now()}`
-    const pay = await createPayment({ amountCents, currency: 'EGP', merchantOrderId, billing })
+    const origin = new URL(req.url).origin
+    const specialReference = `${id}__${Date.now()}`
+    const intent = await createIntention({
+      amountCents,
+      currency: 'EGP',
+      specialReference,
+      billing,
+      notificationUrl: `${origin}/api/paymob/webhook`,
+      redirectionUrl: `${origin}/api/paymob/return?booking=${id}`,
+    })
 
     return NextResponse.json({
       ok: true,
-      iframe_url: pay.iframeUrl,
-      payment_token: pay.paymentToken,
-      order_id: pay.orderId,
+      checkout_url: intent.checkoutUrl,
+      client_secret: intent.clientSecret,
+      intention_id: intent.intentionId,
+      return_url_prefix: `${origin}/api/paymob/return`,
       amount_cents: amountCents,
       currency: 'EGP',
       reference: bk.reservation_code,
