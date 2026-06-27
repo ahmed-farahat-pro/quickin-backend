@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmailRole, verifyPassword, signToken } from '@/lib/local/auth'
+import { getUserRowByEmail, verifyPassword, signToken } from '@/lib/local/auth'
 
 export const dynamic = 'force-dynamic'
 
@@ -29,7 +29,7 @@ export async function OPTIONS() {
 // unverified email accounts (so the client can route to OTP), and returns role.
 export async function POST(req: Request) {
   try {
-    const { email, password, role } = await req.json()
+    const { email, password } = await req.json()
     if (!email || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: CORS })
     }
@@ -48,14 +48,12 @@ export async function POST(req: Request) {
     }
 
     // ---- Regular email/password user ----
-    // The (email, role) account. One email can have a SEPARATE guest and host
-    // account; the chosen role selects which one to sign into. Each has its own
-    // password, profile and data.
-    const desired = role === 'host' ? 'host' : 'user'
-    const row = await getUserRowByEmailRole(ident, desired)
+    // ONE unified account per email — no guest/host split (matches the web). Host
+    // capability is a flag on the same account, gained via "become a host".
+    const row = await getUserRowByEmail(ident)
     if (!row || !verifyPassword(String(password), row.password_hash)) {
       return NextResponse.json(
-        { error: `No ${desired === 'host' ? 'host' : 'guest'} account matches that email and password. Register first if you haven't.` },
+        { error: 'Invalid email or password' },
         { status: 401, headers: CORS }
       )
     }

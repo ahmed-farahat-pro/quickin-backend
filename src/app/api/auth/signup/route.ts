@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import {
-  getUserRowByEmailRole,
+  getUserRowByEmail,
   hashPassword,
   createPendingUser,
   setUserOtp,
@@ -33,7 +33,7 @@ export async function OPTIONS() {
 // the client then calls /api/auth/verify-otp with the code to activate + receive a token.
 export async function POST(req: Request) {
   try {
-    const { email, password, full_name, role, country: rawCountry } = await req.json()
+    const { email, password, full_name, country: rawCountry } = await req.json()
     if (!email || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: CORS })
     }
@@ -41,18 +41,15 @@ export async function POST(req: Request) {
     if (String(password).length < 6) {
       return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400, headers: CORS })
     }
-    // Only 'user' or 'host' may self-register — never 'admin'.
-    const chosenRole = role === 'host' ? 'host' : 'user'
     const cleanEmail = String(email).trim()
     const fullName = String(full_name || '').trim() || cleanEmail.split('@')[0]
 
-    // One email can hold TWO SEPARATE accounts: one guest, one host. Each is keyed
-    // by (email, role), registers independently, and verifies its own OTP. So we
-    // only look at the account for THIS role.
-    const existing = await getUserRowByEmailRole(cleanEmail, chosenRole)
+    // ONE unified account per email (no guest/host split — matches the web). New
+    // accounts register as a regular user; hosting is gained later via "become a host".
+    const existing = await getUserRowByEmail(cleanEmail)
     if (existing && existing.email_verified) {
       return NextResponse.json(
-        { error: `You already have a ${chosenRole === 'host' ? 'host' : 'guest'} account with this email. Please sign in.` },
+        { error: 'An account with this email already exists. Please sign in.' },
         { status: 409, headers: CORS }
       )
     }
@@ -61,16 +58,16 @@ export async function POST(req: Request) {
     const otpExpires = new Date(Date.now() + OTP_TTL_MS)
 
     if (existing) {
-      // Unverified (email, role) re-signing up → refresh its OTP + details.
-      await setUserOtp({ email: cleanEmail, otp, otpExpires, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole, country })
+      // Unverified account re-signing up → refresh its OTP + details.
+      await setUserOtp({ email: cleanEmail, otp, otpExpires, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: 'user', country })
     } else {
-      await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: chosenRole, otp, otpExpires, country })
+      await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: 'user', otp, otpExpires, country })
     }
 
     await sendOtpEmail(cleanEmail, otp)
 
     return NextResponse.json(
-      { pending: true, email: cleanEmail, role: chosenRole, ...(smtpConfigured ? {} : { devCode: otp }) },
+      { pending: true, email: cleanEmail, ...(smtpConfigured ? {} : { devCode: otp }) },
       { headers: CORS }
     )
   } catch (err) {
