@@ -1039,6 +1039,88 @@ export async function getBookingById(bookingId: string): Promise<Booking | null>
   return (rows[0] as Booking) ?? null
 }
 
+// ---- ID verification (id_verifications table — shared with web /ops admin) ---
+
+export type VerificationTableStatus = 'unverified' | 'pending' | 'verified' | 'rejected'
+
+export interface VerificationTableState {
+  status: VerificationTableStatus
+  verified_at: string | null
+}
+
+/** Submit FRONT (+ optional BACK) ID photos for review → upserts the user's
+ *  PENDING row in id_verifications (the table the web /ops admin reads), so
+ *  mobile-submitted IDs are visible to admins. Reuses an existing pending row.
+ *  Stores FRONT→image_data, BACK→back_image_data, source='manual',
+ *  status='pending'. */
+export async function submitVerificationImages(args: {
+  userId: string
+  front: string
+  back?: string | null
+  idNumber?: string | null
+  fullName?: string | null
+}): Promise<VerificationTableState> {
+  const { userId, front, back = null, idNumber = null, fullName = null } = args
+  if (!isUuid(userId)) throw new Error('Invalid user')
+  const f = String(front ?? '').trim()
+  if (!/^data:image\//i.test(f) && !/^https?:\/\//i.test(f)) {
+    throw new Error('Please attach a photo of the front of your ID')
+  }
+  if (f.length > 3_500_000) throw new Error('That front image is too large')
+  const b = back == null ? null : String(back).trim() || null
+  if (b && !/^data:image\//i.test(b) && !/^https?:\/\//i.test(b)) {
+    throw new Error('Please attach a valid photo of the back of your ID')
+  }
+  if (b && b.length > 3_500_000) throw new Error('That back image is too large')
+
+  const existing = await pool.query(
+    `SELECT id FROM id_verifications WHERE user_id = $1 AND status = 'pending' LIMIT 1`,
+    [userId]
+  )
+  if (existing.rows[0]) {
+    await pool.query(
+      `UPDATE id_verifications
+          SET image_data = $2, back_image_data = $3,
+              id_number = COALESCE($4, id_number),
+              full_name = COALESCE($5, full_name),
+              source = 'manual', status = 'pending',
+              submitted_at = now(), reviewed_at = NULL, reviewed_by = NULL, notes = NULL
+        WHERE id = $1`,
+      [existing.rows[0].id, f, b, idNumber, fullName]
+    )
+  } else {
+    await pool.query(
+      `INSERT INTO id_verifications (user_id, image_data, back_image_data, id_number, full_name, source, status)
+       VALUES ($1, $2, $3, $4, $5, 'manual', 'pending')`,
+      [userId, f, b, idNumber, fullName]
+    )
+  }
+  return { status: 'pending', verified_at: null }
+}
+
+/** The signed-in user's verification status, read from the latest
+ *  id_verifications row. Defaults to 'unverified' when no row exists.
+ *  verified_at is the review timestamp once status is 'verified'. */
+export async function getVerificationStatusFromTable(userId: string): Promise<VerificationTableState> {
+  if (!isUuid(userId)) return { status: 'unverified', verified_at: null }
+  const { rows } = await pool.query(
+    `SELECT status,
+            CASE WHEN status = 'verified'
+                 THEN to_char(reviewed_at, 'YYYY-MM-DD"T"HH24:MI:SS') END AS verified_at
+       FROM id_verifications
+      WHERE user_id = $1
+      ORDER BY submitted_at DESC
+      LIMIT 1`,
+    [userId]
+  )
+  const r = rows[0]
+  if (!r) return { status: 'unverified', verified_at: null }
+  return {
+    status: (r.status as VerificationTableStatus) ?? 'unverified',
+    verified_at: r.verified_at ?? null,
+  }
+}
+
 // ---- Chat: per-booking messages between guest and host ----------------------
 
 export interface Message {

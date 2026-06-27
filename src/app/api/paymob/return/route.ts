@@ -9,12 +9,15 @@ export const dynamic = 'force-dynamic'
 
 export async function GET(req: Request) {
   const sp = new URL(req.url).searchParams
-  const success = sp.get('success') === 'true'
+  const confirmedNoCharge = sp.get('confirmed') === '1'
+  const success = confirmedNoCharge || sp.get('success') === 'true'
   const booking = sp.get('booking') || ''
-  const title = success ? 'Payment received' : 'Payment not completed'
-  const msg = success
-    ? 'Your reservation is confirmed. You can return to the QuickIn app.'
-    : 'No charge was made. You can return to the app and try again.'
+  const title = confirmedNoCharge ? 'Reservation confirmed' : success ? 'Payment received' : 'Payment not completed'
+  const msg = confirmedNoCharge
+    ? 'Your reservation is confirmed. Payment will be arranged directly with your host. You can return to the QuickIn app.'
+    : success
+      ? 'Your reservation is confirmed. You can return to the QuickIn app.'
+      : 'No charge was made. You can return to the app and try again.'
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>QuickIn — ${title}</title>

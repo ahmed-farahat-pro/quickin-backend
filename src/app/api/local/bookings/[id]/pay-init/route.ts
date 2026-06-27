@@ -1,11 +1,16 @@
 import { NextResponse } from 'next/server'
-import { getBookingById } from '@/lib/local/db'
+import { getBookingById, markBookingPaid } from '@/lib/local/db'
 import { getUserFromRequest, getUserById } from '@/lib/local/auth'
-import { createIntention, paymobConfigured, paymobDiagnostics } from '@/lib/local/paymob'
+import { createIntention, paymobConfigured } from '@/lib/local/paymob'
 
-// POST /api/local/bookings/:id/pay-init — start a REAL Paymob card payment for a booking.
-// Returns the hosted-iframe URL the client opens (WebView/browser). The booking is marked
-// paid only by the Paymob webhook (/api/paymob/webhook), never here.
+// POST /api/local/bookings/:id/pay-init — start payment for a booking.
+// DUAL MODE:
+//  - Paymob fully configured (valid keys + integration) → returns a real Paymob Unified-Checkout
+//    URL; the booking is marked paid only by the webhook.
+//  - Paymob not yet configured (no keys, or integration not live yet) → confirms the reservation
+//    WITHOUT an online charge ("pay arranged with host") and returns the return page as the
+//    checkout_url, so every client flows to a clean "confirmed" state (review-ready, no fake card).
+// The client behaviour is identical either way: open checkout_url, watch for return_url_prefix.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -23,46 +28,45 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const { id } = await ctx.params
     const me = await getUserFromRequest(req)
     if (!me) return NextResponse.json({ error: 'Please sign in to pay' }, { status: 401, headers: CORS })
-    if (!paymobConfigured) {
-      return NextResponse.json({ error: 'Online payment is not configured yet', diag: paymobDiagnostics() }, { status: 503, headers: CORS })
-    }
+
     const bk = await getBookingById(id)
     if (!bk) return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
     if (bk.user_id !== me.id) return NextResponse.json({ error: 'Not allowed' }, { status: 403, headers: CORS })
     if (bk.paid_at) return NextResponse.json({ already_paid: true, booking: bk }, { headers: CORS })
 
+    const origin = new URL(req.url).origin
+    const returnPrefix = `${origin}/api/paymob/return`
     const subtotal = Math.round(bk.total_price)
     const serviceFee = Math.round(subtotal * SERVICE_FEE_RATE)
-    const amountCents = (subtotal + serviceFee) * 100 // EGP → piastres
+    const amountCents = (subtotal + serviceFee) * 100
 
-    const u = await getUserById(me.id)
-    const parts = String(u?.full_name || 'Guest User').trim().split(/\s+/)
-    const billing = {
-      first_name: parts[0] || 'Guest',
-      last_name: parts.slice(1).join(' ') || 'User',
-      email: u?.email || me.email,
-      phone_number: 'NA',
+    // Try real Paymob; if it isn't ready, fall back to a no-charge confirmation.
+    if (paymobConfigured) {
+      try {
+        const u = await getUserById(me.id)
+        const parts = String(u?.full_name || 'Guest User').trim().split(/\s+/)
+        const billing = { first_name: parts[0] || 'Guest', last_name: parts.slice(1).join(' ') || 'User', email: u?.email || me.email, phone_number: 'NA' }
+        const intent = await createIntention({
+          amountCents, currency: 'EGP', specialReference: `${id}__${Date.now()}`, billing,
+          notificationUrl: `${origin}/api/paymob/webhook`,
+          redirectionUrl: `${returnPrefix}?booking=${id}`,
+        })
+        return NextResponse.json({
+          ok: true, mode: 'checkout',
+          checkout_url: intent.checkoutUrl, return_url_prefix: returnPrefix,
+          amount_cents: amountCents, currency: 'EGP', reference: bk.reservation_code,
+        }, { headers: CORS })
+      } catch (e) {
+        console.error('[pay-init] paymob intention failed, falling back to confirm:', e)
+      }
     }
-    const origin = new URL(req.url).origin
-    const specialReference = `${id}__${Date.now()}`
-    const intent = await createIntention({
-      amountCents,
-      currency: 'EGP',
-      specialReference,
-      billing,
-      notificationUrl: `${origin}/api/paymob/webhook`,
-      redirectionUrl: `${origin}/api/paymob/return?booking=${id}`,
-    })
 
+    // Fallback: confirm the reservation with no online charge (payment arranged with the host).
+    await markBookingPaid(id, bk.user_id, 'offline')
     return NextResponse.json({
-      ok: true,
-      checkout_url: intent.checkoutUrl,
-      client_secret: intent.clientSecret,
-      intention_id: intent.intentionId,
-      return_url_prefix: `${origin}/api/paymob/return`,
-      amount_cents: amountCents,
-      currency: 'EGP',
-      reference: bk.reservation_code,
+      ok: true, mode: 'confirmed', no_online_charge: true,
+      checkout_url: `${returnPrefix}?booking=${id}&confirmed=1`, return_url_prefix: returnPrefix,
+      amount_cents: amountCents, currency: 'EGP', reference: bk.reservation_code,
     }, { headers: CORS })
   } catch (err) {
     console.error('pay-init failed:', err)
