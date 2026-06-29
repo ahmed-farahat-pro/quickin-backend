@@ -33,43 +33,44 @@ export async function POST(req: Request) {
   try {
     const url = new URL(req.url)
     const body = await req.json().catch(() => null)
-    // hmac is normally in the query; tolerate the body too.
-    const hmac = url.searchParams.get('hmac') || String(body?.hmac || '')
-    // Accept both shapes: { type:'TRANSACTION', obj:{...} } and a raw transaction object.
-    const obj = (body?.obj ?? body) as Record<string, unknown> | null
+    // The transaction object lives under different keys across Paymob flows:
+    //   Unified Checkout / Intention → body.transaction ; legacy iframe → body.obj ; raw → body.
+    const tx = (body?.transaction ?? body?.obj ?? body) as Record<string, unknown> | null
+    // The signature may arrive in the query (?hmac=) or in the body (body.hmac). Try both.
+    const hmacCandidates = [url.searchParams.get('hmac'), body?.hmac].filter(Boolean).map((h) => String(h))
 
     // TEMP DIAGNOSTIC (structure only — no PII values). Remove once settlement is confirmed.
     {
-      const ord = (obj?.order || {}) as Record<string, unknown>
+      const ord = (tx?.order || {}) as Record<string, unknown>
       console.log(
-        '[paymob][diag] bodyType=%s hmac=%s objKeys=[%s] orderKeys=[%s] success=%s pending=%s refunded=%s voided=%s txn=%s merchant_order_id=%s amount_cents=%s',
-        body?.type, hmac ? 'present' : 'MISSING',
-        obj ? Object.keys(obj).join(',') : 'null',
-        Object.keys(ord).join(','),
-        String(obj?.success), String(obj?.pending), String(obj?.is_refunded), String(obj?.is_voided),
-        String(obj?.id), String(ord.merchant_order_id), String(obj?.amount_cents),
+        '[paymob][diag] bodyKeys=[%s] txKeys=[%s] hmacCands=%d success=%s pending=%s refunded=%s voided=%s txn=%s merchant_order_id=%s amount_cents=%s',
+        body ? Object.keys(body).join(',') : 'null',
+        tx ? Object.keys(tx).join(',') : 'null',
+        hmacCandidates.length,
+        String(tx?.success), String(tx?.pending), String(tx?.is_refunded), String(tx?.is_voided),
+        String(tx?.id), String(ord.merchant_order_id), String(tx?.amount_cents),
       )
     }
 
-    if (!obj || (body?.type && body.type !== 'TRANSACTION')) {
-      console.log(`[paymob] ignored: bodyType=${body?.type} hasObj=${!!obj}`)
+    if (!tx || typeof tx !== 'object') {
+      console.log('[paymob] ignored: no transaction object in payload')
       return NextResponse.json({ ok: true, ignored: true })
     }
-    if (!verifyTransactionHmac(obj, hmac)) {
-      console.error('[paymob] webhook rejected: HMAC mismatch', JSON.stringify(debugTransactionHmac(obj, hmac)))
+    if (!hmacCandidates.some((h) => verifyTransactionHmac(tx, h))) {
+      console.error('[paymob] webhook rejected: HMAC mismatch', JSON.stringify(debugTransactionHmac(tx, hmacCandidates[0] || '')))
       return NextResponse.json({ error: 'invalid signature' }, { status: 401 })
     }
-    const txnId = String(obj.id ?? '')
-    const bookingId = recoverBookingId(body, obj)
+    const txnId = String(tx.id ?? '')
+    const bookingId = recoverBookingId(body, tx)
     if (!bookingId) {
       console.log(`[paymob] txn ${txnId} — could not recover booking id; ignored`)
       return NextResponse.json({ ok: true, ignored: true })
     }
 
-    const success = truthy(obj.success)
-    const pending = truthy(obj.pending)
-    const refunded = truthy(obj.is_refunded)
-    const voided = truthy(obj.is_voided)
+    const success = truthy(tx.success)
+    const pending = truthy(tx.pending)
+    const refunded = truthy(tx.is_refunded)
+    const voided = truthy(tx.is_voided)
 
     // Exhaustive outcome handling. paid is the ONLY state that sets paid_at; the rest just
     // record status for the UI. The webhook is the single source of truth for all of these.
