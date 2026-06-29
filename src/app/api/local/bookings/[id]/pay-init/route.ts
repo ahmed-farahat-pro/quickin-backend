@@ -4,13 +4,12 @@ import { getUserFromRequest, getUserById } from '@/lib/local/auth'
 import { createIntention, paymobConfigured } from '@/lib/local/paymob'
 
 // POST /api/local/bookings/:id/pay-init — start payment for a booking.
-// DUAL MODE:
-//  - Paymob fully configured (valid keys + integration) → returns a real Paymob Unified-Checkout
-//    URL; the booking is marked paid only by the webhook.
-//  - Paymob not yet configured (no keys, or integration not live yet) → confirms the reservation
-//    WITHOUT an online charge ("pay arranged with host") and returns the return page as the
-//    checkout_url, so every client flows to a clean "confirmed" state (review-ready, no fake card).
-// The client behaviour is identical either way: open checkout_url, watch for return_url_prefix.
+//  - Paymob configured → returns a real Unified-Checkout URL; the booking is marked paid ONLY by
+//    the webhook (source of truth). If the intention can't be created, we return an error and do
+//    NOT confirm the booking (no free confirmations).
+//  - Paymob NOT configured → production fails with 503 (misconfiguration); dev/preview mock-confirms
+//    so local flows complete. Clients: if `checkout_url` is a Paymob URL, open it; the mock path
+//    returns the return page as checkout_url.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -52,6 +51,14 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     if (!bk) return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
     if (bk.user_id !== me.id) return NextResponse.json({ error: 'Not allowed' }, { status: 403, headers: CORS })
     if (bk.paid_at) return NextResponse.json({ already_paid: true, booking: bk }, { headers: CORS })
+    // Only an approved reservation can be paid — the gateway is authoritative, so enforce it here
+    // (not just in the UI). Pending/cancelled/rejected bookings must never reach checkout.
+    if (bk.status === 'pending') {
+      return NextResponse.json({ error: 'This reservation is awaiting host approval — you can pay once it is approved.' }, { status: 409, headers: CORS })
+    }
+    if (bk.status !== 'confirmed') {
+      return NextResponse.json({ error: 'This reservation can no longer be paid.' }, { status: 409, headers: CORS })
+    }
 
     const origin = new URL(req.url).origin
     const returnPrefix = `${origin}/api/paymob/return`
@@ -62,7 +69,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const serviceFee = Math.round(subtotal * SERVICE_FEE_RATE)
     const amountCents = (subtotal + serviceFee) * 100
 
-    // Try real Paymob; if it isn't ready, fall back to a no-charge confirmation.
+    // Paymob configured → create the intention. On error, surface a failure to the client;
+    // NEVER fall through to marking the booking paid (that would confirm it without a charge).
     if (paymobConfigured) {
       try {
         const u = await getUserById(me.id)
@@ -79,14 +87,26 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           amount_cents: amountCents, currency: 'EGP', reference: bk.reservation_code,
         }, { headers: CORS })
       } catch (e) {
-        console.error('[pay-init] paymob intention failed, falling back to confirm:', e)
+        console.error('[pay-init] paymob intention failed:', e)
+        return NextResponse.json(
+          { error: 'Could not start the card payment. Please try again in a moment.' },
+          { status: 502, headers: CORS }
+        )
       }
     }
 
-    // Fallback: confirm the reservation with no online charge (payment arranged with the host).
-    await markBookingPaid(id, bk.user_id, 'offline')
+    // Paymob NOT configured. In production this is a misconfiguration — fail loudly rather than
+    // confirming the booking for free. In dev/preview, mock-confirm so local flows still complete.
+    if (process.env.NODE_ENV === 'production') {
+      console.error('[pay-init] Paymob is not configured in production — refusing to free-confirm')
+      return NextResponse.json(
+        { error: 'Online payment is temporarily unavailable. Please try again later.' },
+        { status: 503, headers: CORS }
+      )
+    }
+    await markBookingPaid(id, bk.user_id, 'mock')
     return NextResponse.json({
-      ok: true, mode: 'confirmed', no_online_charge: true,
+      ok: true, mode: 'mock', no_online_charge: true,
       checkout_url: `${returnPrefix}?booking=${id}&confirmed=1`, return_url_prefix: returnPrefix,
       amount_cents: amountCents, currency: 'EGP', reference: bk.reservation_code,
     }, { headers: CORS })

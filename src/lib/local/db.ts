@@ -448,28 +448,39 @@ export async function getUserBookings(userId: string): Promise<Booking[]> {
 export async function markBookingPaid(
   bookingId: string,
   userId: string,
-  method = 'card'
+  method = 'card',
+  paymentRef?: string,
 ): Promise<Booking | null> {
   if (!isUuid(bookingId) || !isUuid(userId)) return null
   const m = method === 'bank_transfer' ? 'bank_transfer' : method === 'mock' ? 'mock' : 'card'
-  const ref = 'QK-MOCK-' + genReservationCode().replace(/^QK-/, '')
+  // Prefer the gateway's real transaction reference (e.g. the Paymob transaction id) so the
+  // payment can be reconciled; only synthesize a QK-MOCK ref for the dev/mock path with none.
+  const ref = paymentRef && String(paymentRef).trim()
+    ? String(paymentRef).trim()
+    : 'QK-MOCK-' + genReservationCode().replace(/^QK-/, '')
+  // Idempotent on gateway retries: COALESCE keeps the first paid_at/ref/method. `prev` captures
+  // whether it was already paid, so the host is notified exactly once even if Paymob re-posts.
   const { rows } = await pool.query(
-    `WITH upd AS (
+    `WITH prev AS (
+       SELECT paid_at AS prev_paid_at FROM bookings WHERE id = $1 AND user_id = $2
+     ), upd AS (
        UPDATE bookings b SET
          payment_status = 'paid',
-         paid_at = now(),
-         payment_method = $4,
-         payment_ref = $3,
+         paid_at = COALESCE(b.paid_at, now()),
+         payment_method = COALESCE(b.payment_method, $4),
+         payment_ref = COALESCE(b.payment_ref, $3),
          status = CASE WHEN b.status = 'pending' THEN 'confirmed' ELSE b.status END
        WHERE b.id = $1 AND b.user_id = $2
        RETURNING *
      )
-     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+     SELECT ${BOOKING_COLS}, prev.prev_paid_at FROM upd b JOIN listings l ON l.id = b.listing_id, prev`,
     [bookingId, userId, ref, m]
   )
-  const booking = rows[0] as Booking | undefined
-  if (!booking) return null
-  if (booking.host_id) {
+  const row = rows[0] as (Booking & { prev_paid_at: string | null }) | undefined
+  if (!row) return null
+  const booking = row as Booking
+  const newlyPaid = !row.prev_paid_at
+  if (newlyPaid && booking.host_id) {
     await createNotification(booking.host_id, {
       type: 'booking_paid',
       title: 'Booking paid',
@@ -483,6 +494,31 @@ export async function markBookingPaid(
     })
   }
   return booking
+}
+
+/** Record a NON-success Paymob outcome from the (HMAC-verified, trusted) webhook. Never grants
+ *  payment, and never touches payment_ref — that column is reserved for the SUCCESSFUL txn id, so
+ *  a later success isn't masked by an earlier failure. 'failed'/'pending' only apply while still
+ *  unpaid (a late failure must not un-pay a confirmed booking); 'refunded'/'voided' reverse a prior
+ *  payment (clear paid_at). id-scoped only (server-to-server). Returns true if a row was updated.
+ *  The transaction id is captured in the webhook logs for audit. */
+export async function setBookingPaymentOutcome(
+  bookingId: string,
+  outcome: 'failed' | 'pending' | 'refunded' | 'voided',
+): Promise<boolean> {
+  if (!isUuid(bookingId)) return false
+  if (outcome === 'refunded' || outcome === 'voided') {
+    const { rowCount } = await pool.query(
+      `UPDATE bookings SET payment_status = $2, paid_at = NULL WHERE id = $1`,
+      [bookingId, outcome]
+    )
+    return (rowCount ?? 0) > 0
+  }
+  const { rowCount } = await pool.query(
+    `UPDATE bookings SET payment_status = $2 WHERE id = $1 AND paid_at IS NULL`,
+    [bookingId, outcome]
+  )
+  return (rowCount ?? 0) > 0
 }
 
 /** Records the promo code + discount applied to a booking (set at pay time). */

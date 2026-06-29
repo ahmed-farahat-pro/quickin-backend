@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server'
 import { verifyTransactionHmac } from '@/lib/local/paymob'
-import { getBookingById, markBookingPaid } from '@/lib/local/db'
+import { getBookingById, markBookingPaid, setBookingPaymentOutcome } from '@/lib/local/db'
+
+const truthy = (v: unknown) => v === true || v === 'true'
 
 // Paymob server-to-server "processed" callback (the source of truth for payment).
 // Configure this URL in the Paymob dashboard as the Transaction Processed Callback:
@@ -22,18 +24,41 @@ export async function POST(req: Request) {
       console.error('[paymob] webhook rejected: HMAC mismatch')
       return NextResponse.json({ error: 'invalid signature' }, { status: 401 })
     }
-    const success = obj.success === true || obj.success === 'true'
+    const txnId = String(obj.id ?? '')
     const order = (obj.order || {}) as Record<string, unknown>
     const merchantOrderId = String(order.merchant_order_id || '')
     const bookingId = merchantOrderId.split('__')[0]
-    if (success && bookingId) {
+    if (!bookingId) {
+      console.log(`[paymob] txn ${txnId} has no booking ref (order=${merchantOrderId}) — ignored`)
+      return NextResponse.json({ ok: true, ignored: true })
+    }
+
+    const success = truthy(obj.success)
+    const pending = truthy(obj.pending)
+    const refunded = truthy(obj.is_refunded)
+    const voided = truthy(obj.is_voided)
+
+    // Exhaustive outcome handling. paid is the ONLY state that sets paid_at; the rest just
+    // record status for the UI. The webhook is the single source of truth for all of these.
+    if (refunded || voided) {
+      await setBookingPaymentOutcome(bookingId, refunded ? 'refunded' : 'voided')
+      console.log(`[paymob] booking ${bookingId} ${refunded ? 'refunded' : 'voided'} (txn ${txnId})`)
+    } else if (success && !pending) {
       const bk = await getBookingById(bookingId)
-      if (bk && !bk.paid_at) {
-        await markBookingPaid(bookingId, bk.user_id, 'card')
-        console.log(`[paymob] booking ${bookingId} marked paid (txn ${String(obj.id)})`)
+      if (!bk) {
+        console.warn(`[paymob] paid txn ${txnId} but booking ${bookingId} not found`)
+      } else if (bk.paid_at) {
+        console.log(`[paymob] booking ${bookingId} already paid — txn ${txnId} ignored`)
+      } else {
+        await markBookingPaid(bookingId, bk.user_id, 'card', txnId)
+        console.log(`[paymob] booking ${bookingId} marked paid (txn ${txnId})`)
       }
+    } else if (pending) {
+      await setBookingPaymentOutcome(bookingId, 'pending')
+      console.log(`[paymob] booking ${bookingId} payment pending (txn ${txnId})`)
     } else {
-      console.log(`[paymob] txn ${String(obj.id)} success=${success} order=${merchantOrderId} — not marking paid`)
+      await setBookingPaymentOutcome(bookingId, 'failed')
+      console.log(`[paymob] booking ${bookingId} payment failed (txn ${txnId})`)
     }
     return NextResponse.json({ ok: true })
   } catch (err) {
