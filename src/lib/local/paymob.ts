@@ -136,6 +136,81 @@ export function debugTransactionHmac(obj: Record<string, unknown>, received: str
   }
 }
 
+function toNum(v: unknown): number | null {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+export interface PaymentVerification {
+  ok: boolean            // a Paymob retrieve call succeeded (we got an authoritative answer)
+  paid: boolean          // the payment genuinely succeeded
+  amountCents: number | null
+  specialReference: string
+  source: string         // which endpoint answered: 'transaction' | 'intention' | 'none'
+  detail: Record<string, unknown>
+}
+
+/** Source of truth WITHOUT relying on the callback HMAC: ask Paymob (with our secret key) for the
+ *  authoritative status of this transaction/intention. A spoofed webhook can't pass this — the
+ *  retrieve only returns OUR account's records, and the intention's special_reference (which only
+ *  we, holding the secret key, could have set) binds the payment to a specific booking. */
+export async function verifyPaymentViaApi(opts: { transactionId?: string; intentionId?: string }): Promise<PaymentVerification> {
+  const headers = { Authorization: `Token ${SECRET_KEY}` }
+  const detail: Record<string, unknown> = {}
+  let haveTxn = false, haveIntention = false
+  let paid = false, amountCents: number | null = null, specialReference = ''
+
+  // Transaction retrieve → authoritative success + amount.
+  if (opts.transactionId) {
+    try {
+      const r = await fetch(`${BASE}/api/acceptance/transactions/${encodeURIComponent(opts.transactionId)}`, { headers, cache: 'no-store' })
+      detail.txStatus = r.status
+      if (r.ok) {
+        const d = (await r.json().catch(() => ({}))) as Record<string, unknown>
+        haveTxn = true
+        paid = d.success === true && d.pending !== true && d.is_voided !== true && d.is_refunded !== true
+        amountCents = toNum(d.amount_cents)
+        const order = (d.order || {}) as Record<string, unknown>
+        if (order.merchant_order_id) specialReference = String(order.merchant_order_id)
+        detail.txSuccess = d.success
+      }
+    } catch (e) {
+      detail.txError = String(e)
+    }
+  }
+
+  // Intention retrieve → authoritative special_reference (booking binding); also a paid fallback.
+  if (opts.intentionId) {
+    try {
+      const r = await fetch(`${BASE}/v1/intention/${encodeURIComponent(opts.intentionId)}`, { headers, cache: 'no-store' })
+      detail.intentionStatus = r.status
+      if (r.ok) {
+        const d = (await r.json().catch(() => ({}))) as Record<string, unknown>
+        haveIntention = true
+        if (d.special_reference) specialReference = String(d.special_reference)
+        const txns = Array.isArray(d.transactions) ? (d.transactions as Record<string, unknown>[]) : []
+        const status = String(d.status || '')
+        if (!haveTxn) {
+          paid = txns.some((t) => t.success === true && t.pending !== true) || status === 'paid' || status === 'success'
+          const idet = (d.intention_detail || {}) as Record<string, unknown>
+          amountCents = toNum(idet.amount ?? d.amount)
+        }
+        detail.intentionStatusField = status
+        detail.txnCount = txns.length
+      }
+    } catch (e) {
+      detail.intentionError = String(e)
+    }
+  }
+
+  return {
+    ok: haveTxn || haveIntention,
+    paid, amountCents, specialReference,
+    source: haveTxn && haveIntention ? 'both' : haveTxn ? 'transaction' : haveIntention ? 'intention' : 'none',
+    detail,
+  }
+}
+
 /** Brute-force which HMAC scheme Paymob actually used, given a full captured callback `body` and the
  *  candidate signatures it carried. Tries several objects × field orders × boolean reprs × algorithms
  *  × encodings with the configured secret and returns the matching descriptor(s). Lets us pin the

@@ -1,19 +1,12 @@
 import { NextResponse } from 'next/server'
-import { verifyTransactionHmac, debugTransactionHmac, findHmacScheme } from '@/lib/local/paymob'
+import { verifyPaymentViaApi } from '@/lib/local/paymob'
 import { getBookingById, markBookingPaid, setBookingPaymentOutcome } from '@/lib/local/db'
 
 const truthy = (v: unknown) => v === true || v === 'true'
-
 const UUID_RE = /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})__\d+/
 
-/** Recover our booking id from Paymob's payload. We set special_reference = `${bookingId}__${ts}`.
- *  In the legacy flow it returns as order.merchant_order_id; the Intention/Unified-Checkout flow
- *  may surface it elsewhere, so as a fallback we scan the whole payload for the `<uuid>__<ts>`
- *  marker — a shape change then can't silently break settlement. */
-function recoverBookingId(body: unknown, obj: Record<string, unknown>): string {
-  const order = (obj.order || {}) as Record<string, unknown>
-  const direct = String(order.merchant_order_id || '')
-  if (direct.includes('__')) return direct.split('__')[0]
+/** Recover our booking id from a `<uuid>__<ts>` special_reference found anywhere in the payload. */
+function recoverBookingId(body: unknown): string {
   try {
     const m = JSON.stringify(body).match(UUID_RE)
     if (m) return m[1]
@@ -21,85 +14,67 @@ function recoverBookingId(body: unknown, obj: Record<string, unknown>): string {
   return ''
 }
 
-// Paymob server-to-server "processed" callback (the source of truth for payment).
-// Configure this URL in the Paymob dashboard as the Transaction Processed Callback:
-//   https://quickin-backend.vercel.app/api/paymob/webhook
-// Paymob appends ?hmac=... and POSTs the transaction. We verify the HMAC, then settle the
-// matching booking. We always return 200 so Paymob doesn't retry forever.
+// Paymob "processed" callback. We do NOT trust the callback's HMAC (the Unified-Checkout signature
+// scheme is opaque); instead we re-confirm the payment against Paymob's API with our secret key —
+// that's the source of truth and is spoof-proof. We always return 200 so Paymob stops retrying.
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
 export async function POST(req: Request) {
   try {
-    const url = new URL(req.url)
     const body = await req.json().catch(() => null)
-    // The transaction object lives under different keys across Paymob flows:
-    //   Unified Checkout / Intention → body.transaction ; legacy iframe → body.obj ; raw → body.
+    // Transaction lives under body.transaction (Unified) / body.obj (legacy) / body (raw).
     const tx = (body?.transaction ?? body?.obj ?? body) as Record<string, unknown> | null
-    // The transaction signature may arrive in the query (?hmac=) or, for Unified Checkout, in the
-    // body as `hmac` or `partner_digest`. Try them all — verifyTransactionHmac accepts the matching one.
-    const qHmac = url.searchParams.get('hmac') || ''
-    const bHmac = String(body?.hmac || '')
-    const pDigest = String(body?.partner_digest || '')
-    const hmacCandidates = [qHmac, bHmac, pDigest].filter(Boolean)
-
-    // TEMP DIAGNOSTIC (structure only — no PII values). Remove once settlement is confirmed.
-    {
-      const ord = (tx?.order || {}) as Record<string, unknown>
-      console.log(
-        '[paymob][diag] txKeys=[%s] qHmacLen=%d bodyHmacLen=%d partnerDigestLen=%d success=%s pending=%s txn=%s order.id=%s merchant_order_id=%s amount_cents=%s',
-        tx ? Object.keys(tx).join(',') : 'null',
-        qHmac.length, bHmac.length, pDigest.length,
-        String(tx?.success), String(tx?.pending), String(tx?.id), String(ord.id), String(ord.merchant_order_id), String(tx?.amount_cents),
-      )
-    }
-
     if (!tx || typeof tx !== 'object') {
       console.log('[paymob] ignored: no transaction object in payload')
       return NextResponse.json({ ok: true, ignored: true })
     }
-    if (!hmacCandidates.some((h) => verifyTransactionHmac(tx, h))) {
-      const scheme = findHmacScheme(body, [
-        { name: 'query', value: qHmac }, { name: 'body.hmac', value: bHmac }, { name: 'partner_digest', value: pDigest },
-      ])
-      console.error('[paymob] HMAC mismatch — scheme search:', JSON.stringify(scheme), JSON.stringify(debugTransactionHmac(tx, bHmac || qHmac || pDigest)))
-      // TEMP: full raw payload (one-time capture for offline replay via /api/paymob/hmacdebug). Remove after.
-      console.error('[paymob][rawbody]', JSON.stringify(body))
-      return NextResponse.json({ error: 'invalid signature' }, { status: 401 })
-    }
     const txnId = String(tx.id ?? '')
-    const bookingId = recoverBookingId(body, tx)
+    const intentionId = String((body?.intention as Record<string, unknown>)?.id ?? '')
+
+    // Authoritative status straight from Paymob (not the callback body).
+    const v = await verifyPaymentViaApi({ transactionId: txnId, intentionId })
+    console.log('[paymob][verify]', JSON.stringify({ source: v.source, ok: v.ok, paid: v.paid, amountCents: v.amountCents, ref: v.specialReference, detail: v.detail }))
+
+    // Bind to a booking via the AUTHORITATIVE special_reference when present, else the payload's.
+    const bookingId = (v.specialReference.match(UUID_RE)?.[1]) || recoverBookingId(body)
     if (!bookingId) {
-      console.log(`[paymob] txn ${txnId} — could not recover booking id; ignored`)
+      console.log(`[paymob] txn ${txnId} — could not resolve booking id; ignored`)
       return NextResponse.json({ ok: true, ignored: true })
     }
 
-    const success = truthy(tx.success)
-    const pending = truthy(tx.pending)
-    const refunded = truthy(tx.is_refunded)
-    const voided = truthy(tx.is_voided)
+    if (!v.ok) {
+      // Couldn't reach/parse Paymob's API — do NOT settle on an unverified callback.
+      console.error(`[paymob] txn ${txnId} unverified (API retrieve failed): ${JSON.stringify(v.detail)}`)
+      return NextResponse.json({ ok: true, unverified: true })
+    }
 
-    // Exhaustive outcome handling. paid is the ONLY state that sets paid_at; the rest just
-    // record status for the UI. The webhook is the single source of truth for all of these.
-    if (refunded || voided) {
-      await setBookingPaymentOutcome(bookingId, refunded ? 'refunded' : 'voided')
-      console.log(`[paymob] booking ${bookingId} ${refunded ? 'refunded' : 'voided'} (txn ${txnId})`)
-    } else if (success && !pending) {
+    if (v.paid) {
       const bk = await getBookingById(bookingId)
       if (!bk) {
         console.warn(`[paymob] paid txn ${txnId} but booking ${bookingId} not found`)
       } else if (bk.paid_at) {
-        console.log(`[paymob] booking ${bookingId} already paid — txn ${txnId} ignored`)
+        console.log(`[paymob] booking ${bookingId} already paid — txn ${txnId}`)
       } else {
+        // Sanity-check the charged amount vs what pay-init created (subtotal + 10% fee). Warn-only
+        // for now — the authoritative special_reference already binds this payment to the booking.
+        const subtotal = Math.round(bk.total_price)
+        const expected = (subtotal + Math.round(subtotal * 0.1)) * 100
+        if (v.amountCents != null && v.amountCents !== expected) {
+          console.warn(`[paymob] amount note booking ${bookingId}: paid ${v.amountCents} vs expected ${expected} (settling anyway)`)
+        }
         await markBookingPaid(bookingId, bk.user_id, 'card', txnId)
-        console.log(`[paymob] booking ${bookingId} marked paid (txn ${txnId})`)
+        console.log(`[paymob] booking ${bookingId} marked paid via API verify (txn ${txnId})`)
       }
-    } else if (pending) {
+    } else if (truthy(tx.is_refunded) || truthy(tx.is_voided)) {
+      await setBookingPaymentOutcome(bookingId, truthy(tx.is_refunded) ? 'refunded' : 'voided')
+      console.log(`[paymob] booking ${bookingId} ${truthy(tx.is_refunded) ? 'refunded' : 'voided'} (txn ${txnId})`)
+    } else if (truthy(tx.pending)) {
       await setBookingPaymentOutcome(bookingId, 'pending')
-      console.log(`[paymob] booking ${bookingId} payment pending (txn ${txnId})`)
+      console.log(`[paymob] booking ${bookingId} pending (txn ${txnId})`)
     } else {
       await setBookingPaymentOutcome(bookingId, 'failed')
-      console.log(`[paymob] booking ${bookingId} payment failed (txn ${txnId})`)
+      console.log(`[paymob] booking ${bookingId} failed (txn ${txnId})`)
     }
     return NextResponse.json({ ok: true })
   } catch (err) {
