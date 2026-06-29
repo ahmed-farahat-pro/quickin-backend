@@ -79,21 +79,44 @@ export async function createIntention(opts: {
   return { clientSecret, intentionId: String(d.id ?? ''), checkoutUrl: checkoutUrl(clientSecret) }
 }
 
-/** Verify a Paymob TRANSACTION webhook by recomputing its HMAC (SHA-512) over the canonical field order. */
-export function verifyTransactionHmac(obj: Record<string, unknown>, received: string): boolean {
-  if (!HMAC_SECRET || !received) return false
+/** The exact string Paymob signs: the canonical 20-field order, concatenated. */
+function transactionHmacBasis(obj: Record<string, unknown>): string {
   const sd = (obj.source_data || {}) as Record<string, unknown>
   const order = (obj.order || {}) as Record<string, unknown>
-  const parts = [
+  return [
     obj.amount_cents, obj.created_at, obj.currency, obj.error_occured, obj.has_parent_transaction,
     obj.id, obj.integration_id, obj.is_3d_secure, obj.is_auth, obj.is_capture, obj.is_refunded,
     obj.is_standalone_payment, obj.is_voided, order.id, obj.owner, obj.pending,
     sd.pan, sd.sub_type, sd.type, obj.success,
   ].map((v) => (v === undefined || v === null ? '' : String(v))).join('')
-  const expected = crypto.createHmac('sha512', HMAC_SECRET).update(parts).digest('hex')
+}
+
+/** Verify a Paymob TRANSACTION webhook by recomputing its HMAC (SHA-512) over the canonical field order. */
+export function verifyTransactionHmac(obj: Record<string, unknown>, received: string): boolean {
+  if (!HMAC_SECRET || !received) return false
+  const expected = crypto.createHmac('sha512', HMAC_SECRET).update(transactionHmacBasis(obj)).digest('hex')
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(received)))
   } catch {
     return false
+  }
+}
+
+/** Non-secret diagnostics for an HMAC mismatch. Tells wrong-secret (basis fields present, hashes
+ *  differ) from wrong-payload (basis empty/short) from missing-signature. Prints prefixes only —
+ *  an HMAC digest is not the secret, but we still truncate. TEMP: pair with the webhook diag log. */
+export function debugTransactionHmac(obj: Record<string, unknown>, received: string) {
+  const basis = transactionHmacBasis(obj)
+  const expected = HMAC_SECRET ? crypto.createHmac('sha512', HMAC_SECRET).update(basis).digest('hex') : ''
+  return {
+    hmacSecretSet: !!HMAC_SECRET,
+    receivedLen: String(received || '').length,
+    receivedPrefix: String(received || '').slice(0, 10),
+    expectedPrefix: expected.slice(0, 10),
+    match: !!expected && expected === String(received || ''),
+    basisLen: basis.length,
+    // Which fields were actually present — an empty/short basis means we're hashing the wrong object.
+    fieldsPresent: [obj.amount_cents, obj.id, (obj.order as Record<string, unknown>)?.id, obj.success]
+      .filter((v) => v !== undefined && v !== null).length,
   }
 }

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { verifyTransactionHmac } from '@/lib/local/paymob'
+import { verifyTransactionHmac, debugTransactionHmac } from '@/lib/local/paymob'
 import { getBookingById, markBookingPaid, setBookingPaymentOutcome } from '@/lib/local/db'
 
 const truthy = (v: unknown) => v === true || v === 'true'
@@ -56,7 +56,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, ignored: true })
     }
     if (!verifyTransactionHmac(obj, hmac)) {
-      console.error('[paymob] webhook rejected: HMAC mismatch')
+      console.error('[paymob] webhook rejected: HMAC mismatch', JSON.stringify(debugTransactionHmac(obj, hmac)))
       return NextResponse.json({ error: 'invalid signature' }, { status: 401 })
     }
     const txnId = String(obj.id ?? '')
