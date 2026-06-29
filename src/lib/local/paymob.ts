@@ -95,9 +95,12 @@ function transactionHmacFields(obj: Record<string, unknown>): [string, unknown][
   ]
 }
 
+const reprStd = (v: unknown) => (v === undefined || v === null ? '' : v === true ? 'true' : v === false ? 'false' : String(v))
+const reprPy = (v: unknown) => (v === undefined || v === null ? '' : v === true ? 'True' : v === false ? 'False' : String(v))
+
 /** The exact string Paymob signs: the canonical 20-field order, concatenated. */
 function transactionHmacBasis(obj: Record<string, unknown>): string {
-  return transactionHmacFields(obj).map(([, v]) => (v === undefined || v === null ? '' : String(v))).join('')
+  return transactionHmacFields(obj).map(([, v]) => reprStd(v)).join('')
 }
 
 /** Verify a Paymob TRANSACTION webhook by recomputing its HMAC (SHA-512) over the canonical field order. */
@@ -131,4 +134,49 @@ export function debugTransactionHmac(obj: Record<string, unknown>, received: str
     // where one is expected (e.g. order.id) means a field-mapping bug; all-present + mismatch = bad secret.
     fields: transactionHmacFields(obj).map(([k, v]) => `${k}=${v === undefined || v === null ? '∅' : String(v)}`),
   }
+}
+
+/** Brute-force which HMAC scheme Paymob actually used, given a full captured callback `body` and the
+ *  candidate signatures it carried. Tries several objects × field orders × boolean reprs × algorithms
+ *  × encodings with the configured secret and returns the matching descriptor(s). Lets us pin the
+ *  exact Unified-Checkout signature from ONE captured payload — no repeated test payments. TEMP. */
+export function findHmacScheme(body: unknown, candidates: { name: string; value: string }[]): string[] {
+  if (!HMAC_SECRET) return ['NO_HMAC_SECRET']
+  const b = (body ?? {}) as Record<string, unknown>
+  const sortedScalars = (o: Record<string, unknown>, r: (v: unknown) => string) =>
+    Object.keys(o)
+      .filter((k) => { const v = o[k]; return v === null || ['string', 'number', 'boolean'].includes(typeof v) })
+      .sort()
+      .map((k) => r(o[k]))
+      .join('')
+  const objects: [string, unknown][] = [
+    ['transaction', b.transaction], ['obj', b.obj], ['intention', b.intention], ['root', b],
+  ]
+  const cands = candidates
+    .filter((c) => c && c.value)
+    .map((c) => ({ name: c.name, raw: String(c.value), low: String(c.value).toLowerCase() }))
+  const algos = ['sha512', 'sha256'] as const
+  const hits: string[] = []
+  for (const [oname, o] of objects) {
+    if (!o || typeof o !== 'object') continue
+    const rec = o as Record<string, unknown>
+    const bases: [string, string][] = [
+      ['classic:std', transactionHmacFields(rec).map(([, v]) => reprStd(v)).join('')],
+      ['classic:py', transactionHmacFields(rec).map(([, v]) => reprPy(v)).join('')],
+      ['sorted:std', sortedScalars(rec, reprStd)],
+      ['sorted:py', sortedScalars(rec, reprPy)],
+    ]
+    for (const [bname, basis] of bases) {
+      if (!basis) continue
+      for (const algo of algos) {
+        const hex = crypto.createHmac(algo, HMAC_SECRET).update(basis).digest('hex')
+        const b64 = crypto.createHmac(algo, HMAC_SECRET).update(basis).digest('base64')
+        for (const c of cands) {
+          if (hex === c.low) hits.push(`${oname}/${bname}/${algo}/hex == ${c.name}`)
+          else if (b64 === c.raw) hits.push(`${oname}/${bname}/${algo}/base64 == ${c.name}`)
+        }
+      }
+    }
+  }
+  return hits.length ? hits : ['NO_SCHEME_MATCHED']
 }
