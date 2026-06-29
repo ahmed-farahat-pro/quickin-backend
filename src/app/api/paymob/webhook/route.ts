@@ -4,32 +4,65 @@ import { getBookingById, markBookingPaid, setBookingPaymentOutcome } from '@/lib
 
 const truthy = (v: unknown) => v === true || v === 'true'
 
+const UUID_RE = /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})__\d+/
+
+/** Recover our booking id from Paymob's payload. We set special_reference = `${bookingId}__${ts}`.
+ *  In the legacy flow it returns as order.merchant_order_id; the Intention/Unified-Checkout flow
+ *  may surface it elsewhere, so as a fallback we scan the whole payload for the `<uuid>__<ts>`
+ *  marker — a shape change then can't silently break settlement. */
+function recoverBookingId(body: unknown, obj: Record<string, unknown>): string {
+  const order = (obj.order || {}) as Record<string, unknown>
+  const direct = String(order.merchant_order_id || '')
+  if (direct.includes('__')) return direct.split('__')[0]
+  try {
+    const m = JSON.stringify(body).match(UUID_RE)
+    if (m) return m[1]
+  } catch { /* ignore */ }
+  return ''
+}
+
 // Paymob server-to-server "processed" callback (the source of truth for payment).
 // Configure this URL in the Paymob dashboard as the Transaction Processed Callback:
 //   https://quickin-backend.vercel.app/api/paymob/webhook
-// Paymob appends ?hmac=... and POSTs { type:'TRANSACTION', obj:{...} }. We verify the HMAC,
-// then mark the matching booking paid. We always return 200 so Paymob doesn't retry forever.
+// Paymob appends ?hmac=... and POSTs the transaction. We verify the HMAC, then settle the
+// matching booking. We always return 200 so Paymob doesn't retry forever.
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
 export async function POST(req: Request) {
   try {
-    const hmac = new URL(req.url).searchParams.get('hmac') || ''
+    const url = new URL(req.url)
     const body = await req.json().catch(() => null)
-    if (!body || body.type !== 'TRANSACTION' || !body.obj) {
+    // hmac is normally in the query; tolerate the body too.
+    const hmac = url.searchParams.get('hmac') || String(body?.hmac || '')
+    // Accept both shapes: { type:'TRANSACTION', obj:{...} } and a raw transaction object.
+    const obj = (body?.obj ?? body) as Record<string, unknown> | null
+
+    // TEMP DIAGNOSTIC (structure only — no PII values). Remove once settlement is confirmed.
+    {
+      const ord = (obj?.order || {}) as Record<string, unknown>
+      console.log(
+        '[paymob][diag] bodyType=%s hmac=%s objKeys=[%s] orderKeys=[%s] success=%s pending=%s refunded=%s voided=%s txn=%s merchant_order_id=%s amount_cents=%s',
+        body?.type, hmac ? 'present' : 'MISSING',
+        obj ? Object.keys(obj).join(',') : 'null',
+        Object.keys(ord).join(','),
+        String(obj?.success), String(obj?.pending), String(obj?.is_refunded), String(obj?.is_voided),
+        String(obj?.id), String(ord.merchant_order_id), String(obj?.amount_cents),
+      )
+    }
+
+    if (!obj || (body?.type && body.type !== 'TRANSACTION')) {
+      console.log(`[paymob] ignored: bodyType=${body?.type} hasObj=${!!obj}`)
       return NextResponse.json({ ok: true, ignored: true })
     }
-    const obj = body.obj as Record<string, unknown>
     if (!verifyTransactionHmac(obj, hmac)) {
       console.error('[paymob] webhook rejected: HMAC mismatch')
       return NextResponse.json({ error: 'invalid signature' }, { status: 401 })
     }
     const txnId = String(obj.id ?? '')
-    const order = (obj.order || {}) as Record<string, unknown>
-    const merchantOrderId = String(order.merchant_order_id || '')
-    const bookingId = merchantOrderId.split('__')[0]
+    const bookingId = recoverBookingId(body, obj)
     if (!bookingId) {
-      console.log(`[paymob] txn ${txnId} has no booking ref (order=${merchantOrderId}) — ignored`)
+      console.log(`[paymob] txn ${txnId} — could not recover booking id; ignored`)
       return NextResponse.json({ ok: true, ignored: true })
     }
 
