@@ -18,6 +18,9 @@ const SECRET_KEY = process.env.PAYMOB_SECRET_KEY || ''
 const PUBLIC_KEY = process.env.PAYMOB_PUBLIC_KEY || ''
 const INTEGRATION_ID = process.env.PAYMOB_INTEGRATION_ID || ''
 const HMAC_SECRET = process.env.PAYMOB_HMAC_SECRET || ''
+// Legacy API key (dashboard → Account Info → API Key). Needed to retrieve a transaction's
+// authoritative status: POST /api/auth/tokens {api_key} → Bearer token → GET the transaction.
+const API_KEY = process.env.PAYMOB_API_KEY || ''
 
 export const paymobConfigured = Boolean(SECRET_KEY && PUBLIC_KEY && INTEGRATION_ID)
 
@@ -154,60 +157,47 @@ export interface PaymentVerification {
  *  authoritative status of this transaction/intention. A spoofed webhook can't pass this — the
  *  retrieve only returns OUR account's records, and the intention's special_reference (which only
  *  we, holding the secret key, could have set) binds the payment to a specific booking. */
+/** Exchange the legacy API key for a short-lived auth token (Bearer) used by acceptance endpoints. */
+async function legacyAuthToken(detail: Record<string, unknown>): Promise<string> {
+  const r = await fetch(`${BASE}/api/auth/tokens`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: API_KEY }),
+    cache: 'no-store',
+  })
+  detail.authStatus = r.status
+  if (!r.ok) return ''
+  const d = (await r.json().catch(() => ({}))) as Record<string, unknown>
+  return String(d.token || '')
+}
+
 export async function verifyPaymentViaApi(opts: { transactionId?: string; intentionId?: string }): Promise<PaymentVerification> {
-  const headers = { Authorization: `Token ${SECRET_KEY}` }
   const detail: Record<string, unknown> = {}
-  let haveTxn = false, haveIntention = false
-  let paid = false, amountCents: number | null = null, specialReference = ''
-
-  // Transaction retrieve → authoritative success + amount.
-  if (opts.transactionId) {
-    try {
-      const r = await fetch(`${BASE}/api/acceptance/transactions/${encodeURIComponent(opts.transactionId)}`, { headers, cache: 'no-store' })
-      detail.txStatus = r.status
-      if (r.ok) {
-        const d = (await r.json().catch(() => ({}))) as Record<string, unknown>
-        haveTxn = true
-        paid = d.success === true && d.pending !== true && d.is_voided !== true && d.is_refunded !== true
-        amountCents = toNum(d.amount_cents)
-        const order = (d.order || {}) as Record<string, unknown>
-        if (order.merchant_order_id) specialReference = String(order.merchant_order_id)
-        detail.txSuccess = d.success
-      }
-    } catch (e) {
-      detail.txError = String(e)
+  const none: PaymentVerification = { ok: false, paid: false, amountCents: null, specialReference: '', source: 'none', detail }
+  if (!API_KEY) { detail.error = 'PAYMOB_API_KEY not set'; return none }
+  if (!opts.transactionId) { detail.error = 'no transactionId'; return none }
+  try {
+    const token = await legacyAuthToken(detail)
+    if (!token) { detail.error = 'auth token failed'; return none }
+    const r = await fetch(`${BASE}/api/acceptance/transactions/${encodeURIComponent(opts.transactionId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
+    })
+    detail.txStatus = r.status
+    if (!r.ok) return none
+    const d = (await r.json().catch(() => ({}))) as Record<string, unknown>
+    const order = (d.order || {}) as Record<string, unknown>
+    return {
+      ok: true,
+      paid: d.success === true && d.pending !== true && d.is_voided !== true && d.is_refunded !== true,
+      amountCents: toNum(d.amount_cents),
+      specialReference: String(order.merchant_order_id || ''),
+      source: 'transaction',
+      detail: { ...detail, success: d.success, pending: d.pending },
     }
-  }
-
-  // Intention retrieve → authoritative special_reference (booking binding); also a paid fallback.
-  if (opts.intentionId) {
-    try {
-      const r = await fetch(`${BASE}/v1/intention/${encodeURIComponent(opts.intentionId)}`, { headers, cache: 'no-store' })
-      detail.intentionStatus = r.status
-      if (r.ok) {
-        const d = (await r.json().catch(() => ({}))) as Record<string, unknown>
-        haveIntention = true
-        if (d.special_reference) specialReference = String(d.special_reference)
-        const txns = Array.isArray(d.transactions) ? (d.transactions as Record<string, unknown>[]) : []
-        const status = String(d.status || '')
-        if (!haveTxn) {
-          paid = txns.some((t) => t.success === true && t.pending !== true) || status === 'paid' || status === 'success'
-          const idet = (d.intention_detail || {}) as Record<string, unknown>
-          amountCents = toNum(idet.amount ?? d.amount)
-        }
-        detail.intentionStatusField = status
-        detail.txnCount = txns.length
-      }
-    } catch (e) {
-      detail.intentionError = String(e)
-    }
-  }
-
-  return {
-    ok: haveTxn || haveIntention,
-    paid, amountCents, specialReference,
-    source: haveTxn && haveIntention ? 'both' : haveTxn ? 'transaction' : haveIntention ? 'intention' : 'none',
-    detail,
+  } catch (e) {
+    detail.error = String(e)
+    return none
   }
 }
 
