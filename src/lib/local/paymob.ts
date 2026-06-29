@@ -79,16 +79,25 @@ export async function createIntention(opts: {
   return { clientSecret, intentionId: String(d.id ?? ''), checkoutUrl: checkoutUrl(clientSecret) }
 }
 
-/** The exact string Paymob signs: the canonical 20-field order, concatenated. */
-function transactionHmacBasis(obj: Record<string, unknown>): string {
+// The canonical 20 fields Paymob signs, in order, as [name, value] pairs.
+function transactionHmacFields(obj: Record<string, unknown>): [string, unknown][] {
   const sd = (obj.source_data || {}) as Record<string, unknown>
   const order = (obj.order || {}) as Record<string, unknown>
   return [
-    obj.amount_cents, obj.created_at, obj.currency, obj.error_occured, obj.has_parent_transaction,
-    obj.id, obj.integration_id, obj.is_3d_secure, obj.is_auth, obj.is_capture, obj.is_refunded,
-    obj.is_standalone_payment, obj.is_voided, order.id, obj.owner, obj.pending,
-    sd.pan, sd.sub_type, sd.type, obj.success,
-  ].map((v) => (v === undefined || v === null ? '' : String(v))).join('')
+    ['amount_cents', obj.amount_cents], ['created_at', obj.created_at], ['currency', obj.currency],
+    ['error_occured', obj.error_occured], ['has_parent_transaction', obj.has_parent_transaction],
+    ['id', obj.id], ['integration_id', obj.integration_id], ['is_3d_secure', obj.is_3d_secure],
+    ['is_auth', obj.is_auth], ['is_capture', obj.is_capture], ['is_refunded', obj.is_refunded],
+    ['is_standalone_payment', obj.is_standalone_payment], ['is_voided', obj.is_voided],
+    ['order.id', order.id], ['owner', obj.owner], ['pending', obj.pending],
+    ['source_data.pan', sd.pan], ['source_data.sub_type', sd.sub_type], ['source_data.type', sd.type],
+    ['success', obj.success],
+  ]
+}
+
+/** The exact string Paymob signs: the canonical 20-field order, concatenated. */
+function transactionHmacBasis(obj: Record<string, unknown>): string {
+  return transactionHmacFields(obj).map(([, v]) => (v === undefined || v === null ? '' : String(v))).join('')
 }
 
 /** Verify a Paymob TRANSACTION webhook by recomputing its HMAC (SHA-512) over the canonical field order. */
@@ -118,5 +127,8 @@ export function debugTransactionHmac(obj: Record<string, unknown>, received: str
     // Which fields were actually present — an empty/short basis means we're hashing the wrong object.
     fieldsPresent: [obj.amount_cents, obj.id, (obj.order as Record<string, unknown>)?.id, obj.success]
       .filter((v) => v !== undefined && v !== null).length,
+    // TEMP: each signed field's resolved value (pan is already masked by Paymob). An empty value
+    // where one is expected (e.g. order.id) means a field-mapping bug; all-present + mismatch = bad secret.
+    fields: transactionHmacFields(obj).map(([k, v]) => `${k}=${v === undefined || v === null ? '∅' : String(v)}`),
   }
 }

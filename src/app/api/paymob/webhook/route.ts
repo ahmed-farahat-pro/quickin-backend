@@ -36,19 +36,21 @@ export async function POST(req: Request) {
     // The transaction object lives under different keys across Paymob flows:
     //   Unified Checkout / Intention → body.transaction ; legacy iframe → body.obj ; raw → body.
     const tx = (body?.transaction ?? body?.obj ?? body) as Record<string, unknown> | null
-    // The signature may arrive in the query (?hmac=) or in the body (body.hmac). Try both.
-    const hmacCandidates = [url.searchParams.get('hmac'), body?.hmac].filter(Boolean).map((h) => String(h))
+    // The transaction signature may arrive in the query (?hmac=) or, for Unified Checkout, in the
+    // body as `hmac` or `partner_digest`. Try them all — verifyTransactionHmac accepts the matching one.
+    const qHmac = url.searchParams.get('hmac') || ''
+    const bHmac = String(body?.hmac || '')
+    const pDigest = String(body?.partner_digest || '')
+    const hmacCandidates = [qHmac, bHmac, pDigest].filter(Boolean)
 
     // TEMP DIAGNOSTIC (structure only — no PII values). Remove once settlement is confirmed.
     {
       const ord = (tx?.order || {}) as Record<string, unknown>
       console.log(
-        '[paymob][diag] bodyKeys=[%s] txKeys=[%s] hmacCands=%d success=%s pending=%s refunded=%s voided=%s txn=%s merchant_order_id=%s amount_cents=%s',
-        body ? Object.keys(body).join(',') : 'null',
+        '[paymob][diag] txKeys=[%s] qHmacLen=%d bodyHmacLen=%d partnerDigestLen=%d success=%s pending=%s txn=%s order.id=%s merchant_order_id=%s amount_cents=%s',
         tx ? Object.keys(tx).join(',') : 'null',
-        hmacCandidates.length,
-        String(tx?.success), String(tx?.pending), String(tx?.is_refunded), String(tx?.is_voided),
-        String(tx?.id), String(ord.merchant_order_id), String(tx?.amount_cents),
+        qHmac.length, bHmac.length, pDigest.length,
+        String(tx?.success), String(tx?.pending), String(tx?.id), String(ord.id), String(ord.merchant_order_id), String(tx?.amount_cents),
       )
     }
 
