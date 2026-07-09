@@ -108,6 +108,12 @@ export interface Booking {
   host_id: string | null
   payment_status: string
   paid_at: string | null
+  /** 'instapay' once a transfer screenshot is submitted (else null / legacy value). */
+  payment_method: string | null
+  /** Latest payment_proofs row status: submitted | approved | rejected | disputed (null = no proof). */
+  payment_proof_status: string | null
+  payment_submitted_at: string | null
+  payment_reject_reason: string | null
   host_notes: string | null
   amenities: string[]
   cancellation_policy: string
@@ -331,6 +337,12 @@ const BOOKING_COLS = `
   b.guests, b.total_price::float8 AS total_price, b.status,
   COALESCE(b.payment_status, 'unpaid') AS payment_status,
   to_char(b.paid_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS paid_at,
+  b.payment_method,
+  -- Latest transfer-screenshot submission for this booking (metadata only — the
+  -- base64 image itself is fetched on demand via getBookingProof to keep lists light).
+  (SELECT pp.status FROM payment_proofs pp WHERE pp.booking_id = b.id ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_proof_status,
+  (SELECT to_char(pp.submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') FROM payment_proofs pp WHERE pp.booking_id = b.id ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_submitted_at,
+  (SELECT pp.reject_reason FROM payment_proofs pp WHERE pp.booking_id = b.id ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_reject_reason,
   b.host_notes,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
   to_char(b.cancelled_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS cancelled_at,
@@ -1073,6 +1085,322 @@ export async function getBookingById(bookingId: string): Promise<Booking | null>
     [bookingId]
   )
   return (rows[0] as Booking) ?? null
+}
+
+// ---- Instapay manual payment (app_settings + payment_proofs) -----------------
+// Flow: guest transfers via Instapay, uploads a screenshot at booking time
+// (payment 'submitted') → host accepts (confirmed + paid) or rejects → guest may
+// dispute a rejection → admin resolves. See scripts/migrate-instapay.mjs.
+
+const MAX_PROOF_BYTES = 3_500_000
+
+/** Validate a base64 data-URL (or https URL) screenshot, matching the id_verifications convention. */
+function assertProofImage(src: unknown): string {
+  const v = String(src ?? '').trim()
+  if (!/^data:image\//i.test(v) && !/^https?:\/\//i.test(v)) {
+    throw new Error('Please attach a screenshot of your transfer')
+  }
+  if (v.length > MAX_PROOF_BYTES) throw new Error('That screenshot is too large (max ~3.5MB)')
+  return v
+}
+
+/** Read one admin setting (null if unset). */
+export async function getSetting(key: string): Promise<string | null> {
+  const { rows } = await pool.query(`SELECT value FROM app_settings WHERE key = $1`, [key])
+  return rows[0] ? ((rows[0].value as string | null) ?? null) : null
+}
+
+/** Upsert an admin setting. `updatedBy` is a user id or 'admin' (free text). */
+export async function setSetting(key: string, value: string, updatedBy: string | null = null): Promise<void> {
+  await pool.query(
+    `INSERT INTO app_settings (key, value, updated_at, updated_by)
+     VALUES ($1, $2, now(), $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by`,
+    [key, value, updatedBy]
+  )
+}
+
+export interface PaymentConfig {
+  instapay_handle: string
+  instructions: string
+}
+
+/** The public-facing Instapay destination shown to guests at checkout. */
+export async function getPaymentConfig(): Promise<PaymentConfig> {
+  const { rows } = await pool.query(
+    `SELECT key, value FROM app_settings WHERE key IN ('instapay_handle', 'instapay_instructions')`
+  )
+  const map: Record<string, string> = {}
+  for (const r of rows) map[r.key as string] = (r.value as string | null) ?? ''
+  return { instapay_handle: map.instapay_handle ?? '', instructions: map.instapay_instructions ?? '' }
+}
+
+/**
+ * Guest uploads a transfer screenshot for their booking. Inserts a payment_proofs
+ * row, flips payment_status → 'submitted', and (if the host had rejected) reopens
+ * the booking to 'pending' for re-review. Only the booking's owner, never on an
+ * already-paid booking. Returns the updated booking (or null if not theirs).
+ */
+export async function submitPaymentProof(
+  bookingId: string,
+  userId: string,
+  imageData: string,
+  method = 'instapay',
+): Promise<Booking | null> {
+  if (!isUuid(bookingId) || !isUuid(userId)) return null
+  const img = assertProofImage(imageData)
+  const m = method === 'instapay' ? 'instapay' : String(method).slice(0, 32)
+  const cur = await pool.query(
+    `SELECT payment_status FROM bookings WHERE id = $1 AND user_id = $2`,
+    [bookingId, userId]
+  )
+  if (!cur.rows[0]) return null
+  if (cur.rows[0].payment_status === 'paid') throw new Error('This booking is already paid')
+
+  await pool.query(
+    `INSERT INTO payment_proofs (booking_id, method, image_data, amount)
+     VALUES ($1, $2, $3, (SELECT total_price FROM bookings WHERE id = $1))`,
+    [bookingId, m, img]
+  )
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE bookings b SET
+         payment_status = 'submitted',
+         payment_method = $3,
+         status = CASE WHEN b.status = 'rejected' THEN 'pending' ELSE b.status END
+       WHERE b.id = $1 AND b.user_id = $2
+       RETURNING b.*
+     )
+     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+    [bookingId, userId, m]
+  )
+  const booking = (rows[0] as Booking) ?? null
+  if (booking && booking.host_id) {
+    await createNotification(booking.host_id, {
+      type: 'payment_submitted',
+      title: 'Payment to review',
+      body: `${booking.title} — a guest uploaded a transfer receipt`,
+      link: '/host',
+    })
+    await sendPush(booking.host_id, {
+      title: 'Payment to review',
+      body: `${booking.title} — ${booking.reservation_code ?? ''}`,
+      link: '/host',
+    })
+  }
+  return booking
+}
+
+export interface PaymentProof {
+  image_data: string
+  method: string
+  status: string
+  submitted_at: string
+  reject_reason: string | null
+  dispute_note: string | null
+  amount: number | null
+}
+
+/** The latest transfer screenshot for a booking. Authorized to the booking's
+ *  guest, the listing's host, or an admin — else null. */
+export async function getBookingProof(
+  bookingId: string,
+  requester: { id: string; role: string },
+): Promise<PaymentProof | null> {
+  if (!isUuid(bookingId)) return null
+  const auth = await pool.query(
+    `SELECT b.user_id, l.host_id FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE b.id = $1`,
+    [bookingId]
+  )
+  const a = auth.rows[0]
+  if (!a) return null
+  const allowed = requester.role === 'admin' || requester.id === a.user_id || requester.id === a.host_id
+  if (!allowed) return null
+  const { rows } = await pool.query(
+    `SELECT image_data, method, status,
+            to_char(submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS submitted_at,
+            reject_reason, dispute_note, amount::float8 AS amount
+       FROM payment_proofs WHERE booking_id = $1 ORDER BY submitted_at DESC LIMIT 1`,
+    [bookingId]
+  )
+  return (rows[0] as PaymentProof) ?? null
+}
+
+/**
+ * Host accepts or rejects a booking's payment (doubles as accepting the stay).
+ * Accept → booking 'confirmed' + payment 'paid'. Reject → 'rejected' + reason.
+ * Only the listing's host, only while the booking is 'pending'. Updates the
+ * latest proof row and notifies the guest. Returns null if not the host / not pending.
+ */
+export async function hostReviewPayment(
+  bookingId: string,
+  hostUserId: string,
+  action: 'accept' | 'reject',
+  reason: string | null = null,
+): Promise<Booking | null> {
+  if (!isUuid(bookingId) || !isUuid(hostUserId)) return null
+  const accept = action === 'accept'
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE bookings b SET
+         status = CASE WHEN $3 THEN 'confirmed' ELSE 'rejected' END,
+         payment_status = CASE WHEN $3 THEN 'paid' ELSE 'rejected' END,
+         paid_at = CASE WHEN $3 THEN COALESCE(b.paid_at, now()) ELSE b.paid_at END
+       FROM listings l
+       WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2 AND b.status = 'pending'
+       RETURNING b.*
+     )
+     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+    [bookingId, hostUserId, accept]
+  )
+  const booking = (rows[0] as Booking) ?? null
+  if (!booking) return null
+  await pool.query(
+    `UPDATE payment_proofs SET
+        status = CASE WHEN $2 THEN 'approved' ELSE 'rejected' END,
+        reviewed_by = $3, reviewed_at = now(),
+        reject_reason = CASE WHEN $2 THEN NULL ELSE $4 END
+      WHERE id = (SELECT id FROM payment_proofs WHERE booking_id = $1 ORDER BY submitted_at DESC LIMIT 1)`,
+    [bookingId, accept, hostUserId, reason ? String(reason).slice(0, 500) : null]
+  )
+  await createNotification(booking.user_id, {
+    type: accept ? 'payment_approved' : 'payment_rejected',
+    title: accept ? 'Payment confirmed' : 'Payment not accepted',
+    body: accept
+      ? `Your stay at ${booking.title} is confirmed`
+      : `${booking.title}: ${reason || 'the transfer could not be verified'}`,
+    link: `/reservation/${booking.id}`,
+  })
+  await sendPush(booking.user_id, {
+    title: accept ? 'Booking confirmed 🎉' : 'Payment not accepted',
+    body: accept ? `${booking.title} is confirmed & paid` : `${booking.title} — tap for details`,
+    link: `/reservation/${booking.id}`,
+  })
+  return booking
+}
+
+/** Guest disputes a host-rejected payment ("I did pay"). Flags the latest proof +
+ *  booking as 'disputed' for admin review. Only the guest, only on a rejected proof. */
+export async function guestDisputePayment(
+  bookingId: string,
+  userId: string,
+  note: string | null = null,
+): Promise<Booking | null> {
+  if (!isUuid(bookingId) || !isUuid(userId)) return null
+  const latest = await pool.query(
+    `SELECT pp.id, pp.status FROM payment_proofs pp
+       JOIN bookings b ON b.id = pp.booking_id
+      WHERE pp.booking_id = $1 AND b.user_id = $2
+      ORDER BY pp.submitted_at DESC LIMIT 1`,
+    [bookingId, userId]
+  )
+  const l = latest.rows[0]
+  if (!l) return null
+  if (l.status !== 'rejected') throw new Error('Only a rejected payment can be disputed')
+  await pool.query(
+    `UPDATE payment_proofs SET status = 'disputed', dispute_note = $2, disputed_at = now() WHERE id = $1`,
+    [l.id, note ? String(note).slice(0, 1000) : null]
+  )
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE bookings b SET payment_status = 'disputed' WHERE b.id = $1 AND b.user_id = $2 RETURNING b.*
+     )
+     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+    [bookingId, userId]
+  )
+  return (rows[0] as Booking) ?? null
+}
+
+export interface DisputeRow {
+  booking_id: string
+  reservation_code: string | null
+  title: string
+  guest_id: string
+  guest_name: string | null
+  guest_email: string | null
+  host_id: string | null
+  total_price: number
+  reject_reason: string | null
+  dispute_note: string | null
+  submitted_at: string | null
+  disputed_at: string | null
+}
+
+/** All open payment disputes (latest proof still 'disputed'), for the admin queue. */
+export async function adminListDisputes(): Promise<DisputeRow[]> {
+  const { rows } = await pool.query(
+    `SELECT b.id AS booking_id, b.reservation_code, l.title,
+            b.user_id AS guest_id,
+            (SELECT full_name FROM users u WHERE u.id = b.user_id) AS guest_name,
+            (SELECT email     FROM users u WHERE u.id = b.user_id) AS guest_email,
+            l.host_id, b.total_price::float8 AS total_price,
+            pp.reject_reason, pp.dispute_note,
+            to_char(pp.submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS submitted_at,
+            to_char(pp.disputed_at,  'YYYY-MM-DD"T"HH24:MI:SS') AS disputed_at
+       FROM payment_proofs pp
+       JOIN bookings b ON b.id = pp.booking_id
+       JOIN listings l ON l.id = b.listing_id
+      WHERE pp.status = 'disputed'
+        AND pp.id = (SELECT id FROM payment_proofs p2 WHERE p2.booking_id = pp.booking_id ORDER BY p2.submitted_at DESC LIMIT 1)
+      ORDER BY pp.disputed_at DESC NULLS LAST`
+  )
+  return rows as DisputeRow[]
+}
+
+/** Admin resolves a dispute. Approve → confirm + mark paid; Uphold → keep rejected.
+ *  Not constrained to 'pending' (a rejected booking can be revived). Notifies guest (+ host on approve). */
+export async function adminResolveDispute(
+  bookingId: string,
+  adminId: string,
+  action: 'approve' | 'uphold',
+  note: string | null = null,
+): Promise<Booking | null> {
+  if (!isUuid(bookingId)) return null
+  const approve = action === 'approve'
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE bookings b SET
+         status = CASE WHEN $2 THEN 'confirmed' ELSE 'rejected' END,
+         payment_status = CASE WHEN $2 THEN 'paid' ELSE 'rejected' END,
+         paid_at = CASE WHEN $2 THEN COALESCE(b.paid_at, now()) ELSE b.paid_at END
+       WHERE b.id = $1
+       RETURNING b.*
+     )
+     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+    [bookingId, approve]
+  )
+  const booking = (rows[0] as Booking) ?? null
+  if (!booking) return null
+  await pool.query(
+    `UPDATE payment_proofs SET
+        status = CASE WHEN $2 THEN 'approved' ELSE 'rejected' END,
+        reviewed_by = $3, reviewed_at = now(),
+        reject_reason = CASE WHEN $2 THEN NULL ELSE COALESCE($4, reject_reason) END
+      WHERE id = (SELECT id FROM payment_proofs WHERE booking_id = $1 ORDER BY submitted_at DESC LIMIT 1)`,
+    [bookingId, approve, String(adminId).slice(0, 64), note ? String(note).slice(0, 500) : null]
+  )
+  await createNotification(booking.user_id, {
+    type: approve ? 'payment_approved' : 'payment_rejected',
+    title: approve ? 'Payment confirmed' : 'Payment dispute closed',
+    body: approve
+      ? `Your stay at ${booking.title} is confirmed`
+      : `${booking.title}: the transfer could not be verified`,
+    link: `/reservation/${booking.id}`,
+  })
+  await sendPush(booking.user_id, {
+    title: approve ? 'Booking confirmed 🎉' : 'Payment update',
+    body: booking.title,
+    link: `/reservation/${booking.id}`,
+  })
+  if (approve && booking.host_id) {
+    await createNotification(booking.host_id, {
+      type: 'booking_paid',
+      title: 'Booking paid',
+      body: `${booking.title} — payment confirmed by admin`,
+      link: '/host',
+    })
+  }
+  return booking
 }
 
 // ---- ID verification (id_verifications table — shared with web /ops admin) ---

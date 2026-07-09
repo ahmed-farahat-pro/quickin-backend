@@ -1,0 +1,62 @@
+import { NextResponse } from 'next/server'
+import { adminListDisputes, adminResolveDispute } from '@/lib/local/db'
+import { getUserFromRequest } from '@/lib/local/auth'
+
+// Admin payment-dispute queue.
+//   GET  /api/local/admin/payments                         → open disputes
+//   POST /api/local/admin/payments {booking_id, action, note?}
+//        action: 'approve' (confirm + mark paid) | 'uphold' (keep rejected)
+// Admins only (role='admin').
+export const dynamic = 'force-dynamic'
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Cache-Control': 'no-store',
+}
+
+export async function OPTIONS() {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+    },
+  })
+}
+
+async function requireAdmin(req: Request) {
+  const user = await getUserFromRequest(req)
+  if (!user) return { error: NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS }) }
+  if (user.role !== 'admin') return { error: NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS }) }
+  return { user }
+}
+
+export async function GET(req: Request) {
+  const gate = await requireAdmin(req)
+  if ('error' in gate) return gate.error
+  try {
+    return NextResponse.json(await adminListDisputes(), { headers: CORS })
+  } catch (err) {
+    return NextResponse.json({ error: 'Failed to load disputes', detail: String(err) }, { status: 500, headers: CORS })
+  }
+}
+
+export async function POST(req: Request) {
+  const gate = await requireAdmin(req)
+  if ('error' in gate) return gate.error
+  try {
+    const body = await req.json().catch(() => ({}))
+    const bookingId = String(body.booking_id ?? body.bookingId ?? '')
+    const raw = String(body.action ?? '')
+    const action = /^app/i.test(raw) ? 'approve' : /^up|^rej/i.test(raw) ? 'uphold' : null
+    if (!bookingId || !action) {
+      return NextResponse.json({ error: 'booking_id and action ("approve"|"uphold") are required' }, { status: 400, headers: CORS })
+    }
+    const booking = await adminResolveDispute(bookingId, gate.user.id, action, body.note ?? null)
+    if (!booking) return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
+    return NextResponse.json(booking, { headers: CORS })
+  } catch (err) {
+    return NextResponse.json({ error: 'Failed to resolve dispute', detail: String(err) }, { status: 500, headers: CORS })
+  }
+}
