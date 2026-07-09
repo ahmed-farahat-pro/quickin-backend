@@ -1536,3 +1536,149 @@ export async function createMessage(bookingId: string, senderId: string, body: s
   )
   return rows[0] as Message
 }
+
+// ---- Place autocomplete (search-by-place typeahead) -------------------------
+
+const CURATED_PLACES = [
+  'Giza', 'North Coast', 'Sahel', 'El Gouna', 'Cairo', 'Zamalek', 'New Cairo',
+  'Sheikh Zayed', '6th of October', 'Maadi', 'Hurghada', 'Sharm El Sheikh',
+  'Alexandria', 'Marina', 'Ain Sokhna', 'Dahab', 'Luxor', 'Aswan',
+]
+
+/** Up to 8 place suggestions: distinct listing locations matching q, merged with
+ *  a curated list of well-known Egyptian destinations. Empty q → curated list. */
+export async function getPlaceSuggestions(q: string): Promise<string[]> {
+  const query = (q || '').trim()
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (p: string) => {
+    const k = p.trim().toLowerCase()
+    if (!p.trim() || seen.has(k)) return
+    seen.add(k); out.push(p.trim())
+  }
+  if (!query) {
+    CURATED_PLACES.slice(0, 8).forEach(push)
+    return out
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT location FROM listings
+        WHERE location IS NOT NULL AND location ILIKE '%' || $1 || '%'
+        ORDER BY location LIMIT 8`,
+      [query]
+    )
+    for (const r of rows) push(String(r.location))
+  } catch { /* fall back to curated matches */ }
+  CURATED_PLACES.filter((p) => p.toLowerCase().includes(query.toLowerCase())).forEach(push)
+  return out.slice(0, 8)
+}
+
+// ---- Pre-booking chat (guest ⇄ host, before a booking exists) ---------------
+// Uses the shared conversations + chat_messages tables (created by the web via
+// xmig6). Distinct from the per-booking `messages` table above.
+
+export interface ConversationSummary {
+  id: string
+  listing_id: string | null
+  listing_title: string | null
+  listing_image: string | null
+  other_name: string | null
+  last_message: string | null
+  last_message_at: string
+  is_host: boolean
+}
+
+export interface ChatThreadMessage {
+  id: string
+  sender_id: string
+  body: string
+  created_at: string
+  mine?: boolean
+}
+
+/** Guest opens (or reuses) a thread with the listing's host. Returns the thread id. */
+export async function getOrCreateConversation(
+  guestId: string,
+  listingId: string
+): Promise<{ id: string; host_id: string; listing_title: string | null }> {
+  if (!isUuid(guestId) || !isUuid(listingId)) throw new Error('Invalid id')
+  const { rows: lr } = await pool.query(`SELECT host_id, title FROM listings WHERE id = $1`, [listingId])
+  const listing = lr[0] as { host_id: string | null; title: string | null } | undefined
+  if (!listing) throw new Error('Listing not found')
+  if (!listing.host_id || !isUuid(listing.host_id)) throw new Error('This listing has no host to message yet')
+  if (listing.host_id === guestId) throw new Error("You can't message your own listing")
+  const { rows } = await pool.query(
+    `INSERT INTO conversations (listing_id, guest_id, host_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (listing_id, guest_id) DO UPDATE SET listing_id = EXCLUDED.listing_id
+     RETURNING id`,
+    [listingId, guestId, listing.host_id]
+  )
+  return { id: rows[0].id as string, host_id: listing.host_id, listing_title: listing.title }
+}
+
+/** All threads a user is part of (as guest or host), newest activity first. */
+export async function listConversations(userId: string): Promise<ConversationSummary[]> {
+  if (!isUuid(userId)) return []
+  const { rows } = await pool.query(
+    `SELECT c.id, c.listing_id,
+            l.title AS listing_title,
+            (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS listing_image,
+            CASE WHEN c.guest_id = $1 THEN hu.full_name ELSE gu.full_name END AS other_name,
+            (SELECT m.body FROM chat_messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+            to_char(c.last_message_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last_message_at,
+            (c.host_id = $1) AS is_host
+       FROM conversations c
+       LEFT JOIN listings l ON l.id = c.listing_id
+       LEFT JOIN users gu ON gu.id = c.guest_id
+       LEFT JOIN users hu ON hu.id = c.host_id
+      WHERE c.guest_id = $1 OR c.host_id = $1
+      ORDER BY c.last_message_at DESC
+      LIMIT 200`,
+    [userId]
+  )
+  return rows as ConversationSummary[]
+}
+
+async function conversationForUser(userId: string, conversationId: string) {
+  const { rows } = await pool.query(
+    `SELECT id, listing_id, guest_id, host_id FROM conversations
+      WHERE id = $1 AND (guest_id = $2 OR host_id = $2)`,
+    [conversationId, userId]
+  )
+  return rows[0] as { id: string; listing_id: string | null; guest_id: string; host_id: string } | undefined
+}
+
+/** Messages in a thread, oldest first. Only members can read. */
+export async function listChatMessages(userId: string, conversationId: string): Promise<ChatThreadMessage[]> {
+  if (!isUuid(userId) || !isUuid(conversationId)) throw new Error('Invalid id')
+  const convo = await conversationForUser(userId, conversationId)
+  if (!convo) throw new Error('Conversation not found')
+  const { rows } = await pool.query(
+    `SELECT id, sender_id, body, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+       FROM chat_messages WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT 500`,
+    [conversationId]
+  )
+  return (rows as ChatThreadMessage[]).map((m) => ({ ...m, mine: m.sender_id === userId }))
+}
+
+/** Post a message. Phone numbers are blocked (contentguard). Notifies the other party. */
+export async function postChatMessage(userId: string, conversationId: string, rawBody: string): Promise<ChatThreadMessage> {
+  if (!isUuid(userId) || !isUuid(conversationId)) throw new Error('Invalid id')
+  const body = String(rawBody || '').trim().slice(0, 2000)
+  if (!body) throw new Error('Message is empty')
+  if (containsPhoneNumber(body)) throw new Error(PHONE_BLOCK_MESSAGE)
+  const convo = await conversationForUser(userId, conversationId)
+  if (!convo) throw new Error('Conversation not found')
+  const { rows } = await pool.query(
+    `WITH ins AS (
+       INSERT INTO chat_messages (conversation_id, sender_id, body) VALUES ($1, $2, $3) RETURNING *
+     ), upd AS ( UPDATE conversations SET last_message_at = now() WHERE id = $1 )
+     SELECT id, sender_id, body, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at FROM ins`,
+    [conversationId, userId, body]
+  )
+  const other = convo.guest_id === userId ? convo.host_id : convo.guest_id
+  await createNotification(other, { type: 'message', title: 'New message', body: body.slice(0, 80), link: '/messages' })
+  const msg = rows[0] as ChatThreadMessage
+  return { ...msg, mine: true }
+}
