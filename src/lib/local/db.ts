@@ -58,6 +58,7 @@ export interface Listing {
   lng: number | null
   rating: number
   review_count: number
+  created_at: string | null
   listing_images: ListingImage[]
 }
 
@@ -137,6 +138,7 @@ export const LISTING_COLS = `
   l.host_id, (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
   COALESCE((SELECT u.verification_status = 'verified' FROM users u WHERE u.id = l.host_id), false) AS host_verified,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
+  to_char(l.created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
   COALESCE(l.amenities, '{}') AS amenities,
   COALESCE((SELECT round(avg(rv.rating)::numeric, 2) FROM reviews rv WHERE rv.listing_id = l.id), 0)::float8 AS rating,
   COALESCE((SELECT count(*) FROM reviews rv WHERE rv.listing_id = l.id), 0)::int AS review_count,
