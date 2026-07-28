@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { upsertSocialUser, signToken } from '@/lib/local/auth'
+import { withHostState } from '@/lib/local/db'
 
 export const dynamic = 'force-dynamic'
 
@@ -37,7 +38,7 @@ export async function POST(req: Request) {
 
     const user = await upsertSocialUser({ email, fullName, provider, avatarUrl, role: body.role })
     const token = signToken({ sub: user.id, email: user.email })
-    const res = NextResponse.json({ token, user }, { headers: CORS })
+    const res = NextResponse.json({ token, user: await withHostState(user) }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
     return res
   } catch (err) {

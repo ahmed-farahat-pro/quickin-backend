@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { verifyUserOtp, signToken } from '@/lib/local/auth'
+import { withHostState } from '@/lib/local/db'
 import { recordReferral } from '@/lib/local/promote'
 
 export const dynamic = 'force-dynamic'
@@ -22,7 +23,8 @@ export async function OPTIONS() {
 }
 
 // POST /api/auth/verify-otp — { email, code } → on success, activates the account
-// and returns { token, user } (also sets the qk_token cookie for web).
+// and returns { token, user } (also sets the qk_token cookie for web). `user` carries
+// the same host fields as /api/auth/me so the new session is correct immediately.
 export async function POST(req: Request) {
   try {
     const { email, code, role, referral_code, referralCode } = await req.json()
@@ -40,7 +42,7 @@ export async function POST(req: Request) {
       await recordReferral(user.id, refCode).catch(() => {})
     }
     const token = signToken({ sub: user.id, email: user.email, role: user.role })
-    const res = NextResponse.json({ token, user }, { headers: CORS })
+    const res = NextResponse.json({ token, user: await withHostState(user) }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
     return res
   } catch (err) {

@@ -72,12 +72,33 @@ CREATE TABLE IF NOT EXISTS bookings (
 CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id);
 CREATE INDEX IF NOT EXISTS idx_bookings_listing ON bookings(listing_id);
 
--- Reservation lifecycle: hosts own listings; bookings go pending -> confirmed/rejected;
--- each booking carries a short reservation_code used for the QR / wallet pass.
+-- Reservation lifecycle: hosts own listings; bookings go pending -> confirmed/rejected.
+-- reservation_code ("QK-7F3K9Q") is the QR / wallet-pass code. It stays NULL while
+-- the booking is pending and is assigned ONCE, at the confirmation transition —
+-- no code ⇒ no QR, no wallet pass, no /stay/<code> page.
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS host_id uuid REFERENCES users(id);
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reservation_code text;
 ALTER TABLE bookings ALTER COLUMN status SET DEFAULT 'pending';
 CREATE INDEX IF NOT EXISTS idx_listings_host ON listings(host_id);
+-- A reservation code must resolve to exactly one stay (lookups are case-insensitive).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_bookings_reservation_code
+  ON bookings (upper(reservation_code)) WHERE reservation_code IS NOT NULL;
+
+-- Host-authored stay guide: extra content the host attaches to a CONFIRMED
+-- booking (arrival info, photos, QR links to places, attachments). Served on the
+-- public /stay/<code> pass alongside bookings.host_notes. Host-supplied text —
+-- every client escapes it, it is never HTML.
+CREATE TABLE IF NOT EXISTS stay_guide_items (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  booking_id  uuid NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+  kind        text NOT NULL,          -- 'info' | 'photo' | 'place_qr' | 'attachment'
+  title       text,
+  body        text,                   -- info text, or a caption
+  url         text,                   -- data: URL (photo/attachment) or an external link (place_qr)
+  "order"     int DEFAULT 0,
+  created_at  timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_stay_guide_booking ON stay_guide_items(booking_id, "order");
 
 -- Per-booking chat between the guest and the listing's host.
 CREATE TABLE IF NOT EXISTS messages (

@@ -78,6 +78,10 @@ function loadAssets(): Record<string, Buffer> {
   return buffers
 }
 
+/** Where the public stay pass lives (the web project). Same default as
+ *  src/lib/local/db.ts, overridable with WEB_URL. */
+const WEB_URL = (process.env.WEB_URL || 'https://quickin-frontend.vercel.app').replace(/\/+$/, '')
+
 // Bookings are charged in EGP, so the pass shows EGP (not a $ amount).
 function money(amount: number | null | undefined): string {
   const n = Number(amount)
@@ -101,11 +105,15 @@ export async function GET(req: Request, ctx: { params: Promise<{ bookingId: stri
     if (!booking) {
       return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
     }
-    if (booking.status !== 'confirmed') {
+    // No pass for an unconfirmed booking: the QR on the pass is the reservation
+    // code, and a code only exists once the stay is confirmed. Never fall back to
+    // the booking id — that would print a QR pointing at a /stay/<uuid> that can
+    // never resolve.
+    if (booking.status !== 'confirmed' || !booking.reservation_code) {
       return NextResponse.json({ error: 'Reservation must be confirmed first' }, { status: 400, headers: CORS })
     }
 
-    const reservationCode = booking.reservation_code ?? booking.id
+    const reservationCode = booking.reservation_code
 
     // 2. Build the signed pass.
     const pass = new PKPass(
@@ -127,10 +135,15 @@ export async function GET(req: Request, ctx: { params: Promise<{ bookingId: stri
     // eventTicket layout — initializes the field arrays.
     pass.type = 'eventTicket'
 
-    // QR encoding the reservation code (what a host scans on check-in).
+    // QR encoding the PUBLIC STAY-PASS URL — the same thing the in-app QR on web,
+    // iOS and Android encodes, so a scan (by the guest's camera or the host's
+    // phone) opens the pass page with the host's stay guide instead of showing a
+    // bare string. `altText` keeps the human-readable code under the barcode for
+    // a manual check-in. Never falls back to the booking id: the pass page
+    // resolves by reservation_code, and the guard above already required one.
     pass.setBarcodes({
       format: 'PKBarcodeFormatQR',
-      message: reservationCode,
+      message: `${WEB_URL}/stay/${encodeURIComponent(reservationCode)}`,
       messageEncoding: 'iso-8859-1',
       altText: reservationCode,
     })

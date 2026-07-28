@@ -3,8 +3,10 @@
 //       BASE_URL defaults to the deployed backend; override to test local (:4000).
 //
 // Covers: browse -> host signup+OTP -> create listing (with lat/lng) ->
-//         guest signup+OTP -> book (pending) -> chat both ways (+ stranger blocked)
-//         -> host confirm -> reservation (confirmed) -> host inbox -> wallet pass.
+//         guest signup+OTP -> book (pending, NO reservation code) -> chat both ways
+//         (+ stranger blocked) -> host confirm (code issued here) -> reservation
+//         (confirmed) -> host inbox -> public /stay/:code pass + host stay guide
+//         (host-only writes) -> wallet pass.
 import pg from 'pg'
 
 const BASE = process.env.BASE_URL || 'https://quickin-backend.vercel.app'
@@ -53,7 +55,9 @@ async function cleanup() {
   console.log('Guest books in an available range')
   const bk = await post('/api/local/bookings', { listing_id: lid, check_in: '2026-12-01', check_out: '2026-12-05', guests: 2 }, guest)
   ok(bk.status === 201 && bk.body.status === 'pending', 'booking -> pending (request)')
-  ok(!!bk.body.reservation_code, `reservation code issued (${bk.body.reservation_code})`)
+  // THE RULE: a reservation waiting for approval has no code — so no QR, no wallet
+  // pass, no /stay/<code>. The code is minted at the confirmation transition below.
+  ok(!bk.body.reservation_code, 'pending booking has NO reservation code (no QR yet)')
   const bid = bk.body.id
 
   console.log('Chat between host and guest')
@@ -69,17 +73,49 @@ async function cleanup() {
   const blocked = await get(`/api/local/bookings/${bid}/messages`, stranger)
   ok(blocked.status === 403, 'a stranger is blocked from the thread (403)')
 
+  console.log('No wallet pass before confirmation')
+  const early = await fetch(BASE + '/api/wallet/pass/' + bid)
+  ok(early.status === 400 || early.status === 501, `wallet refuses an unconfirmed booking (${early.status})`)
+
   console.log('Host confirms the request')
   const guestCannot = await patch(`/api/local/bookings/${bid}`, { status: 'confirm' }, guest)
   ok(guestCannot.status === 403, 'guest cannot self-confirm (403)')
   const confirm = await patch(`/api/local/bookings/${bid}`, { status: 'confirm' }, host)
   ok(confirm.status === 200 && confirm.body.status === 'confirmed', 'host confirm -> confirmed')
+  ok(!!confirm.body.reservation_code, `code issued at confirmation (${confirm.body.reservation_code})`)
+  const code = confirm.body.reservation_code
 
   console.log('Guest sees the confirmed reservation')
   const resv = await get(`/api/local/bookings/${bid}`, guest)
   ok(resv.status === 200 && resv.body.status === 'confirmed' && resv.body.reservation_code, 'reservation shows confirmed + code (for QR)')
+  ok(resv.body.reservation_code === code, 'the code never changes once issued (idempotent)')
   const inbox = await get('/api/local/host/bookings', host)
   ok(inbox.status === 200 && inbox.body.some((b) => b.id === bid && b.status === 'confirmed'), 'host inbox shows it confirmed')
+
+  console.log('Public stay pass (what the QR opens) + host stay guide')
+  const stay = await get(`/api/local/stay/${encodeURIComponent(code)}`)
+  ok(stay.status === 200 && stay.body.reservation_code === code, 'GET /api/local/stay/:code resolves the pass')
+  ok(Array.isArray(stay.body.guide), 'stay pass carries a guide array')
+  ok(!('id' in stay.body) && !('guest_email' in stay.body), 'public pass leaks no booking id / guest email')
+  const missing = await get('/api/local/stay/null')
+  ok(missing.status === 400, 'a "null" code is a missing code (400), not a lookup')
+  const unknown = await get('/api/local/stay/QK-ZZZZZZ')
+  ok(unknown.status === 404, 'an unknown code is 404')
+
+  const gItem = await post(`/api/local/bookings/${bid}/stay-guide`, { kind: 'place_qr', title: 'Beach club', url: 'https://maps.example.com/beach' }, host)
+  ok(gItem.status === 201 && gItem.body.id, 'host adds a stay guide item')
+  const gBad = await post(`/api/local/bookings/${bid}/stay-guide`, { kind: 'place_qr', title: 'Bad', url: 'javascript:alert(1)' }, host)
+  ok(gBad.status === 400, 'place_qr rejects a non-http(s) link (400)')
+  const gGuestWrite = await post(`/api/local/bookings/${bid}/stay-guide`, { kind: 'info', title: 'Nope' }, guest)
+  ok(gGuestWrite.status === 403, 'the guest cannot write to the stay guide (403)')
+  const gGuestRead = await get(`/api/local/bookings/${bid}/stay-guide`, guest)
+  ok(gGuestRead.status === 200 && gGuestRead.body.length === 1, 'the guest can read the stay guide')
+  const gStranger = await get(`/api/local/bookings/${bid}/stay-guide`, stranger)
+  ok(gStranger.status === 403, 'a stranger is blocked from the stay guide (403)')
+  const stay2 = await get(`/api/local/stay/${encodeURIComponent(code)}`)
+  ok(stay2.body.guide?.length === 1, 'the item shows up on the public stay pass')
+  const gDel = await fetch(BASE + `/api/local/bookings/${bid}/stay-guide/${gItem.body.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${host}` } }).then(j)
+  ok(gDel.status === 200, 'host removes the item')
 
   console.log('Apple Wallet pass')
   const w = await fetch(BASE + '/api/wallet/pass/' + bid)

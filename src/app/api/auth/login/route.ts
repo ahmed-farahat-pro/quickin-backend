@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getUserRowByEmail, verifyPassword, signToken } from '@/lib/local/auth'
+import { withHostState } from '@/lib/local/db'
 
 export const dynamic = 'force-dynamic'
 
@@ -26,7 +27,8 @@ export async function OPTIONS() {
 }
 
 // POST /api/auth/login — { email, password }. Handles the hardcoded admin, blocks
-// unverified email accounts (so the client can route to OTP), and returns role.
+// unverified email accounts (so the client can route to OTP), and returns role +
+// the same host fields as /api/auth/me so a fresh session is correct immediately.
 export async function POST(req: Request) {
   try {
     const { email, password } = await req.json()
@@ -40,7 +42,10 @@ export async function POST(req: Request) {
       if (!ADMIN_PASSWORD || String(password) !== ADMIN_PASSWORD) {
         return NextResponse.json({ error: 'Invalid admin credentials' }, { status: 401, headers: CORS })
       }
-      const user = { id: 'admin', email: ADMIN_USERNAME, full_name: 'Administrator', provider: 'admin', avatar_url: null, role: 'admin' }
+      const user = {
+        id: 'admin', email: ADMIN_USERNAME, full_name: 'Administrator', provider: 'admin', avatar_url: null, role: 'admin',
+        is_host: false, host_type: null, host_status: 'none', host_review_note: null,
+      }
       const token = signToken({ sub: 'admin', email: ADMIN_USERNAME, role: 'admin' })
       const res = NextResponse.json({ token, user }, { headers: CORS })
       res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
@@ -63,7 +68,9 @@ export async function POST(req: Request) {
         { status: 403, headers: CORS }
       )
     }
-    const user = { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role }
+    const user = await withHostState({
+      id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role,
+    })
     const token = signToken({ sub: user.id, email: user.email, role: row.role })
     const res = NextResponse.json({ token, user }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })

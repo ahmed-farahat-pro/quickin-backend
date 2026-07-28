@@ -66,8 +66,18 @@ export async function POST(req: Request) {
 
     await sendOtpEmail(cleanEmail, otp)
 
+    // A brand-new account is never a host — still send the host fields every other
+    // auth response carries so clients can hydrate from any of them.
     return NextResponse.json(
-      { pending: true, email: cleanEmail, ...(smtpConfigured ? {} : { devCode: otp }) },
+      {
+        pending: true,
+        email: cleanEmail,
+        is_host: false,
+        host_type: null,
+        host_status: 'none',
+        host_review_note: null,
+        ...(smtpConfigured ? {} : { devCode: otp }),
+      },
       { headers: CORS }
     )
   } catch (err) {

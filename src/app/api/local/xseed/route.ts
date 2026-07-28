@@ -109,9 +109,12 @@ export async function GET(req: Request) {
     // 6) pending booking: guest → North Coast listing, 3 nights starting in ~2 weeks
     const nc = listingIds[0]
     const booking = (await pool.query(
+      // reservation_code stays NULL: a pending booking has no code (and so no QR /
+      // wallet pass / stay page) until the host confirms it. Never synthesize one
+      // from the id — the stored column is the only truth.
       `INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests, adults, total_price, status)
        VALUES ($1,$2, CURRENT_DATE + 14, CURRENT_DATE + 17, 2, 2, $3, 'pending')
-       RETURNING 'QK-' || upper(substr(id::text,1,8)) AS code,
+       RETURNING reservation_code AS code,
                  to_char(check_in,'YYYY-MM-DD') AS check_in, to_char(check_out,'YYYY-MM-DD') AS check_out`,
       [nc, guest, LISTINGS[0].price * 3])).rows[0]
     steps.push('created pending booking (guest → North Coast)')

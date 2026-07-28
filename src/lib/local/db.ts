@@ -1,4 +1,5 @@
 import { pool } from './pool'
+import type { PoolClient } from 'pg'
 import { randomInt } from 'node:crypto'
 import { createNotification } from './notifications'
 import { sendNotificationEmail } from './mailer'
@@ -25,6 +26,8 @@ const isUuid = (s: string) => /^[0-9a-fA-F-]{36}$/.test(s)
 const isDate = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s)
 
 export interface ListingImage {
+  /** listing_images.id — what the photo add/delete/reorder endpoints address. */
+  id: string
   url: string
   order: number
 }
@@ -143,7 +146,7 @@ export const LISTING_COLS = `
   COALESCE((SELECT round(avg(rv.rating)::numeric, 2) FROM reviews rv WHERE rv.listing_id = l.id), 0)::float8 AS rating,
   COALESCE((SELECT count(*) FROM reviews rv WHERE rv.listing_id = l.id), 0)::int AS review_count,
   COALESCE(
-    (SELECT json_agg(json_build_object('url', li.url, 'order', li."order") ORDER BY li."order")
+    (SELECT json_agg(json_build_object('id', li.id, 'url', li.url, 'order', li."order") ORDER BY li."order")
      FROM listing_images li WHERE li.listing_id = l.id), '[]'
   ) AS listing_images
 `
@@ -364,6 +367,22 @@ export interface CreateBookingInput {
   guests: number
 }
 
+/**
+ * Issue the reservation code at a CONFIRMATION transition, and only there.
+ *
+ * The rule (shared by the web, iOS and Android): a booking that is still waiting
+ * for approval has NO code — `reservation_code` stays NULL, so there is no QR,
+ * no wallet pass and no /stay/<code> link. The code is minted the moment the
+ * booking becomes confirmed, and COALESCE makes that idempotent: once a guest is
+ * holding a QR, re-confirming / a gateway retry / an admin edit never changes it.
+ *
+ * `when` is the SQL predicate that means "this row is becoming confirmed";
+ * `param` is the placeholder carrying a freshly generated candidate code.
+ */
+function issueCodeSql(when: string, param: string): string {
+  return `reservation_code = CASE WHEN ${when} THEN COALESCE(b.reservation_code, ${param}) ELSE b.reservation_code END`
+}
+
 export async function createBooking(input: CreateBookingInput): Promise<Booking> {
   const { listingId, userId, checkIn, checkOut, guests } = input
   if (!isUuid(listingId) || !isUuid(userId)) throw new Error('Invalid id')
@@ -384,10 +403,12 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
   )
   if (clash.rowCount && clash.rowCount > 0) throw new Error('Those dates are not available')
 
-  const reservationCode = genReservationCode()
+  // NO reservation_code here on purpose — a booking starts 'pending' (awaiting the
+  // host's approval) and a pending booking must have no code / no QR. It is issued
+  // at the confirmation transition (see issueCodeSql).
   const { rows } = await pool.query(
     `WITH ins AS (
-       INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests, total_price, status, reservation_code)
+       INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests, total_price, status)
        SELECT $1, $2, $3, $4, $5,
          round(
            -- Seasonal per-night sum: weekend price (Fri/Sat) → monthly override → base.
@@ -405,12 +426,12 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
                WHEN ($4::date - $3::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
                ELSE 0 END)::numeric / 100)
          ),
-         'pending', $6
+         'pending'
        FROM listings l WHERE l.id = $1
        RETURNING *
      )
      SELECT ${BOOKING_COLS} FROM ins b JOIN listings l ON l.id = b.listing_id`,
-    [listingId, userId, checkIn, checkOut, g, reservationCode]
+    [listingId, userId, checkIn, checkOut, g]
   )
   if (!rows[0]) throw new Error('Could not create booking (listing not found)')
   const booking = rows[0] as Booking
@@ -483,12 +504,15 @@ export async function markBookingPaid(
          paid_at = COALESCE(b.paid_at, now()),
          payment_method = COALESCE(b.payment_method, $4),
          payment_ref = COALESCE(b.payment_ref, $3),
-         status = CASE WHEN b.status = 'pending' THEN 'confirmed' ELSE b.status END
+         status = CASE WHEN b.status = 'pending' THEN 'confirmed' ELSE b.status END,
+         -- Paying confirms the booking, so this is a confirmation transition: mint the
+         -- code here too (also backfills a legacy confirmed booking that has none).
+         ${issueCodeSql(`b.status IN ('pending', 'confirmed')`, '$5')}
        WHERE b.id = $1 AND b.user_id = $2
        RETURNING *
      )
      SELECT ${BOOKING_COLS}, prev.prev_paid_at FROM upd b JOIN listings l ON l.id = b.listing_id, prev`,
-    [bookingId, userId, ref, m]
+    [bookingId, userId, ref, m, genReservationCode()]
   )
   const row = rows[0] as (Booking & { prev_paid_at: string | null }) | undefined
   if (!row) return null
@@ -678,6 +702,11 @@ export async function cancelBooking(
   return { booking, quote }
 }
 
+// The three single-purpose host edits below predate the full edit form. They now
+// delegate to updateListingDetails so there is exactly ONE code path that writes a
+// listing — and therefore no way to change a listing without the re-review rule in
+// REVIEW_TRIGGERING_FIELDS applying. Signatures and return values are unchanged.
+
 /** Host updates the cancellation policy on their own listing. Returns the
  *  refreshed listing, or null if the caller isn't the host. */
 export async function updateListingPolicy(
@@ -685,13 +714,7 @@ export async function updateListingPolicy(
   hostUserId: string,
   policy: string
 ): Promise<Listing | null> {
-  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
-  const { rowCount } = await pool.query(
-    `UPDATE listings SET cancellation_policy = $3 WHERE id = $1 AND host_id = $2`,
-    [listingId, hostUserId, normalizePolicy(policy)]
-  )
-  if (!rowCount) return null
-  return getListingById(listingId)
+  return updateListingDetails(listingId, hostUserId, { cancellation_policy: policy })
 }
 
 /** Host updates the length-of-stay discounts (% off) on their own listing. */
@@ -701,13 +724,10 @@ export async function updateListingDiscounts(
   weekly: number,
   monthly: number
 ): Promise<Listing | null> {
-  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
-  const { rowCount } = await pool.query(
-    `UPDATE listings SET weekly_discount = $3, monthly_discount = $4 WHERE id = $1 AND host_id = $2`,
-    [listingId, hostUserId, clampDiscount(weekly), clampDiscount(monthly)]
-  )
-  if (!rowCount) return null
-  return getListingById(listingId)
+  return updateListingDetails(listingId, hostUserId, {
+    weekly_discount: weekly,
+    monthly_discount: monthly,
+  })
 }
 
 /** Host sets seasonal pricing: weekend nightly price + per-month overrides. */
@@ -717,13 +737,10 @@ export async function updateListingPricing(
   weekendPrice: unknown,
   monthlyPrices: unknown
 ): Promise<Listing | null> {
-  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
-  const { rowCount } = await pool.query(
-    `UPDATE listings SET weekend_price = $3, monthly_prices = $4::jsonb WHERE id = $1 AND host_id = $2`,
-    [listingId, hostUserId, cleanPrice(weekendPrice), cleanMonthlyPrices(monthlyPrices)]
-  )
-  if (!rowCount) return null
-  return getListingById(listingId)
+  return updateListingDetails(listingId, hostUserId, {
+    weekend_price: weekendPrice ?? null,
+    monthly_prices: monthlyPrices ?? {},
+  })
 }
 
 export interface StayQuote {
@@ -833,16 +850,684 @@ export async function setListingOwnershipDoc(
   doc: string
 ): Promise<Listing | null> {
   if (!isUuid(listingId) || !isUuid(hostUserId)) return null
-  const d = String(doc ?? '').trim()
-  if (!/^(data:image\/|https?:\/\/)/i.test(d)) throw new Error('Please attach a photo of the document')
-  if (d.length > 3_500_000) throw new Error('That image is too large')
+  const d = assertImageSrc(doc, 'Please attach a photo of the document')
   const { rowCount } = await pool.query(
-    `UPDATE listings SET ownership_doc = $3, approval_status = 'pending', is_published = false
+    `UPDATE listings SET ownership_doc = $3, ${REQUEUE_SET}
       WHERE id = $1 AND host_id = $2`,
     [listingId, hostUserId, d]
   )
   if (!rowCount) return null
-  return getListingById(listingId)
+  const updated = await getListingById(listingId)
+  if (updated) await notifyListingRequeued(updated)
+  return updated
+}
+
+// ---- Full listing edit → automatic re-review (W3) ---------------------------
+// A host can edit EVERY aspect of their own listing — details, pricing, photos —
+// from web/iOS/Android. Two invariants hold for every helper below:
+//   1. Ownership is enforced inside the SQL (`WHERE id = $1 AND host_id = $2`, or
+//      a join back to listings.host_id for listing_images). A host id is never
+//      taken from the request body. No row matched → null → the route answers 403.
+//   2. The re-review flip lives in the SAME statement as the edit, so it can't be
+//      skipped — exactly like setListingOwnershipDoc above.
+
+/** Property types the create-listing forms offer (web icon grid, iOS
+ *  AddListingView, Android HostScreen). The stored value stays English —
+ *  clients translate the label only — so matching is case-insensitive. */
+export const PROPERTY_TYPES = [
+  'Apartment', 'House', 'Villa', 'Cabin', 'Studio', 'Loft', 'Chalet', 'Cottage',
+  'Guest suite', 'Guest House',
+] as const
+
+/** Max photos on a listing — the cap createListing already enforces. */
+export const MAX_LISTING_PHOTOS = 10
+
+/** Max chars for an inline image (data: URL) — same budget as the ownership doc. */
+const MAX_IMAGE_CHARS = 3_500_000
+
+/** Every field a host may edit through PATCH /api/local/listings/:id.
+ *  `images` is the photo set (listing_images rows), not a listings column. */
+export const EDITABLE_LISTING_FIELDS = [
+  // Moderation-relevant — what an admin actually looks at.
+  'title', 'description', 'location', 'country', 'region', 'lat', 'lng',
+  'property_type', 'max_guests', 'bedrooms', 'beds', 'bathrooms', 'amenities',
+  'ownership_doc', 'images',
+  // Commercial — what the host tunes day to day.
+  'price_per_night', 'weekend_price', 'monthly_prices',
+  'weekly_discount', 'monthly_discount', 'cancellation_policy',
+] as const
+export type ListingEditField = (typeof EDITABLE_LISTING_FIELDS)[number]
+
+/**
+ * THE re-review switch — the ONE place that decides which host edits send a
+ * listing back to the admin queue (approval_status='pending' + is_published=false).
+ *
+ * Product decision, as specified: EVERY edit re-reviews, including price,
+ * discounts, seasonal pricing and cancellation policy — so a host nudging their
+ * nightly rate takes their own listing offline until an admin approves it.
+ * To move to the usual split (moderation fields re-review, commercial fields save
+ * live) replace the value below with the moderation subset, e.g.
+ *   export const REVIEW_TRIGGERING_FIELDS: readonly ListingEditField[] =
+ *     ['title','description','location','country','region','lat','lng',
+ *      'property_type','max_guests','bedrooms','beds','bathrooms','amenities',
+ *      'ownership_doc','images']
+ * Nothing else in the codebase needs to change.
+ */
+export const REVIEW_TRIGGERING_FIELDS: readonly ListingEditField[] = EDITABLE_LISTING_FIELDS
+
+/** Does this set of edited fields put the listing back in front of an admin? */
+export function requeuesForReview(fields: readonly string[]): boolean {
+  return fields.some((f) => (REVIEW_TRIGGERING_FIELDS as readonly string[]).includes(f))
+}
+
+/** Photos are one field of the edit form — same switch, asked once. */
+const photosRequeue = () => requeuesForReview(['images'])
+
+/** The SET fragment every re-queueing edit appends — identical to the ownership-doc flow. */
+const REQUEUE_SET = `approval_status = 'pending', is_published = false`
+
+/** Something the host can fix in the form (→ HTTP 400), as opposed to a real
+ *  failure (→ 500). A named class rather than message-sniffing, so adding a
+ *  validation rule can't silently start answering 500. Mirrors the web's
+ *  HostApplicationError. */
+export class ListingInputError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ListingInputError'
+  }
+}
+
+/** Was this thrown by one of the listing validators above? (`name` is checked too
+ *  so it still works if the module is instantiated twice in a bundle.) */
+export function isListingInputError(err: unknown): boolean {
+  return err instanceof ListingInputError || (err instanceof Error && err.name === 'ListingInputError')
+}
+
+/** A photo / document source: an inline data:image or an http(s) URL, bounded in
+ *  size. Mirrors setListingOwnershipDoc + assertProofImage. */
+function assertImageSrc(src: unknown, message = 'Please attach a valid photo'): string {
+  const v = String(src ?? '').trim()
+  if (!/^(data:image\/|https?:\/\/)/i.test(v)) throw new ListingInputError(message)
+  if (v.length > MAX_IMAGE_CHARS) throw new ListingInputError('That image is too large')
+  return v
+}
+
+/** Non-blank text, else a per-field error (the clients highlight the input). */
+function assertText(v: unknown, label: string): string {
+  const s = String(v ?? '').trim()
+  if (!s) throw new ListingInputError(`${label} is required`)
+  return s
+}
+
+/** A whole number >= min, else a per-field error. */
+function assertInt(v: unknown, label: string, min: number): number {
+  const n = Number(v)
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < min) {
+    throw new ListingInputError(`${label} must be a whole number of at least ${min}`)
+  }
+  return n
+}
+
+/** A coordinate inside its valid range, or null to clear the pin. */
+function assertCoord(v: unknown, label: string, limit: number): number | null {
+  if (v === null || v === '') return null
+  const n = Number(v)
+  if (!Number.isFinite(n) || Math.abs(n) > limit) throw new ListingInputError(`${label} must be between -${limit} and ${limit}`)
+  return n
+}
+
+/** Canonical (English) property type for any casing the clients send. */
+function assertPropertyType(v: unknown): string {
+  const s = String(v ?? '').trim()
+  const match = PROPERTY_TYPES.find((p) => p.toLowerCase() === s.toLowerCase())
+  if (!match) throw new ListingInputError(`Choose a property type: ${PROPERTY_TYPES.join(', ')}`)
+  return match
+}
+
+/** Canonical region — one of REGIONS, the same chips search filters on. */
+function assertRegion(v: unknown): string {
+  const s = String(v ?? '').trim()
+  const match = REGIONS.find((r) => r.toLowerCase() === s.toLowerCase())
+  if (!match) throw new ListingInputError(`Choose an area: ${REGIONS.join(', ')}`)
+  return match
+}
+
+/** An array of non-empty amenity names (trimmed, deduped). */
+function assertAmenities(v: unknown): string[] {
+  if (!Array.isArray(v)) throw new ListingInputError('Amenities must be a list')
+  const out: string[] = []
+  for (const a of v) {
+    if (typeof a !== 'string') throw new ListingInputError('Amenities must be a list of names')
+    const s = a.trim().slice(0, 64)
+    if (s && !out.includes(s)) out.push(s)
+  }
+  return out
+}
+
+/** The full replacement photo set for a listing (array order = display order, so
+ *  the first entry is the cover). Validated like every other image we accept. */
+function assertPhotoSet(v: unknown): string[] {
+  if (!Array.isArray(v)) throw new ListingInputError('Photos must be a list')
+  if (v.length > MAX_LISTING_PHOTOS) throw new ListingInputError(`A listing can have at most ${MAX_LISTING_PHOTOS} photos`)
+  return v.map((u) => assertImageSrc(u, 'Each photo must be an image'))
+}
+
+/** Partial edit — ONLY the keys actually present are written; omitted keys keep
+ *  their current value (never nulled out). Values are `unknown` by design: the
+ *  route hands the raw JSON straight through and validation happens here, once. */
+export interface ListingPatch {
+  title?: unknown
+  description?: unknown
+  location?: unknown
+  country?: unknown
+  region?: unknown
+  lat?: unknown
+  lng?: unknown
+  property_type?: unknown
+  max_guests?: unknown
+  bedrooms?: unknown
+  beds?: unknown
+  bathrooms?: unknown
+  amenities?: unknown
+  ownership_doc?: unknown
+  /** Full replacement photo set (first = cover). Omit to leave photos untouched. */
+  images?: unknown
+  price_per_night?: unknown
+  weekend_price?: unknown
+  monthly_prices?: unknown
+  weekly_discount?: unknown
+  monthly_discount?: unknown
+  cancellation_policy?: unknown
+}
+
+/**
+ * Host edits their own listing. Ownership is enforced in the SQL, so a listing
+ * that isn't theirs matches no row and returns null (the route maps that to 403).
+ * Every re-review-triggering field (today: all of them — see
+ * REVIEW_TRIGGERING_FIELDS) puts the listing back to 'pending' + unpublished in
+ * the SAME statement as the edit. Returns the refreshed listing.
+ */
+export async function updateListingDetails(
+  listingId: string,
+  hostUserId: string,
+  patch: ListingPatch
+): Promise<Listing | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+
+  const sets: string[] = []
+  const vals: unknown[] = [listingId, hostUserId]
+  const touched: ListingEditField[] = []
+  // Column name === patch key for every scalar field, so one helper covers them all.
+  const put = (field: Exclude<ListingEditField, 'images'>, val: unknown, cast = '') => {
+    vals.push(val)
+    sets.push(`${field} = $${vals.length}${cast}`)
+    touched.push(field)
+  }
+
+  // --- Moderation-relevant fields ---
+  if (patch.title !== undefined) put('title', assertText(patch.title, 'Title').slice(0, 200))
+  if (patch.description !== undefined) put('description', assertText(patch.description, 'Description').slice(0, 5000))
+  if (patch.location !== undefined) put('location', assertText(patch.location, 'Location').slice(0, 200))
+  if (patch.country !== undefined) put('country', String(patch.country ?? '').trim().slice(0, 100) || null)
+  if (patch.region !== undefined) put('region', assertRegion(patch.region))
+  if (patch.lat !== undefined) put('lat', assertCoord(patch.lat, 'Latitude', 90))
+  if (patch.lng !== undefined) put('lng', assertCoord(patch.lng, 'Longitude', 180))
+  if (patch.property_type !== undefined) put('property_type', assertPropertyType(patch.property_type))
+  // max_guests keeps createListing's floor of 1 — a 0-guest listing can't be booked.
+  if (patch.max_guests !== undefined) put('max_guests', assertInt(patch.max_guests, 'Guests', 1))
+  if (patch.bedrooms !== undefined) put('bedrooms', assertInt(patch.bedrooms, 'Bedrooms', 0))
+  if (patch.beds !== undefined) put('beds', assertInt(patch.beds, 'Beds', 0))
+  if (patch.bathrooms !== undefined) put('bathrooms', assertInt(patch.bathrooms, 'Bathrooms', 0))
+  if (patch.amenities !== undefined) put('amenities', assertAmenities(patch.amenities))
+  if (patch.ownership_doc !== undefined) {
+    put('ownership_doc', assertImageSrc(patch.ownership_doc, 'Please attach a photo of the document'))
+  }
+
+  // --- Commercial fields (same re-review rule today) ---
+  if (patch.price_per_night !== undefined) {
+    const price = Number(patch.price_per_night)
+    if (!Number.isFinite(price) || price <= 0) throw new ListingInputError('Price must be greater than 0')
+    put('price_per_night', Math.round(price))
+  }
+  if (patch.weekend_price !== undefined) put('weekend_price', cleanPrice(patch.weekend_price))
+  if (patch.monthly_prices !== undefined) put('monthly_prices', cleanMonthlyPrices(patch.monthly_prices), '::jsonb')
+  if (patch.weekly_discount !== undefined) put('weekly_discount', clampDiscount(patch.weekly_discount))
+  if (patch.monthly_discount !== undefined) put('monthly_discount', clampDiscount(patch.monthly_discount))
+  if (patch.cancellation_policy !== undefined) put('cancellation_policy', normalizePolicy(String(patch.cancellation_policy)))
+
+  // --- Photos (listing_images rows, replaced wholesale when supplied) ---
+  // null = not sent (leave photos alone); [] = sent empty (clear them).
+  const nextPhotos = patch.images === undefined ? null : assertPhotoSet(patch.images)
+  if (nextPhotos !== null) touched.push('images')
+
+  if (!touched.length) throw new ListingInputError('No listing fields to update')
+  const requeue = requeuesForReview(touched)
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    if (sets.length || requeue) {
+      // Ownership + the re-review flip in ONE statement — nothing can bypass it.
+      const { rowCount } = await client.query(
+        `UPDATE listings SET ${[...sets, ...(requeue ? [REQUEUE_SET] : [])].join(', ')}
+          WHERE id = $1 AND host_id = $2`,
+        vals
+      )
+      if (!rowCount) {
+        await client.query('ROLLBACK')
+        return null
+      }
+    } else if (!(await ownsListing(client, listingId, hostUserId))) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    if (nextPhotos !== null) await replaceListingImages(client, listingId, nextPhotos)
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+
+  const updated = await getListingById(listingId)
+  if (updated && requeue) await notifyListingRequeued(updated)
+  return updated
+}
+
+// ---- Photos (listing_images) ------------------------------------------------
+// Add / delete / reorder, each ownership-checked through listings.host_id and each
+// re-queuing the listing — a photo change is exactly what a moderator looks at.
+
+/** Does this host own this listing? (Row locked for the rest of the transaction.) */
+async function ownsListing(client: PoolClient, listingId: string, hostUserId: string): Promise<boolean> {
+  const { rowCount } = await client.query(
+    `SELECT 1 FROM listings WHERE id = $1 AND host_id = $2 FOR UPDATE`,
+    [listingId, hostUserId]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/** Re-queue for admin review inside an open transaction. Ownership re-checked. */
+async function requeueListing(client: PoolClient, listingId: string, hostUserId: string): Promise<void> {
+  await client.query(`UPDATE listings SET ${REQUEUE_SET} WHERE id = $1 AND host_id = $2`, [listingId, hostUserId])
+}
+
+/** Swap a listing's whole photo set — array order becomes display order (first = cover). */
+async function replaceListingImages(client: PoolClient, listingId: string, urls: string[]): Promise<void> {
+  await client.query(`DELETE FROM listing_images WHERE listing_id = $1`, [listingId])
+  for (let i = 0; i < urls.length; i++) {
+    await client.query(`INSERT INTO listing_images (listing_id, url, "order") VALUES ($1,$2,$3)`, [listingId, urls[i], i])
+  }
+}
+
+/** Host appends photos to their own listing (kept under MAX_LISTING_PHOTOS) →
+ *  re-queues for review. Returns the refreshed listing, or null if not theirs. */
+export async function addListingImages(
+  listingId: string,
+  hostUserId: string,
+  urls: unknown
+): Promise<Listing | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+  const list = Array.isArray(urls) ? urls : [urls]
+  if (!list.length) throw new ListingInputError('Please attach at least one photo')
+  const photos = list.map((u) => assertImageSrc(u, 'Each photo must be an image'))
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    if (!(await ownsListing(client, listingId, hostUserId))) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const { rows } = await client.query(
+      `SELECT count(*)::int AS count, COALESCE(max("order"), -1)::int AS max_order
+         FROM listing_images WHERE listing_id = $1`,
+      [listingId]
+    )
+    const { count, max_order } = rows[0] as { count: number; max_order: number }
+    if (count + photos.length > MAX_LISTING_PHOTOS) {
+      throw new ListingInputError(`A listing can have at most ${MAX_LISTING_PHOTOS} photos`)
+    }
+    for (let i = 0; i < photos.length; i++) {
+      await client.query(
+        `INSERT INTO listing_images (listing_id, url, "order") VALUES ($1,$2,$3)`,
+        [listingId, photos[i], max_order + 1 + i]
+      )
+    }
+    if (photosRequeue()) await requeueListing(client, listingId, hostUserId)
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+
+  const updated = await getListingById(listingId)
+  if (updated && photosRequeue()) await notifyListingRequeued(updated)
+  return updated
+}
+
+/** Host removes one photo from their own listing (the remaining orders are
+ *  re-packed to 0..n-1, so the next photo becomes the cover) → re-queues for review. */
+export async function deleteListingImage(
+  listingId: string,
+  hostUserId: string,
+  imageId: string
+): Promise<Listing | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId) || !isUuid(imageId)) return null
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Ownership via a join back to listings.host_id — the image id alone proves nothing.
+    const { rowCount } = await client.query(
+      `DELETE FROM listing_images li
+        USING listings l
+        WHERE li.id = $3 AND li.listing_id = $1 AND l.id = li.listing_id AND l.host_id = $2`,
+      [listingId, hostUserId, imageId]
+    )
+    if (!rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    await client.query(
+      `UPDATE listing_images li SET "order" = ranked.rn - 1
+         FROM (SELECT id, row_number() OVER (ORDER BY "order", id) AS rn
+                 FROM listing_images WHERE listing_id = $1) ranked
+        WHERE li.id = ranked.id AND li."order" <> ranked.rn - 1`,
+      [listingId]
+    )
+    if (photosRequeue()) await requeueListing(client, listingId, hostUserId)
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+
+  const updated = await getListingById(listingId)
+  if (updated && photosRequeue()) await notifyListingRequeued(updated)
+  return updated
+}
+
+/** Host reorders their own listing's photos — `orderedImageIds` must list every
+ *  photo of the listing exactly once; index 0 becomes the cover. Re-queues for review. */
+export async function reorderListingImages(
+  listingId: string,
+  hostUserId: string,
+  orderedImageIds: unknown
+): Promise<Listing | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+  if (!Array.isArray(orderedImageIds)) throw new ListingInputError('Photo order must be a list of photo ids')
+  const ids = orderedImageIds.map((v) => String(v ?? '').trim())
+  if (!ids.length || ids.some((v) => !isUuid(v))) throw new ListingInputError('Photo order must be a list of photo ids')
+  if (new Set(ids).size !== ids.length) throw new ListingInputError('Each photo can appear only once in the order')
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    if (!(await ownsListing(client, listingId, hostUserId))) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const { rows } = await client.query(`SELECT id FROM listing_images WHERE listing_id = $1`, [listingId])
+    const current = new Set((rows as { id: string }[]).map((r) => r.id))
+    if (current.size !== ids.length || ids.some((id) => !current.has(id))) {
+      throw new ListingInputError('The photo order must list every photo of this listing exactly once')
+    }
+    for (let i = 0; i < ids.length; i++) {
+      await client.query(`UPDATE listing_images SET "order" = $3 WHERE id = $2 AND listing_id = $1`, [listingId, ids[i], i])
+    }
+    if (photosRequeue()) await requeueListing(client, listingId, hostUserId)
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+
+  const updated = await getListingById(listingId)
+  if (updated && photosRequeue()) await notifyListingRequeued(updated)
+  return updated
+}
+
+/** A host edit put this listing back in the moderation queue: tell the host it's
+ *  hidden until approved (the same shape as createListing's "submitted for review")
+ *  and ping every admin so the /ops queue is picked up. Best-effort — a
+ *  notification failure never fails the edit. */
+async function notifyListingRequeued(listing: Listing): Promise<void> {
+  try {
+    if (listing.host_id) {
+      await createNotification(listing.host_id, {
+        type: 'listing_submitted',
+        title: 'Listing back under review',
+        body: `“${listing.title}” was updated, so it’s under review again. It stays hidden from guests until an admin approves it.`,
+        link: '/host',
+      })
+      await sendPush(listing.host_id, {
+        title: 'Listing back under review',
+        body: `${listing.title} — hidden from guests until approved`,
+        link: '/host',
+      })
+    }
+    const { rows } = await pool.query(`SELECT id FROM users WHERE role = 'admin'`)
+    for (const admin of rows as { id: string }[]) {
+      await createNotification(admin.id, {
+        type: 'listing_pending',
+        title: 'Listing edited — needs review',
+        body: `“${listing.title}” was edited by its host and is waiting for approval.`,
+        link: '/ops',
+      })
+    }
+  } catch (e) {
+    console.error('notifyListingRequeued failed (ignored):', e)
+  }
+}
+
+// ---- Stay guide (host-authored content on a confirmed booking) ---------------
+// The host enriches a confirmed reservation with info blocks, photos, QR links to
+// places and attachments; the guest sees them on the stay pass the QR opens.
+// bookings.host_notes (free text) still works exactly as before — these are
+// structured items alongside it.
+
+export const STAY_GUIDE_KINDS = ['info', 'photo', 'place_qr', 'attachment'] as const
+export type StayGuideKind = (typeof STAY_GUIDE_KINDS)[number]
+
+export interface StayGuideItem {
+  id: string
+  kind: StayGuideKind
+  title: string | null
+  body: string | null
+  url: string | null
+  order: number
+}
+
+/** Display fields only — never the booking id or anything about the guest. The
+ *  public stay page returns exactly this shape too. */
+const GUIDE_COLS = `g.id::text AS id, g.kind, g.title, g.body, g.url, g."order"`
+const GUIDE_ORDER = `ORDER BY g."order", g.created_at`
+
+const MAX_GUIDE_ASSET = 3_500_000 // same cap as ownership docs / payment proofs
+const MAX_GUIDE_TITLE = 120
+const MAX_GUIDE_BODY = 4000
+const MAX_GUIDE_LINK = 2000
+
+/** One of the four item types, else a guest-readable error. */
+function assertGuideKind(kind: unknown): StayGuideKind {
+  const k = String(kind ?? '').trim().toLowerCase()
+  if (!(STAY_GUIDE_KINDS as readonly string[]).includes(k)) {
+    throw new Error('Choose a type: info, photo, place_qr or attachment')
+  }
+  return k as StayGuideKind
+}
+
+/** Host-typed text, capped and stored as PLAIN TEXT — it is rendered to strangers
+ *  on the public pass, so every client escapes it (never dangerouslySetInnerHTML). */
+function cleanGuideText(v: unknown, max: number): string | null {
+  const s = String(v ?? '').trim()
+  return s ? s.slice(0, max) : null
+}
+
+/** Validate the item's URL for its kind (mirrors setListingOwnershipDoc):
+ *   photo/attachment — an inline data: URL or an http(s) link, max ~3.5MB;
+ *   place_qr        — a link the guest's phone will OPEN, so http(s) ONLY
+ *                     (data: and javascript: are rejected);
+ *   info            — carries no URL. */
+function cleanGuideUrl(kind: StayGuideKind, url: unknown): string | null {
+  const u = String(url ?? '').trim()
+  if (kind === 'info') return null
+  if (kind === 'place_qr') {
+    if (!/^https?:\/\//i.test(u)) throw new Error('Please use a link starting with http:// or https://')
+    if (u.length > MAX_GUIDE_LINK) throw new Error('That link is too long')
+    return u
+  }
+  if (!/^(data:|https?:\/\/)/i.test(u)) {
+    throw new Error(kind === 'photo' ? 'Please attach a photo' : 'Please attach a file')
+  }
+  if (u.length > MAX_GUIDE_ASSET) throw new Error('That file is too large (max ~3.5MB)')
+  return u
+}
+
+/** Clamp the manual sort position. */
+function clampGuideOrder(v: unknown): number | null {
+  if (v === undefined || v === null || v === '') return null
+  const n = Math.floor(Number(v))
+  return Number.isFinite(n) ? Math.max(0, Math.min(9999, n)) : null
+}
+
+export interface StayGuideInput {
+  kind: unknown
+  title?: unknown
+  body?: unknown
+  url?: unknown
+  order?: unknown
+}
+
+/** The booking's guide items. Read side only — callers authorize first. */
+async function getStayGuideItems(bookingId: string): Promise<StayGuideItem[]> {
+  const { rows } = await pool.query(
+    `SELECT ${GUIDE_COLS} FROM stay_guide_items g WHERE g.booking_id = $1 ${GUIDE_ORDER}`,
+    [bookingId]
+  )
+  return rows as StayGuideItem[]
+}
+
+/** The guide for a reservation, for the booking's guest, the listing's host, or
+ *  an admin — else null (same authorization shape as getBookingProof). */
+export async function listStayGuide(
+  bookingId: string,
+  requester: { id: string; role: string },
+): Promise<StayGuideItem[] | null> {
+  if (!isUuid(bookingId)) return null
+  const auth = await pool.query(
+    `SELECT b.user_id, l.host_id FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE b.id = $1`,
+    [bookingId]
+  )
+  const a = auth.rows[0]
+  if (!a) return null
+  const allowed = requester.role === 'admin' || requester.id === a.user_id || requester.id === a.host_id
+  if (!allowed) return null
+  return getStayGuideItems(bookingId)
+}
+
+/**
+ * Host adds an item to one of THEIR confirmed bookings. Ownership + the confirmed
+ * gate live in the INSERT ... SELECT itself, so a client-supplied host id can
+ * never widen it: no matching (booking, host) row → no insert → null.
+ * Omitting `order` appends the item to the end of the guide.
+ */
+export async function addStayGuideItem(
+  bookingId: string,
+  hostUserId: string,
+  input: StayGuideInput,
+): Promise<StayGuideItem | null> {
+  if (!isUuid(bookingId) || !isUuid(hostUserId)) return null
+  const kind = assertGuideKind(input.kind)
+  const title = cleanGuideText(input.title, MAX_GUIDE_TITLE)
+  const body = cleanGuideText(input.body, MAX_GUIDE_BODY)
+  const url = cleanGuideUrl(kind, input.url)
+  if (kind === 'info' && !title && !body) throw new Error('Add a title or some text for this item')
+  const { rows } = await pool.query(
+    `WITH ins AS (
+       INSERT INTO stay_guide_items (booking_id, kind, title, body, url, "order")
+       SELECT b.id, $3, $4, $5, $6,
+              COALESCE($7::int, (SELECT COALESCE(max(x."order"), -1) + 1 FROM stay_guide_items x WHERE x.booking_id = b.id))
+         FROM bookings b JOIN listings l ON l.id = b.listing_id
+        WHERE b.id = $1 AND l.host_id = $2 AND b.status = 'confirmed'
+       RETURNING *
+     )
+     SELECT ${GUIDE_COLS} FROM ins g`,
+    [bookingId, hostUserId, kind, title, body, url, clampGuideOrder(input.order)]
+  )
+  return (rows[0] as StayGuideItem) ?? null
+}
+
+/** Host edits / reorders one of their items. `kind` is immutable (delete + re-add
+ *  to change it) so the URL rules can't be swapped out from under an item.
+ *  Only the fields present in `patch` change; ownership is enforced in the SQL. */
+export async function updateStayGuideItem(
+  bookingId: string,
+  itemId: string,
+  hostUserId: string,
+  patch: { title?: unknown; body?: unknown; url?: unknown; order?: unknown },
+): Promise<StayGuideItem | null> {
+  if (!isUuid(bookingId) || !isUuid(itemId) || !isUuid(hostUserId)) return null
+  // The item's own kind decides how a new URL is validated.
+  const cur = await pool.query(
+    `SELECT g.kind FROM stay_guide_items g
+       JOIN bookings b ON b.id = g.booking_id
+       JOIN listings l ON l.id = b.listing_id
+      WHERE g.id = $1 AND b.id = $2 AND l.host_id = $3`,
+    [itemId, bookingId, hostUserId]
+  )
+  if (!cur.rows[0]) return null
+  const kind = cur.rows[0].kind as StayGuideKind
+  const hasTitle = patch.title !== undefined
+  const hasBody = patch.body !== undefined
+  const hasUrl = patch.url !== undefined && kind !== 'info'
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE stay_guide_items g SET
+         title = CASE WHEN $4::boolean THEN $5 ELSE g.title END,
+         body  = CASE WHEN $6::boolean THEN $7 ELSE g.body END,
+         url   = CASE WHEN $8::boolean THEN $9 ELSE g.url END,
+         "order" = COALESCE($10::int, g."order")
+       FROM bookings b, listings l
+       WHERE g.id = $1 AND g.booking_id = b.id AND b.id = $2
+         AND l.id = b.listing_id AND l.host_id = $3
+       RETURNING g.*
+     )
+     SELECT ${GUIDE_COLS} FROM upd g`,
+    [
+      itemId, bookingId, hostUserId,
+      hasTitle, hasTitle ? cleanGuideText(patch.title, MAX_GUIDE_TITLE) : null,
+      hasBody, hasBody ? cleanGuideText(patch.body, MAX_GUIDE_BODY) : null,
+      hasUrl, hasUrl ? cleanGuideUrl(kind, patch.url) : null,
+      clampGuideOrder(patch.order),
+    ]
+  )
+  return (rows[0] as StayGuideItem) ?? null
+}
+
+/** Host removes one of their items. True if a row was deleted. */
+export async function deleteStayGuideItem(
+  bookingId: string,
+  itemId: string,
+  hostUserId: string,
+): Promise<boolean> {
+  if (!isUuid(bookingId) || !isUuid(itemId) || !isUuid(hostUserId)) return false
+  const { rowCount } = await pool.query(
+    `DELETE FROM stay_guide_items g
+      USING bookings b, listings l
+      WHERE g.id = $1 AND g.booking_id = b.id AND b.id = $2
+        AND l.id = b.listing_id AND l.host_id = $3`,
+    [itemId, bookingId, hostUserId]
+  )
+  return (rowCount ?? 0) > 0
 }
 
 export interface StayPass {
@@ -859,16 +1544,28 @@ export interface StayPass {
   guest_name: string | null
   host_name: string | null
   image: string | null
+  /** Host-authored guide items (empty unless the stay is confirmed/completed). */
+  guide: StayGuideItem[]
+}
+
+/** Normalize a code coming off a QR / URL segment. Returns null when there is no
+ *  usable code — including the literal "null"/"undefined" that a client with an
+ *  unconfirmed booking may have stringified into the link. A pending booking has
+ *  reservation_code NULL, so it can never be reached by code at all. */
+export function normalizeStayCode(code: unknown): string | null {
+  const c = String(code ?? '').trim().toUpperCase()
+  if (!c || c === 'NULL' || c === 'UNDEFINED' || c === 'NONE') return null
+  return c
 }
 
 /** Public stay "pass" data, looked up by the reservation code embedded in the
- *  QR. Returns only non-sensitive fields (no emails/phones) so the QR link is
- *  safe to open by anyone holding the code. */
+ *  QR. Returns only non-sensitive fields (no emails/phones, no ids) so the QR
+ *  link is safe to open by anyone holding the code. */
 export async function getStayByCode(code: string): Promise<StayPass | null> {
-  const c = (code || '').trim().toUpperCase()
+  const c = normalizeStayCode(code)
   if (!c) return null
   const { rows } = await pool.query(
-    `SELECT b.reservation_code,
+    `SELECT b.id, b.reservation_code,
             l.title, l.location, l.region,
             to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
             to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
@@ -878,16 +1575,33 @@ export async function getStayByCode(code: string): Promise<StayPass | null> {
             (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
             (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image
        FROM bookings b JOIN listings l ON l.id = b.listing_id
-      WHERE upper(b.reservation_code) = $1 LIMIT 1`,
+      WHERE b.reservation_code IS NOT NULL AND upper(b.reservation_code) = $1 LIMIT 1`,
     [c]
   )
-  return (rows[0] as StayPass) ?? null
+  const row = rows[0] as (Omit<StayPass, 'guide'> & { id: string }) | undefined
+  if (!row) return null
+  const { id, ...pass } = row
+  // The guide belongs to a live stay: once cancelled/rejected the host's content
+  // (gate codes, directions…) stops being served. Best-effort so a dev DB without
+  // the table still renders the pass.
+  let guide: StayGuideItem[] = []
+  if (pass.status === 'confirmed' || pass.status === 'completed') {
+    try {
+      guide = await getStayGuideItems(id)
+    } catch (e) {
+      console.error('stay guide unavailable (run the stay_guide_items migration):', e)
+    }
+  }
+  return { ...pass, guide }
 }
 
 // ---- Reservation lifecycle: host listings + booking confirmation -------------
 
-/** Short reservation code shown on the card + encoded in the QR, e.g. "QK-7F3K9Q". */
-function genReservationCode(): string {
+/** THE reservation-code generator — one format for every surface (backend, web,
+ *  iOS, Android): "QK-" + 6 chars from an alphabet with no ambiguous glyphs, e.g.
+ *  "QK-7F3K9Q". Never derive a code from the booking id; the stored column is the
+ *  only truth, and it is written exactly once, at confirmation (see issueCodeSql). */
+export function genReservationCode(): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // no ambiguous chars
   let s = ''
   for (let i = 0; i < 6; i++) s += alphabet[randomInt(0, alphabet.length)]
@@ -1011,11 +1725,14 @@ export async function setBookingStatus(
   status: 'confirmed' | 'rejected'
 ): Promise<Booking | null> {
   if (!isUuid(bookingId) || !isUuid(hostUserId)) return null
+  // Approving is THE confirmation transition — the reservation code (and with it the
+  // guest's QR / wallet pass / stay link) is born here. Declining leaves it NULL.
   await pool.query(
-    `UPDATE bookings b SET status = $3
+    `UPDATE bookings b SET status = $3,
+            ${issueCodeSql(`$3 = 'confirmed'`, '$4')}
        FROM listings l
       WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2 AND b.status = 'pending'`,
-    [bookingId, hostUserId, status]
+    [bookingId, hostUserId, status, genReservationCode()]
   )
   const { rows } = await pool.query(
     `SELECT ${BOOKING_COLS} FROM bookings b JOIN listings l ON l.id = b.listing_id
@@ -1247,13 +1964,15 @@ export async function hostReviewPayment(
        UPDATE bookings b SET
          status = CASE WHEN $3 THEN 'confirmed' ELSE 'rejected' END,
          payment_status = CASE WHEN $3 THEN 'paid' ELSE 'rejected' END,
-         paid_at = CASE WHEN $3 THEN COALESCE(b.paid_at, now()) ELSE b.paid_at END
+         paid_at = CASE WHEN $3 THEN COALESCE(b.paid_at, now()) ELSE b.paid_at END,
+         -- Accepting the transfer confirms the stay → issue the reservation code.
+         ${issueCodeSql('$3', '$4')}
        FROM listings l
        WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2 AND b.status = 'pending'
        RETURNING b.*
      )
      SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
-    [bookingId, hostUserId, accept]
+    [bookingId, hostUserId, accept, genReservationCode()]
   )
   const booking = (rows[0] as Booking) ?? null
   if (!booking) return null
@@ -1364,12 +2083,14 @@ export async function adminResolveDispute(
        UPDATE bookings b SET
          status = CASE WHEN $2 THEN 'confirmed' ELSE 'rejected' END,
          payment_status = CASE WHEN $2 THEN 'paid' ELSE 'rejected' END,
-         paid_at = CASE WHEN $2 THEN COALESCE(b.paid_at, now()) ELSE b.paid_at END
+         paid_at = CASE WHEN $2 THEN COALESCE(b.paid_at, now()) ELSE b.paid_at END,
+         -- Upholding the guest ("I did pay") confirms the stay → issue the code.
+         ${issueCodeSql('$2', '$3')}
        WHERE b.id = $1
        RETURNING b.*
      )
      SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
-    [bookingId, approve]
+    [bookingId, approve, genReservationCode()]
   )
   const booking = (rows[0] as Booking) ?? null
   if (!booking) return null
@@ -1403,6 +2124,219 @@ export async function adminResolveDispute(
     })
   }
   return booking
+}
+
+// ---- Host applications ("become a host" → admin review → approve) -----------
+// Mirrors the web's helpers (quickin-master/src/lib/local/db.ts) so both projects
+// behave identically against the shared Neon DB. Applying NEVER grants hosting —
+// only an admin approval flips users.is_host.
+
+export const HOST_TYPES = ['individual', 'company', 'brokerage'] as const
+export type HostType = (typeof HOST_TYPES)[number]
+
+/** Derived host state every client reads on launch to gate host surfaces. */
+export type HostStatus = 'none' | 'pending' | 'rejected' | 'approved'
+
+export interface HostState {
+  is_host: boolean
+  host_type: string | null
+  host_status: HostStatus
+  host_review_note: string | null
+}
+
+export interface HostApplication {
+  id: string
+  user_id: string
+  email?: string
+  full_name: string | null
+  national_id: string | null
+  phone: string | null
+  address: string | null
+  company: string | null
+  host_type: string | null
+  notes: string | null
+  status: 'pending' | 'approved' | 'rejected'
+  submitted_at: string
+  reviewed_at: string | null
+  review_note: string | null
+}
+
+// host_applications has no host_type column (canonical schema) — the choice is
+// persisted on users.host_type at apply time and read back through the join.
+const HOST_APP_COLS = `a.id, a.user_id, a.full_name, a.national_id, a.phone, a.address, a.company,
+            u.host_type, a.notes, a.status,
+            to_char(a.submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS submitted_at,
+            to_char(a.reviewed_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS reviewed_at,
+            a.review_note`
+
+/** Legacy rule: is_host = true ALWAYS means approved, even with no application
+ *  row, so pre-existing hosts keep working. Conversely 'approved' is never taken
+ *  from the application alone — users.is_host is the only source of host access. */
+function deriveHostStatus(isHost: boolean, appStatus: string | null): HostStatus {
+  if (isHost) return 'approved'
+  if (appStatus === 'pending') return 'pending'
+  if (appStatus === 'rejected') return 'rejected'
+  return 'none'
+}
+
+function hostStateOf(isHost: boolean, hostType: string | null, appStatus: string | null, note: string | null): HostState {
+  const status = deriveHostStatus(isHost, appStatus)
+  return {
+    is_host: isHost,
+    host_type: hostType ?? null,
+    host_status: status,
+    host_review_note: status === 'rejected' ? (note ?? null) : null, // the note only ever explains a rejection
+  }
+}
+
+/** The authoritative host fields for a user — returned by /api/auth/me and every
+ *  auth response so a client can validate host access on each launch. */
+export async function getHostState(userId: string): Promise<HostState> {
+  const none: HostState = { is_host: false, host_type: null, host_status: 'none', host_review_note: null }
+  if (!isUuid(userId)) return none
+  try {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(u.is_host, false) AS is_host, u.host_type, a.status, a.review_note
+         FROM users u LEFT JOIN host_applications a ON a.user_id = u.id
+        WHERE u.id = $1`,
+      [userId]
+    )
+    const r = rows[0]
+    return r ? hostStateOf(Boolean(r.is_host), r.host_type, r.status, r.review_note) : none
+  } catch (e) {
+    // host_applications is absent on an old dev DB — fall back to users.is_host
+    // alone so sign-in never breaks and legacy hosts still read as approved.
+    console.error('getHostState fell back to users.is_host:', e)
+    const { rows } = await pool.query(`SELECT COALESCE(is_host, false) AS is_host, host_type FROM users WHERE id = $1`, [userId])
+    const r = rows[0]
+    return r ? hostStateOf(Boolean(r.is_host), r.host_type, null, null) : none
+  }
+}
+
+/** Spread the host fields onto a user payload so login / verify-otp / social all
+ *  return exactly the shape /api/auth/me does. */
+export async function withHostState<T extends { id: string }>(user: T): Promise<T & HostState> {
+  return { ...user, ...(await getHostState(user.id)) }
+}
+
+/** The signed-in user's application, or null when they never applied. */
+export async function getHostApplication(userId: string): Promise<HostApplication | null> {
+  if (!isUuid(userId)) return null
+  const { rows } = await pool.query(
+    `SELECT ${HOST_APP_COLS}
+       FROM host_applications a JOIN users u ON u.id = a.user_id
+      WHERE a.user_id = $1`,
+    [userId]
+  )
+  return (rows[0] as HostApplication) ?? null
+}
+
+/** Submit (or re-submit after a rejection) an application: upserts on the
+ *  UNIQUE (user_id) constraint, back to 'pending' with the old review cleared.
+ *  Does NOT touch users.is_host. Callers validate the fields first. */
+export async function submitHostApplication(
+  userId: string,
+  f: {
+    full_name: string
+    national_id: string
+    phone: string
+    address: string
+    host_type: HostType
+    company?: string | null
+    notes?: string | null
+  }
+): Promise<HostApplication | null> {
+  if (!isUuid(userId)) throw new Error('Invalid user')
+  const company = f.host_type === 'individual' ? null : (f.company || null)
+  const vals = [userId, f.full_name, f.national_id, f.phone, f.address, company, f.notes || null]
+  const upd = await pool.query(
+    `UPDATE host_applications
+        SET full_name = $2, national_id = $3, phone = $4, address = $5, company = $6, notes = $7,
+            status = 'pending', submitted_at = now(), reviewed_at = NULL, reviewed_by = NULL, review_note = NULL
+      WHERE user_id = $1 RETURNING id`,
+    vals
+  )
+  if (!upd.rows[0]) {
+    await pool.query(
+      `INSERT INTO host_applications (user_id, full_name, national_id, phone, address, company, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      vals
+    )
+  }
+  // Persist the host type + company on the user (same as the web) so listings can
+  // show a "Company"/"Brokerage" badge once the application is approved.
+  await pool.query(`UPDATE users SET host_type = $2, company = $3 WHERE id = $1`, [userId, f.host_type, company])
+  return getHostApplication(userId)
+}
+
+/** Admin queue — applications with the applicant's email. Defaults to 'pending'. */
+export async function listHostApplications(status = 'pending'): Promise<HostApplication[]> {
+  const filterable = status === 'pending' || status === 'approved' || status === 'rejected'
+  const { rows } = await pool.query(
+    `SELECT ${HOST_APP_COLS}, u.email
+       FROM host_applications a JOIN users u ON u.id = a.user_id
+      ${filterable ? 'WHERE a.status = $1' : ''}
+      ORDER BY a.submitted_at ASC`,
+    filterable ? [status] : []
+  )
+  return rows as HostApplication[]
+}
+
+/** Admin decision, keyed by the APPLICANT (like admin/verifications). Approve
+ *  flips users.is_host AND stamps the application in ONE transaction; reject only
+ *  stamps the application. Both notify the applicant. */
+export async function reviewHostApplication(
+  userId: string,
+  action: 'approve' | 'reject',
+  note: string | null
+): Promise<HostApplication | null> {
+  if (!isUuid(userId)) return null
+  const approve = action === 'approve'
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query(
+      `UPDATE host_applications
+          SET status = $2, reviewed_at = now(), reviewed_by = 'admin', review_note = $3
+        WHERE user_id = $1 RETURNING id`,
+      [userId, approve ? 'approved' : 'rejected', note]
+    )
+    if (!rows[0]) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    if (approve) {
+      // The applicant's host_type was stored on the user when they applied (legacy
+      // rows default to 'individual'). role='host' keeps the backend's own flag in sync.
+      await client.query(
+        `UPDATE users SET is_host = true, role = 'host', host_type = COALESCE(host_type, 'individual') WHERE id = $1`,
+        [userId]
+      )
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+  // Notify after the commit (best-effort, like the listing/verification flows).
+  await createNotification(userId, {
+    type: 'host',
+    title: approve ? 'You are now a host!' : 'Host application update',
+    body: approve
+      ? 'Your host application was approved — you can now list your space and accept guests.'
+      : note
+        ? `Your application needs attention: ${note}`
+        : 'Your host application was not approved this time.',
+    link: approve ? '/host' : '/account',
+  })
+  await sendPush(userId, {
+    title: approve ? 'You are now a host 🎉' : 'Host application update',
+    body: approve ? 'Your application was approved — start listing your space.' : 'Tap to see what needs attention.',
+    link: approve ? '/host' : '/account',
+  })
+  return getHostApplication(userId)
 }
 
 // ---- ID verification (id_verifications table — shared with web /ops admin) ---

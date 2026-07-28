@@ -2,6 +2,7 @@ import { pool } from './pool'
 import { createNotification } from './notifications'
 import { sendPush } from './push'
 import { sendNotificationEmail } from './mailer'
+import { genReservationCode } from './db'
 
 const WEB_URL = process.env.WEB_URL || 'https://quickin-frontend.vercel.app'
 
@@ -142,7 +143,10 @@ export async function deleteEntity(entity: string, id: string): Promise<{ delete
 
 /** Admin drives a reservation's lifecycle (pending → confirmed → completed, or
  *  rejected/cancelled). Marking it "completed" lets the guest leave a review.
- *  Notifies the guest (in-app). */
+ *  Notifies the guest (in-app). Moving a booking to confirmed/completed is a
+ *  confirmation transition, so it issues the reservation code — idempotently
+ *  (COALESCE), exactly like every other path in db.ts. Pending/rejected/cancelled
+ *  never mint one: no code, no QR. */
 export async function adminSetBookingStatus(
   bookingId: string,
   status: string
@@ -150,11 +154,14 @@ export async function adminSetBookingStatus(
   if (!isUuid(bookingId)) throw new Error('Invalid id')
   if (!(BOOKING_STATUSES as readonly string[]).includes(status)) throw new Error('Invalid status')
   const { rows } = await pool.query(
-    `UPDATE bookings b SET status = $2
+    `UPDATE bookings b SET status = $2,
+            reservation_code = CASE WHEN $2 IN ('confirmed', 'completed')
+                                    THEN COALESCE(b.reservation_code, $3)
+                                    ELSE b.reservation_code END
        FROM listings l
       WHERE b.id = $1 AND l.id = b.listing_id
       RETURNING b.user_id, l.title`,
-    [bookingId, status]
+    [bookingId, status, genReservationCode()]
   )
   const row = rows[0]
   if (row) {
