@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { adminListDisputes, adminResolveDispute } from '@/lib/local/db'
-import { getUserFromRequest } from '@/lib/local/auth'
+import { requireStaff, staffActor } from '@/lib/local/staff'
 
 // Admin payment-dispute queue.
 //   GET  /api/local/admin/payments                         → open disputes
@@ -25,15 +25,8 @@ export async function OPTIONS() {
   })
 }
 
-async function requireAdmin(req: Request) {
-  const user = await getUserFromRequest(req)
-  if (!user) return { error: NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS }) }
-  if (user.role !== 'admin') return { error: NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS }) }
-  return { user }
-}
-
 export async function GET(req: Request) {
-  const gate = await requireAdmin(req)
+  const gate = await requireStaff(req, 'payments')
   if ('error' in gate) return gate.error
   try {
     return NextResponse.json(await adminListDisputes(), { headers: CORS })
@@ -43,7 +36,7 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const gate = await requireAdmin(req)
+  const gate = await requireStaff(req, 'payments')
   if ('error' in gate) return gate.error
   try {
     const body = await req.json().catch(() => ({}))
@@ -53,7 +46,7 @@ export async function POST(req: Request) {
     if (!bookingId || !action) {
       return NextResponse.json({ error: 'booking_id and action ("approve"|"uphold") are required' }, { status: 400, headers: CORS })
     }
-    const booking = await adminResolveDispute(bookingId, gate.user.id, action, body.note ?? null)
+    const booking = await adminResolveDispute(bookingId, staffActor(gate.staff), action, body.note ?? null)
     if (!booking) return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
     return NextResponse.json(booking, { headers: CORS })
   } catch (err) {

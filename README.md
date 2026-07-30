@@ -45,12 +45,49 @@ Auth is stateless: an HMAC-signed token returned on login/signup, sent back eith
 | `GOOGLE_CLIENT_ID` | optional | Enables `/api/auth/google` (Google ID-token audience). |
 | `APPLE_CLIENT_ID` | optional | Enables `/api/auth/apple` (Apple Services/bundle id). |
 
-## Seed the database
+## Run the whole stack locally
 
-Create the tables and seed the demo listings:
+Everything runs locally — no Vercel, no Neon, no SMTP account needed.
 
 ```bash
-psql "$DATABASE_URL" -f local-backend/init.sql
+# 1. a local Postgres (any 14+)
+brew services start postgresql@14
+createdb quickin_local
+
+# 2. build the ENTIRE schema + demo data + your admin login, one command
+export DATABASE_URL=postgresql://localhost:5432/quickin_local
+SUPERADMIN_EMAIL=you@quickin.app SUPERADMIN_PASSWORD='LocalDev12345' \
+  node scripts/setup-local.mjs
+
+# 3. run the apps (each in its own shell, DATABASE_URL exported in both)
+npm run dev                                    # API      → :4000
+cd ../../quickin-frontend && npm run dev       # web+/ops → :3000
+```
+
+Then sign in to the admin console at **http://localhost:3000/ops/login**.
+
+`setup-local.mjs` is idempotent — re-run it any time to pick up new migrations. It
+refuses to touch a non-local `DATABASE_URL` unless `ALLOW_REMOTE=1`, because it seeds
+demo data.
+
+> **`local-backend/init.sql` alone is NOT a working schema.** It creates the base
+> tables, but 20+ later `scripts/migrate-*.mjs` files add columns and tables the apps
+> actually read (`users.is_host`, `bookings.paid_at`, `host_applications`,
+> `id_verifications`, …). A DB built from `init.sql` only will 500 on several
+> endpoints. `setup-local.mjs` runs all of them in order.
+
+Optional locally:
+
+| Variable | Without it |
+| --- | --- |
+| `SMTP_*` | OTP and staff-reset codes are printed to the server console instead of emailed (the reset UI shows the code) |
+| `STAFF_AUTH_SECRET` | Falls back to a dev default — fine locally, **set it in production** |
+| `PAYMOB_*`, `FIREBASE_*` | Those features are inert |
+
+### Seeding just the schema
+
+```bash
+psql "$DATABASE_URL" -f local-backend/init.sql   # base tables only — see the warning above
 ```
 
 ## Admin panel (optional)

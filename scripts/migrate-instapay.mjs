@@ -48,7 +48,9 @@ CREATE INDEX IF NOT EXISTS idx_payment_proofs_booking ON payment_proofs (booking
 CREATE INDEX IF NOT EXISTS idx_payment_proofs_status  ON payment_proofs (status);
 `
 
-const pool = new pg.Pool({ connectionString: databaseUrl(), ssl: { rejectUnauthorized: false } })
+const _cs = databaseUrl()
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 ;(async () => {
   await pool.query(DDL)
   const s = await pool.query(`SELECT count(*)::int AS n FROM app_settings`)

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserFromRequest } from '@/lib/local/auth'
+import { requireStaff } from '@/lib/local/staff'
 import { adminBroadcast } from '@/lib/local/admin'
 
 // POST /api/local/admin/notify (admin) — fire a notification to users.
@@ -25,9 +25,8 @@ export async function OPTIONS() {
 
 export async function POST(req: Request) {
   try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    const gate = await requireStaff(req, 'notify')
+    if ('error' in gate) return gate.error
     const b = await req.json().catch(() => ({}))
     const result = await adminBroadcast({
       title: b.title,

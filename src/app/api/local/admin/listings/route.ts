@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserFromRequest } from '@/lib/local/auth'
+import { requireStaff } from '@/lib/local/staff'
 import { listPendingListings, setListingApproval } from '@/lib/local/db'
 
 // Admin listing-moderation queue.
@@ -25,9 +25,8 @@ export async function OPTIONS() {
 
 export async function GET(req: Request) {
   try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    const gate = await requireStaff(req, 'listings')
+    if ('error' in gate) return gate.error
     return NextResponse.json(await listPendingListings(), { headers: CORS })
   } catch (err) {
     return NextResponse.json({ error: 'Failed to load pending listings', detail: String(err) }, { status: 500, headers: CORS })
@@ -36,9 +35,8 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    const gate = await requireStaff(req, 'listings')
+    if ('error' in gate) return gate.error
     const b = await req.json().catch(() => ({}))
     const listingId = String(b.listing_id ?? b.listingId ?? '')
     const action = String(b.action ?? '')

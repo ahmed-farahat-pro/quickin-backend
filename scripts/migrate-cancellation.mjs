@@ -11,7 +11,9 @@ function dbUrl() {
   const env = readFileSync(new URL('../.env', import.meta.url), 'utf8')
   return env.match(/^DATABASE_URL=(.*)$/m)[1].trim().replace(/^["']|["']$/g, '')
 }
-const pool = new pg.Pool({ connectionString: dbUrl(), ssl: { rejectUnauthorized: false } })
+const _cs = dbUrl()
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 
 const DDL = `
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS cancellation_policy text NOT NULL DEFAULT 'moderate';

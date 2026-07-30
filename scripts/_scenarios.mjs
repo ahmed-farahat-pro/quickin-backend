@@ -7,7 +7,9 @@ const BASE = 'https://quickin-backend.vercel.app'
 const WEB  = 'https://quickin-frontend.vercel.app'
 const env  = readFileSync(new URL('../.env', import.meta.url), 'utf8')
 const dburl = env.match(/^DATABASE_URL=(.*)$/m)[1].trim().replace(/^["']|["']$/g,'')
-const pool = new pg.Pool({ connectionString: dburl, ssl:{rejectUnauthorized:false} })
+const _cs = dburl
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 
 const J = (p,b,t,m='POST') => fetch(BASE+p,{method:m,headers:{'Content-Type':'application/json',...(t?{Authorization:`Bearer ${t}`}:{})},body:b?JSON.stringify(b):undefined}).then(async r=>({s:r.status,b:await r.json().catch(()=>({}))}))
 const G = (p,t) => fetch(BASE+p,{headers:t?{Authorization:`Bearer ${t}`}:{}}).then(async r=>({s:r.status,b:await r.json().catch(()=>({}))}))

@@ -12,7 +12,9 @@ function dbUrl() {
   return env.match(/^DATABASE_URL=(.*)$/m)[1].trim().replace(/^["']|["']$/g, '')
 }
 
-const pool = new pg.Pool({ connectionString: dbUrl(), ssl: { rejectUnauthorized: false } })
+const _cs = dbUrl()
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 
 ;(async () => {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_role text`)

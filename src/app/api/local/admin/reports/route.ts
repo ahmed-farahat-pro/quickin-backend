@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserFromRequest } from '@/lib/local/auth'
+import { requireStaff } from '@/lib/local/staff'
 import { listReports, resolveReport } from '@/lib/local/trust'
 
 // Admin reports triage.
@@ -25,9 +25,8 @@ export async function OPTIONS() {
 
 export async function GET(req: Request) {
   try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    const gate = await requireStaff(req, 'reports')
+    if ('error' in gate) return gate.error
     const status = new URL(req.url).searchParams.get('status') ?? undefined
     return NextResponse.json(await listReports(status), { headers: CORS })
   } catch (err) {
@@ -37,9 +36,8 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    const gate = await requireStaff(req, 'reports')
+    if ('error' in gate) return gate.error
     const b = await req.json().catch(() => ({}))
     const reportId = String(b.report_id ?? b.reportId ?? '')
     const action = String(b.action ?? '')

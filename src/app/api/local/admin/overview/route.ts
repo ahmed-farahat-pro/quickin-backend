@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getAdminOverview } from '@/lib/local/admin'
-import { getUserFromRequest } from '@/lib/local/auth'
+import { requireStaff } from '@/lib/local/staff'
 
 // GET /api/local/admin/overview → everything (users, listings, bookings, services,
 // service-requests + counts). Admin only.
@@ -24,9 +24,8 @@ export async function OPTIONS() {
 
 export async function GET(req: Request) {
   try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    const gate = await requireStaff(req, 'overview')
+    if ('error' in gate) return gate.error
     const data = await getAdminOverview()
     return NextResponse.json(data, { headers: CORS })
   } catch (err) {
