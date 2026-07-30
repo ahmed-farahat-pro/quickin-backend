@@ -35,6 +35,12 @@ ALTER TABLE users    ADD COLUMN IF NOT EXISTS is_host       boolean NOT NULL DEF
 ALTER TABLE users    ADD COLUMN IF NOT EXISTS fcm_token     text;
 ALTER TABLE users    ADD COLUMN IF NOT EXISTS push_platform text;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS weekend_days  integer[];
+-- Host-editor / host-application columns the web reads (users.host_type drives the
+-- "individual vs company" application flow; listings.rating* are denormalised rollups).
+ALTER TABLE users    ADD COLUMN IF NOT EXISTS host_type     text;
+ALTER TABLE users    ADD COLUMN IF NOT EXISTS company       text;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS rating        numeric;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS rating_count  int;
 
 -- "Become a host" applications. The /ops Applications tab lists status='pending'
 -- and reviewHostApplication() writes reviewed_at / reviewed_by / review_note.
@@ -137,9 +143,9 @@ const pool = new pg.Pool({ connectionString: url, ssl: isLocal ? false : { rejec
 
   const cols = await pool.query(
     `SELECT count(*)::int AS n FROM information_schema.columns
-      WHERE (table_name='users' AND column_name IN ('is_host','fcm_token','push_platform'))
-         OR (table_name='listings' AND column_name='weekend_days')`
+      WHERE (table_name='users' AND column_name IN ('is_host','fcm_token','push_platform','host_type','company'))
+         OR (table_name='listings' AND column_name IN ('weekend_days','rating','rating_count'))`
   )
-  console.log(`✅ web tables ready — 6 tables, ${cols.rows[0].n}/4 added columns`)
+  console.log(`✅ web tables ready — 6 tables, ${cols.rows[0].n}/8 added columns`)
   await pool.end()
 })().catch(async (e) => { console.error('MIGRATION FAILED:', e); try { await pool.end() } catch {}; process.exit(1) })
