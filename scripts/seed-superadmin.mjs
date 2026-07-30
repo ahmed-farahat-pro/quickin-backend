@@ -8,7 +8,7 @@
 //     node quickin-backend/scripts/seed-superadmin.mjs
 //
 // Run migrate-staff-rbac.mjs first. On prod (Vercel has no shell) use the key-gated
-// /api/local/xmig7 route in quickin-frontend instead.
+// /api/local/xmig8 route in quickin-frontend instead.
 import pg from 'pg'
 import { readFileSync } from 'node:fs'
 import { randomBytes, scryptSync } from 'node:crypto'
