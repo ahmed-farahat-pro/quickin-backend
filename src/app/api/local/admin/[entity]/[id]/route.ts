@@ -1,10 +1,24 @@
 import { NextResponse } from 'next/server'
 import { deleteEntity, updateUserRole, adminSetBookingStatus, adminSetListingPublished } from '@/lib/local/admin'
-import { getUserFromRequest } from '@/lib/local/auth'
+import { requireStaff, type StaffModule } from '@/lib/local/staff'
 
 // DELETE /api/local/admin/:entity/:id — admin removes any row.
 //   entity ∈ users | listings | bookings | services | service-requests
 export const dynamic = 'force-dynamic'
+
+// Which staff module owns each entity. Unlike every other admin route, the
+// permission here depends on the path parameter, so the gate can only run after
+// `await ctx.params` — and an unrecognised entity must be rejected BEFORE the gate,
+// or a typo would be checked against the wrong permission.
+// services / service-requests have no /ops module of their own yet; they're gated by
+// their nearest owner (a service is a host listing, a request is a booking).
+const ENTITY_MODULE: Record<string, StaffModule> = {
+  users: 'users',
+  listings: 'listings',
+  bookings: 'bookings',
+  services: 'listings',
+  'service-requests': 'bookings',
+}
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
@@ -26,9 +40,12 @@ export async function OPTIONS() {
 export async function PATCH(req: Request, ctx: { params: Promise<{ entity: string; id: string }> }) {
   try {
     const { entity, id } = await ctx.params
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    const permission = ENTITY_MODULE[entity]
+    if (!permission) {
+      return NextResponse.json({ error: 'Unknown entity' }, { status: 400, headers: CORS })
+    }
+    const gate = await requireStaff(req, permission)
+    if ('error' in gate) return gate.error
     const body = await req.json().catch(() => ({}))
     // Reservation lifecycle: PATCH /api/local/admin/bookings/:id { status }
     if (entity === 'bookings') {
@@ -48,6 +65,16 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ entity: strin
     if (!['user', 'host', 'admin'].includes(role)) {
       return NextResponse.json({ error: 'role must be user, host, or admin' }, { status: 400, headers: CORS })
     }
+    // Escalation guard: while the legacy compat fallback is enabled, a `users` row
+    // with role='admin' still satisfies an admin gate — so handing out that role is
+    // equivalent to handing out super admin. A moderator holding only the 'users'
+    // module must not be able to promote themselves (or an accomplice) that way.
+    if (role === 'admin' && gate.staff.role !== 'super_admin') {
+      return NextResponse.json(
+        { error: 'Only a super admin can grant the admin role' },
+        { status: 403, headers: CORS }
+      )
+    }
     const result = await updateUserRole(id, role)
     return NextResponse.json(result, { headers: CORS })
   } catch (err) {
@@ -59,9 +86,12 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ entity: strin
 export async function DELETE(req: Request, ctx: { params: Promise<{ entity: string; id: string }> }) {
   try {
     const { entity, id } = await ctx.params
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    const permission = ENTITY_MODULE[entity]
+    if (!permission) {
+      return NextResponse.json({ error: 'Unknown entity' }, { status: 400, headers: CORS })
+    }
+    const gate = await requireStaff(req, permission)
+    if ('error' in gate) return gate.error
     const result = await deleteEntity(entity, id)
     return NextResponse.json(result, { headers: CORS })
   } catch (err) {

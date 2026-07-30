@@ -22,7 +22,9 @@ ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_ref text;
 UPDATE bookings SET payment_status = 'unpaid' WHERE payment_status IS NULL;
 `
 
-const pool = new pg.Pool({ connectionString: databaseUrl(), ssl: { rejectUnauthorized: false } })
+const _cs = databaseUrl()
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 ;(async () => {
   await pool.query(DDL)
   const c = await pool.query(`SELECT count(*)::int AS n FROM bookings`)

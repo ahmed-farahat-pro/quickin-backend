@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS listing_blocked_dates (
 CREATE INDEX IF NOT EXISTS idx_blocked_dates_listing ON listing_blocked_dates(listing_id);
 `
 
-const pool = new pg.Pool({ connectionString: databaseUrl(), ssl: { rejectUnauthorized: false } })
+const _cs = databaseUrl()
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 ;(async () => {
   await pool.query(DDL)
   const c = await pool.query('SELECT count(*)::int AS n FROM listing_blocked_dates')

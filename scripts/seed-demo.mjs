@@ -20,7 +20,9 @@ function databaseUrl() {
 
 const BASE = process.env.BASE_URL || 'https://quickin-backend.vercel.app'
 const PASSWORD = 'Demo12345'
-const pool = new pg.Pool({ connectionString: databaseUrl(), ssl: { rejectUnauthorized: false } })
+const _cs = databaseUrl()
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 
 const post = (p, b, t) =>
   fetch(BASE + p, {

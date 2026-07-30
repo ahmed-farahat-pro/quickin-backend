@@ -8,7 +8,9 @@ function databaseUrl() {
   if (!m) throw new Error('DATABASE_URL not set')
   return m[1].trim().replace(/^["']|["']$/g, '')
 }
-const pool = new pg.Pool({ connectionString: databaseUrl(), ssl: { rejectUnauthorized: false } })
+const _cs = databaseUrl()
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 ;(async () => {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio text`)
   console.log('✅ users.bio added')

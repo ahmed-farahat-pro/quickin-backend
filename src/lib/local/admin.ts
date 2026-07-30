@@ -16,10 +16,13 @@ export const BOOKING_STATUSES = ['pending', 'confirmed', 'completed', 'rejected'
 export type BookingStatus = (typeof BOOKING_STATUSES)[number]
 
 export async function getAllUsers() {
-  // password_plain is PROTOTYPE-ONLY (so the admin can display passwords); it's null
-  // for accounts created before this existed and for social (Google/Apple) sign-ins.
+  // NB: users.password_plain (a prototype-only cleartext copy of the password) is
+  // deliberately NOT selected. This projection is served to the admin panel, and any
+  // moderator granted the 'users' module would otherwise be handed every user's
+  // password in cleartext. The column itself should be dropped; until then, nothing
+  // reads it.
   const { rows } = await pool.query(
-    `SELECT id, email, full_name, role, provider, email_verified, password_plain, country,
+    `SELECT id, email, full_name, role, provider, email_verified, country,
             COALESCE(verification_status, 'unverified') AS verification_status, created_at
        FROM users ORDER BY created_at DESC NULLS LAST`
   )

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserFromRequest } from '@/lib/local/auth'
+import { requireStaff, staffActor } from '@/lib/local/staff'
 import { listPromos, createPromo, setPromoActive, deletePromo } from '@/lib/local/promote'
 
 // Admin promo-code management.
@@ -25,16 +25,9 @@ export async function OPTIONS() {
   })
 }
 
-async function requireAdmin(req: Request) {
-  const user = await getUserFromRequest(req)
-  if (!user) return { error: NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS }) }
-  if (user.role !== 'admin') return { error: NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS }) }
-  return { user }
-}
-
 export async function GET(req: Request) {
-  const gate = await requireAdmin(req)
-  if (gate.error) return gate.error
+  const gate = await requireStaff(req, 'promos')
+  if ('error' in gate) return gate.error
   try {
     return NextResponse.json(await listPromos(), { headers: CORS })
   } catch (err) {
@@ -43,8 +36,8 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const gate = await requireAdmin(req)
-  if (gate.error) return gate.error
+  const gate = await requireStaff(req, 'promos')
+  if ('error' in gate) return gate.error
   try {
     const b = await req.json().catch(() => ({}))
     if (b.action === 'toggle' && b.id) {
@@ -67,8 +60,8 @@ export async function POST(req: Request) {
 }
 
 export async function DELETE(req: Request) {
-  const gate = await requireAdmin(req)
-  if (gate.error) return gate.error
+  const gate = await requireStaff(req, 'promos')
+  if ('error' in gate) return gate.error
   try {
     const id = new URL(req.url).searchParams.get('id') ?? ''
     const ok = await deletePromo(id)

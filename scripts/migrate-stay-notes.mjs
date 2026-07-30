@@ -18,7 +18,9 @@ const DDL = `
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS host_notes text;
 `
 
-const pool = new pg.Pool({ connectionString: databaseUrl(), ssl: { rejectUnauthorized: false } })
+const _cs = databaseUrl()
+const _isLocal = _cs.includes('127.0.0.1') || _cs.includes('localhost')
+const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { rejectUnauthorized: false } })
 ;(async () => {
   await pool.query(DDL)
   console.log('✅ bookings.host_notes added')
