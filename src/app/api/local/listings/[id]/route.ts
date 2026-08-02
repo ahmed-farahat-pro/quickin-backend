@@ -39,9 +39,6 @@ const FIELD_KEYS: Record<keyof ListingPatch, string[]> = {
   location: ['location'],
   country: ['country'],
   region: ['region'],
-  // The host picks a catalog resort, or types one via "Other".
-  resort_id: ['resort_id', 'resortId'],
-  resort_name: ['resort_name', 'resortName'],
   lat: ['lat', 'latitude'],
   lng: ['lng', 'longitude'],
   property_type: ['property_type', 'propertyType'],

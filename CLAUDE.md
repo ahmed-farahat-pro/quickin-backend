@@ -19,25 +19,6 @@ The **web** UI lives in a separate repo (`quickin-master` → deployed as `quick
 - `src/app/api/local/*` — app data (listings, bookings, host/*, admin/*, services, notifications, …).
 - `src/lib/local/db.ts` — SQL (node-postgres). `src/lib/local/auth.ts` — users/OTP/token. `src/lib/local/mailer.ts` — nodemailer + templates (`sendOtpEmail`, `sendNotificationEmail`, `smtpConfigured`, `smtpDiagnostics`).
 
-## Standing requirement — docs and tests
-
-**Anything added to this repo must be (a) documented in `README.md` and (b) covered by
-a unit test.** New route → a row in `## Endpoints`. New env var → a row in
-`## Environment`. New schema → a row in `## Database migrations`.
-
-Tests are `node --test` with **zero dependencies**, in `test/unit/*.test.mjs`. Note
-that `test/*.mjs` (no `unit/`) are live-HTTP smoke scripts that hit **production** —
-never wire them into `npm test`.
-
-The constraint that shapes where code goes: Node's ESM resolver rejects the
-extension-less relative imports used throughout `src/lib/local` (`from './pool'`), so
-those modules cannot be imported by a test. **Put pure logic in a `*-core.ts` module
-with no runtime imports; `db.ts` imports the core, never the reverse.** See
-`src/lib/local/resort-core.ts` and README → Testing.
-
-Run `npm run check` (parity guards + unit tests) before deploying either project.
-There is no CI, so it is a manual gate.
-
 ## Auth model — note the divergence from web
 
 This backend still uses the **older dual `(email, role)` account model**: `getUserRowByEmailRole(email, role)`, and the OTP is stored **on the user row** via `setUserOtp` (not a separate `otp_codes` table like the web). It **does** have `users.email_verified` and gates login the same way as the web: an unverified login returns **HTTP 403 `{needsVerification:true, email}`** and re-sends the code, which the mobile apps route to their OTP screen. When changing auth, keep that 403/`needsVerification` contract intact (mobile depends on it).

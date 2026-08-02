@@ -26,11 +26,6 @@ CREATE TABLE IF NOT EXISTS app_settings (
 );
 INSERT INTO app_settings (key, value) VALUES ('instapay_handle', '')       ON CONFLICT (key) DO NOTHING;
 INSERT INTO app_settings (key, value) VALUES ('instapay_instructions', '') ON CONFLICT (key) DO NOTHING;
--- The deep link and the uploaded QR image are optional companions to the handle.
--- Seeding them is a convenience only: getPaymentConfig() reads a missing row as
--- '' and setSetting() upserts, so an already-migrated database needs nothing.
-INSERT INTO app_settings (key, value) VALUES ('instapay_link', '')         ON CONFLICT (key) DO NOTHING;
-INSERT INTO app_settings (key, value) VALUES ('instapay_qr_image', '')     ON CONFLICT (key) DO NOTHING;
 
 -- One row per uploaded transfer screenshot. image_data is a base64 data URL
 -- (same inline-image convention as id_verifications / listing_images).

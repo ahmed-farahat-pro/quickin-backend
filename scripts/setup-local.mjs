@@ -75,9 +75,6 @@ const MIGRATIONS = [
   // via the deleted xmig4/5/6 routes), so a fresh DB is unusable without it.
   'migrate-web-tables.mjs',
   'migrate-staff-rbac.mjs',
-  // Resorts must precede analytics only for readability; they are independent.
-  'migrate-resorts.mjs',
-  'migrate-analytics.mjs',
 ]
 
 const pool = new pg.Pool({ connectionString: url, ssl: isLocal ? false : { rejectUnauthorized: false } })

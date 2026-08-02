@@ -1,22 +1,11 @@
 import { NextResponse } from 'next/server'
 import { getPaymentConfig, setSetting } from '@/lib/local/db'
 import { requireStaff, staffActor } from '@/lib/local/staff'
-import {
-  INSTAPAY_KEYS,
-  isPaymentConfigError,
-  normalizeHandle,
-  normalizeInstapayLink,
-  normalizeInstructions,
-  normalizeQrImage,
-} from '@/lib/local/payment-config-core'
 
 // Admin-controlled Instapay destination.
-//   GET /api/local/admin/settings/instapay
-//     → { instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload }
-//   PUT /api/local/admin/settings/instapay
-//     {instapay_handle?, instructions?, instapay_link?, instapay_qr_image?}
-// Every field is optional — an omitted key is left untouched, an empty string
-// clears it. Requires a staff session holding the 'payments' module.
+//   GET /api/local/admin/settings/instapay  → { instapay_handle, instructions }
+//   PUT /api/local/admin/settings/instapay {instapay_handle, instructions?}
+// Admins only (role='admin').
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -46,30 +35,14 @@ export async function PUT(req: Request) {
   if ('error' in gate) return gate.error
   try {
     const body = await req.json().catch(() => ({}))
-    const actor = staffActor(gate.staff)
-
-    // Validate everything before writing anything, so a bad QR can't leave a
-    // half-saved config behind.
-    const updates: Array<[string, string]> = []
     if (typeof body.instapay_handle === 'string') {
-      updates.push([INSTAPAY_KEYS.handle, normalizeHandle(body.instapay_handle)])
+      await setSetting('instapay_handle', body.instapay_handle.trim().slice(0, 200), staffActor(gate.staff))
     }
     if (typeof body.instructions === 'string') {
-      updates.push([INSTAPAY_KEYS.instructions, normalizeInstructions(body.instructions)])
+      await setSetting('instapay_instructions', body.instructions.trim().slice(0, 2000), staffActor(gate.staff))
     }
-    if (typeof body.instapay_link === 'string') {
-      updates.push([INSTAPAY_KEYS.link, normalizeInstapayLink(body.instapay_link)])
-    }
-    if (typeof body.instapay_qr_image === 'string') {
-      updates.push([INSTAPAY_KEYS.qr, normalizeQrImage(body.instapay_qr_image)])
-    }
-
-    for (const [key, value] of updates) await setSetting(key, value, actor)
     return NextResponse.json(await getPaymentConfig(), { headers: CORS })
   } catch (err) {
-    if (isPaymentConfigError(err)) {
-      return NextResponse.json({ error: err.message }, { status: 400, headers: CORS })
-    }
     return NextResponse.json({ error: 'Failed to save', detail: String(err) }, { status: 500, headers: CORS })
   }
 }

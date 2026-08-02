@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { deleteEntity, updateUserRole, adminSetBookingStatus, adminSetListingPublished } from '@/lib/local/admin'
-import { requireStaff, staffActor, type StaffModule } from '@/lib/local/staff'
+import { requireStaff, type StaffModule } from '@/lib/local/staff'
 
 // DELETE /api/local/admin/:entity/:id — admin removes any row.
 //   entity ∈ users | listings | bookings | services | service-requests
@@ -49,8 +49,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ entity: strin
     const body = await req.json().catch(() => ({}))
     // Reservation lifecycle: PATCH /api/local/admin/bookings/:id { status }
     if (entity === 'bookings') {
-      // Pass the acting staff member through so a cancellation is attributable (B3).
-      const result = await adminSetBookingStatus(id, String(body.status ?? ''), staffActor(gate.staff))
+      const result = await adminSetBookingStatus(id, String(body.status ?? ''))
       return NextResponse.json(result, { headers: CORS })
     }
     // Listing active/inactive: PATCH /api/local/admin/listings/:id { is_published }

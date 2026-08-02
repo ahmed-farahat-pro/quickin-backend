@@ -152,12 +152,7 @@ export async function deleteEntity(entity: string, id: string): Promise<{ delete
  *  never mint one: no code, no QR. */
 export async function adminSetBookingStatus(
   bookingId: string,
-  status: string,
-  /** Who is doing this — staffActor(gate.staff), e.g. 'staff:<uuid>'. Recorded on
-   *  the booking when the transition is a cancellation, so the cancellation report
-   *  can attribute it. Optional so existing callers keep compiling; they just
-   *  produce an 'admin' cancellation with no actor id. */
-  actor?: string | null
+  status: string
 ): Promise<{ updated: boolean; status: string }> {
   if (!isUuid(bookingId)) throw new Error('Invalid id')
   if (!(BOOKING_STATUSES as readonly string[]).includes(status)) throw new Error('Invalid status')
@@ -165,17 +160,11 @@ export async function adminSetBookingStatus(
     `UPDATE bookings b SET status = $2,
             reservation_code = CASE WHEN $2 IN ('confirmed', 'completed')
                                     THEN COALESCE(b.reservation_code, $3)
-                                    ELSE b.reservation_code END,
-            -- B3: this path previously left cancelled_at NULL, so an admin
-            -- cancellation had no date at all. Set it here (idempotently — a
-            -- re-cancel keeps the original timestamp) along with the actor.
-            cancelled_at      = CASE WHEN $2 = 'cancelled' THEN COALESCE(b.cancelled_at, now()) ELSE b.cancelled_at END,
-            cancelled_by      = CASE WHEN $2 = 'cancelled' THEN $4 ELSE b.cancelled_by END,
-            cancelled_by_role = CASE WHEN $2 = 'cancelled' THEN 'admin' ELSE b.cancelled_by_role END
+                                    ELSE b.reservation_code END
        FROM listings l
       WHERE b.id = $1 AND l.id = b.listing_id
       RETURNING b.user_id, l.title`,
-    [bookingId, status, genReservationCode(), actor ?? null]
+    [bookingId, status, genReservationCode()]
   )
   const row = rows[0]
   if (row) {
