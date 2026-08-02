@@ -1,10 +1,15 @@
 import { pool } from './pool'
+import { resolveResortSelection } from './resorts'
 import type { PoolClient } from 'pg'
 import { randomInt } from 'node:crypto'
 import { createNotification } from './notifications'
 import { sendNotificationEmail } from './mailer'
 import { sendPush } from './push'
 import { containsPhoneNumber, combinesIntoPhoneNumber, PHONE_BLOCK_MESSAGE } from './contentguard'
+import { INSTAPAY_KEYS, rowsToPaymentConfig } from './payment-config-core'
+import type { PaymentConfig } from './payment-config-core'
+
+export type { PaymentConfig }
 
 const WEB_URL = process.env.WEB_URL || 'https://quickin-frontend.vercel.app'
 
@@ -48,6 +53,12 @@ export interface Listing {
   max_guests: number | null
   property_type: string | null
   region: string | null
+  /** The catalog resort this listing belongs to, or null when the host typed
+   *  their own (see `resort`). Region is derived from it. */
+  resort_id?: string | null
+  /** Display name: the catalog resort's name, or the host's free text.
+   *  Free text still shows to guests as typed while it awaits moderation. */
+  resort?: string | null
   cancellation_policy: string
   approval_status: string
   weekly_discount: number
@@ -134,6 +145,7 @@ export const LISTING_COLS = `
   COALESCE(l.monthly_prices, '{}'::jsonb) AS monthly_prices,
   l.currency,
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
+  l.resort_id, COALESCE((SELECT name FROM resorts WHERE id = l.resort_id), l.resort_name) AS resort,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
   COALESCE(l.approval_status, 'approved') AS approval_status,
   COALESCE(l.weekly_discount, 0) AS weekly_discount,
@@ -351,6 +363,8 @@ const BOOKING_COLS = `
   b.host_notes,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
   to_char(b.cancelled_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS cancelled_at,
+  b.cancelled_by, b.cancelled_by_role, b.cancellation_policy AS booked_cancellation_policy,
+  b.commission_rate,
   b.refund_percent,
   b.promo_code,
   b.promo_discount::float8 AS promo_discount,
@@ -408,7 +422,12 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
   // at the confirmation transition (see issueCodeSql).
   const { rows } = await pool.query(
     `WITH ins AS (
-       INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests, total_price, status)
+       -- cancellation_policy and commission_rate are SNAPSHOTTED here on purpose:
+       -- both are editable after the fact (the listing's policy by its host, the
+       -- rate by an admin), and a report must reflect what was in force when the
+       -- booking was taken. See migrate-analytics.mjs.
+       INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests, total_price, status,
+                             cancellation_policy, commission_rate)
        SELECT $1, $2, $3, $4, $5,
          round(
            -- Seasonal per-night sum: weekend price (Fri/Sat) → monthly override → base.
@@ -426,7 +445,9 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
                WHEN ($4::date - $3::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
                ELSE 0 END)::numeric / 100)
          ),
-         'pending'
+         'pending',
+         COALESCE(l.cancellation_policy, 'moderate'),
+         COALESCE((SELECT value::numeric FROM app_settings WHERE key = 'platform_commission_rate'), 0.1)
        FROM listings l WHERE l.id = $1
        RETURNING *
      )
@@ -547,7 +568,12 @@ export async function setBookingPaymentOutcome(
   if (!isUuid(bookingId)) return false
   if (outcome === 'refunded' || outcome === 'voided') {
     const { rowCount } = await pool.query(
-      `UPDATE bookings SET payment_status = $2, paid_at = NULL WHERE id = $1`,
+      // paid_at is cleared here, which is exactly why refunded_at exists: without it
+      // a refunded booking has NO date at all and drops out of every money report.
+      // analytics-core's MONEY_AT_SQL falls back through it. Never reintroduce a
+      // `paid_at IS NOT NULL` revenue predicate — use PAID_SQL / REFUNDED_SQL.
+      `UPDATE bookings SET payment_status = $2, paid_at = NULL, refunded_at = COALESCE(refunded_at, now())
+        WHERE id = $1`,
       [bookingId, outcome]
     )
     return (rowCount ?? 0) > 0
@@ -677,7 +703,11 @@ export async function cancelBooking(
          status = 'cancelled',
          cancelled_at = now(),
          refund_percent = $3,
-         refund_amount = $4
+         refund_amount = $4,
+         -- B3: record the actor in the SAME statement as the status change, so it
+         -- can never be skipped. $2 is the guest's own id (also the WHERE guard).
+         cancelled_by = $2::text,
+         cancelled_by_role = 'guest'
        WHERE b.id = $1 AND b.user_id = $2 AND b.status IN ('pending', 'confirmed')
        RETURNING *
      )
@@ -889,7 +919,7 @@ const MAX_IMAGE_CHARS = 3_500_000
  *  `images` is the photo set (listing_images rows), not a listings column. */
 export const EDITABLE_LISTING_FIELDS = [
   // Moderation-relevant — what an admin actually looks at.
-  'title', 'description', 'location', 'country', 'region', 'lat', 'lng',
+  'title', 'description', 'location', 'country', 'region', 'resort', 'lat', 'lng',
   'property_type', 'max_guests', 'bedrooms', 'beds', 'bathrooms', 'amenities',
   'ownership_doc', 'images',
   // Commercial — what the host tunes day to day.
@@ -1021,6 +1051,8 @@ export interface ListingPatch {
   location?: unknown
   country?: unknown
   region?: unknown
+  resort_id?: unknown
+  resort_name?: unknown
   lat?: unknown
   lng?: unknown
   property_type?: unknown
@@ -1069,7 +1101,23 @@ export async function updateListingDetails(
   if (patch.description !== undefined) put('description', assertText(patch.description, 'Description').slice(0, 5000))
   if (patch.location !== undefined) put('location', assertText(patch.location, 'Location').slice(0, 200))
   if (patch.country !== undefined) put('country', String(patch.country ?? '').trim().slice(0, 100) || null)
-  if (patch.region !== undefined) put('region', assertRegion(patch.region))
+  // Resort is THREE columns (resort_id, resort_name, region) driven by one logical
+  // edit, so it cannot go through put(), which maps one field to one column. When a
+  // resort is chosen its region wins, so the standalone region edit is skipped.
+  const resortEdited = patch.resort_id !== undefined || patch.resort_name !== undefined
+  if (patch.region !== undefined && !resortEdited) put('region', assertRegion(patch.region))
+  if (resortEdited) {
+    const sel = await resolveResortSelection({
+      resortId: patch.resort_id === undefined ? null : String(patch.resort_id ?? '') || null,
+      resortName: patch.resort_name === undefined ? null : (patch.resort_name as string | null),
+      region: patch.region === undefined ? null : assertRegion(patch.region),
+      userId: hostUserId,
+    })
+    vals.push(sel.resort_id); sets.push(`resort_id = $${vals.length}::uuid`)
+    vals.push(sel.resort_name); sets.push(`resort_name = $${vals.length}`)
+    vals.push(sel.region); sets.push(`region = $${vals.length}`)
+    touched.push('resort')
+  }
   if (patch.lat !== undefined) put('lat', assertCoord(patch.lat, 'Latitude', 90))
   if (patch.lng !== undefined) put('lng', assertCoord(patch.lng, 'Longitude', 180))
   if (patch.property_type !== undefined) put('property_type', assertPropertyType(patch.property_type))
@@ -1620,6 +1668,10 @@ export interface CreateListingInput {
   maxGuests?: number
   propertyType?: string
   region?: string
+  /** Resort picked from the catalog. Wins over resortName. */
+  resortId?: string | null
+  /** Free text the host typed via "Other". Queued for admin review. */
+  resortName?: string | null
   lat?: number
   lng?: number
   images?: string[]
@@ -1669,21 +1721,31 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   const ownershipDoc = typeof input.ownershipDoc === 'string' && /^(data:image\/|https?:\/\/)/i.test(input.ownershipDoc) && input.ownershipDoc.length < 3_500_000
     ? input.ownershipDoc
     : null
+  // The resort decides the region — that is the point of a resort belonging to one.
+  // An unknown typed name is kept as free text AND queued for /ops.
+  const resort = await resolveResortSelection({
+    resortId: input.resortId,
+    resortName: input.resortName,
+    region: input.region ?? null,
+    userId: hostUserId,
+  })
   const { rows } = await pool.query(
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
         bedrooms, beds, bathrooms, max_guests, property_type, region, lat, lng, listing_code, is_published, amenities,
-        cancellation_policy, approval_status, ownership_doc, weekly_discount, monthly_discount, weekend_price, monthly_prices)
-     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18,$19,$20,$21,$22::jsonb)
+        cancellation_policy, approval_status, ownership_doc, weekly_discount, monthly_discount, weekend_price, monthly_prices,
+        resort_id, resort_name)
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18,$19,$20,$21,$22::jsonb,$23,$24)
      RETURNING id`,
     [
       hostUserId, input.title.trim(), input.description ?? null, input.location ?? null, input.country ?? null,
       price, Math.max(0, Math.floor(input.bedrooms ?? 1)), Math.max(0, Math.floor(input.beds ?? 1)),
       Math.max(0, Math.floor(input.bathrooms ?? 1)), Math.max(1, Math.floor(input.maxGuests ?? 2)),
-      input.propertyType ?? 'Apartment', input.region ?? null, input.lat ?? null, input.lng ?? null, genReservationCode(),
+      input.propertyType ?? 'Apartment', resort.region, input.lat ?? null, input.lng ?? null, genReservationCode(),
       input.amenities ?? [], normalizePolicy(input.cancellationPolicy), ownershipDoc,
       clampDiscount(input.weeklyDiscount), clampDiscount(input.monthlyDiscount),
       cleanPrice(input.weekendPrice), cleanMonthlyPrices(input.monthlyPrices),
+      resort.resort_id, resort.resort_name,
     ]
   )
   const id = rows[0].id as string
@@ -1729,7 +1791,15 @@ export async function setBookingStatus(
   // guest's QR / wallet pass / stay link) is born here. Declining leaves it NULL.
   await pool.query(
     `UPDATE bookings b SET status = $3,
-            ${issueCodeSql(`$3 = 'confirmed'`, '$4')}
+            ${issueCodeSql(`$3 = 'confirmed'`, '$4')},
+            -- B3: the cancelled_* columns record who ENDED a booking, for any
+            -- terminal transition. A host cannot "cancel" in this system — declining
+            -- a pending request is their only termination — so it is attributed here
+            -- as role 'host'. Without this the cancellation report could never show
+            -- a host at all.
+            cancelled_at      = CASE WHEN $3 = 'rejected' THEN COALESCE(b.cancelled_at, now()) ELSE b.cancelled_at END,
+            cancelled_by      = CASE WHEN $3 = 'rejected' THEN $2::text ELSE b.cancelled_by END,
+            cancelled_by_role = CASE WHEN $3 = 'rejected' THEN 'host' ELSE b.cancelled_by_role END
        FROM listings l
       WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2 AND b.status = 'pending'`,
     [bookingId, hostUserId, status, genReservationCode()]
@@ -1839,19 +1909,17 @@ export async function setSetting(key: string, value: string, updatedBy: string |
   )
 }
 
-export interface PaymentConfig {
-  instapay_handle: string
-  instructions: string
-}
-
-/** The public-facing Instapay destination shown to guests at checkout. */
+/**
+ * The public-facing Instapay destination shown to guests at checkout: the
+ * handle/number, the optional deep link, and the optional admin-uploaded QR.
+ * Rows that were never saved read as '' — no migration is needed to add a key.
+ */
 export async function getPaymentConfig(): Promise<PaymentConfig> {
   const { rows } = await pool.query(
-    `SELECT key, value FROM app_settings WHERE key IN ('instapay_handle', 'instapay_instructions')`
+    `SELECT key, value FROM app_settings WHERE key = ANY($1::text[])`,
+    [Object.values(INSTAPAY_KEYS)]
   )
-  const map: Record<string, string> = {}
-  for (const r of rows) map[r.key as string] = (r.value as string | null) ?? ''
-  return { instapay_handle: map.instapay_handle ?? '', instructions: map.instapay_instructions ?? '' }
+  return rowsToPaymentConfig(rows as Array<{ key: string; value: string | null }>)
 }
 
 /**

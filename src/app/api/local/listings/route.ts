@@ -83,6 +83,8 @@ export async function POST(req: Request) {
       maxGuests: b.max_guests ?? b.maxGuests,
       propertyType: b.property_type ?? b.propertyType,
       region: b.region,
+      resortId: b.resort_id ?? b.resortId,
+      resortName: b.resort_name ?? b.resortName,
       lat: b.lat,
       lng: b.lng,
       images: Array.isArray(b.images) ? b.images : undefined,
