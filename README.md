@@ -28,6 +28,8 @@ npm run dev        # API at http://localhost:4000
 | POST | `/api/auth/google` | Google sign-in — verifies a Google ID token against Google's JWKS |
 | POST | `/api/auth/apple` | Sign in with Apple — verifies an identity token against Apple's JWKS |
 | GET  | `/api/auth/me` | Resolve the current user (Bearer token or `qk_token` cookie) |
+| —    | *(all auth routes above)* | A **blocked or removed** account is refused with **403 `{ error, accountStatus }`** — deliberately **without** `needsVerification`, so the apps show the message instead of routing to the OTP screen. See Account status below |
+| DELETE | `/api/local/admin/users/:id` | **410 Gone** — hard delete is retired. Block or remove the account in `/ops` → Users |
 | GET  | `/api/auth/logout` | Clear the auth cookie |
 | GET  | `/api/local/payment-config` | The Instapay destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload}` |
 | GET  | `/api/local/admin/settings/instapay` | Read the same config for editing. Staff session with the `payments` module |
@@ -142,8 +144,16 @@ imported by a test at all**. The rule that works around it:
 > imports the core — never the reverse. A test then imports the core directly, with
 > an explicit `.ts` extension.
 
-`src/lib/local/resort-core.ts`, `payment-config-core.ts` and `contentguard.ts` are the
-working examples.
+`src/lib/local/resort-core.ts`, `payment-config-core.ts`, `contentguard.ts` and
+`account-status-core.ts` are the working examples.
+
+`account-status-core.ts` is the one core that is **not** parity-guarded, on purpose.
+It is a deliberately smaller sibling of the web project's `user-admin-core.ts`: only
+`/ops` *writes* account status, this project only *reads* it, so all that lives here
+is the predicate, the rejection copy and the mobile response contract. Guarding it
+would make every future edit a mandatory two-repo commit for no correctness gain. What
+does matter — that a blocked login is a `403` carrying no `needsVerification` key — is
+locked by `test/unit/account-status-core.test.mjs`.
 
 Unit-test the pure cores: serializers, filter/clause builders, validators, money
 math, normalizers. **Do not** build a mock-Postgres layer for the thin SQL wrappers —
@@ -153,6 +163,28 @@ verification query plus the smoke scripts.
 > **There is no CI.** No `.github/`, no `vercel.json` here — Vercel only runs
 > `next build`, so a failing test cannot block a deploy. `npm run check` is a
 > **manual gate**. Wiring it into a GitHub Action is the obvious next step.
+
+## Account status — blocked and removed accounts
+
+`users.account_status` (`'active' | 'blocked' | 'removed'`) is written by `/ops` in the
+web project and only **read** here. Two things to know when touching auth:
+
+1. **Enforcement is per-request, not per-login.** Tokens are stateless 30-day HMACs
+   with no session table and no revocation, so `getUserFromRequest` re-reads the
+   status on every call and returns `null` for a non-active account — the caller's
+   normal 401 path. That single chokepoint covers every authenticated route. The
+   hardcoded `sub === 'admin'` token is checked *above* it and is never lockable.
+2. **Routes that mint a token run before there is a session** and each need their own
+   `blockedAccountResponse` call: `login`, `verify-otp`, `resend-otp`, `signup`,
+   `forgot-password`, `social`, `google`, `apple`. The social ones must check
+   **before** `upsertSocialUser`, which writes the row and marks the email verified —
+   otherwise a removed user reactivates themselves by tapping "Sign in with Google".
+
+The rejection is **403 `{ error, accountStatus }` with no `needsVerification`**. Keep
+that shape: the apps branch on `403 && needsVerification === true` to reach the OTP
+screen, so adding the key would send a suspended user somewhere they can succeed and
+still be refused. `adminBroadcast` also skips non-active accounts, so a blocked user
+receives no push or email.
 
 ## Database migrations
 
@@ -167,6 +199,7 @@ the list of record. Recent additions:
 | `migrate-resorts.mjs` | `resorts`, `resort_aliases`, `resort_submissions`, `listings.resort_id`/`resort_name` — the curated compound catalog that replaces free-text location as the geographic filter |
 | `migrate-analytics.mjs` | `bookings.cancelled_by`/`cancelled_by_role`/`cancellation_policy`/`commission_rate`/`refunded_at`, the `platform_commission_rate` setting, and the analytics indexes |
 | `migrate-instapay.mjs` | `app_settings`, `payment_proofs`, and the four seeded `instapay_*` setting rows |
+| `migrate-account-status.mjs` | `users.account_status`/`status_reason`/`status_changed_at`/`status_changed_by`, `listings.unpublished_by_admin`, and the user search indexes — the block / remove lifecycle behind `/ops` → Users |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The
 reverse gap is safe — the columns are additive and unread until the deploy lands.

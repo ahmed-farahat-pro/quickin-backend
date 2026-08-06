@@ -1,5 +1,7 @@
 import { scryptSync, randomBytes, timingSafeEqual, createHmac, randomInt } from 'node:crypto'
+import { NextResponse } from 'next/server'
 import { pool } from './pool'
+import { blockedLoginBody, BLOCKED_STATUS_CODE, isActiveStatus } from './account-status-core'
 
 // Local auth — no Supabase. Postgres via node-postgres (Vercel/Neon-ready),
 // password hashing via node:crypto (scrypt), stateless HMAC-signed tokens.
@@ -77,14 +79,22 @@ export async function getUserFromRequest(
   if (!token) return null
   const claims = verifyToken(token)
   if (!claims) return null
-  // Hardcoded admin token has no DB row.
+  // Hardcoded admin token has no DB row — and must stay above the status check, so
+  // the ops operator can never be locked out by it.
   if (claims.role === 'admin' && claims.sub === 'admin') {
     return { id: 'admin', email: claims.email, role: 'admin' }
   }
   // Resolve by id (sub) — email is no longer unique now that one email can have
   // a separate guest AND host account.
   const row = await getUserById(claims.sub)
-  return row ? { id: row.id, email: row.email, role: row.role } : null
+  if (!row) return null
+  // D3/D4: tokens are stateless 30-day HMACs with no session table and no
+  // revocation, so a blocked or removed account can only be stopped by re-reading
+  // its status on every request — which this lookup already does. Returning null
+  // (→ each caller's 401) means no route can forget to handle a status it never
+  // sees: the failure mode is "signed out", never "still allowed".
+  if (!isActiveStatus(row.account_status)) return null
+  return { id: row.id, email: row.email, role: row.role }
 }
 
 // ---- User operations (parameterized pg) -------------------------------------
@@ -99,15 +109,38 @@ export interface UserRow {
   avatar_url: string | null
   role: string
   email_verified: boolean
+  /** D3/D4 lifecycle — 'active' | 'blocked' | 'removed'. Written only by /ops in
+   *  the web project; read here to refuse blocked and removed accounts. */
+  account_status: string
 }
 
 export async function getUserRowByEmail(email: string): Promise<UserRow | null> {
   const { rows } = await pool.query(
-    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified
+    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified,
+            COALESCE(account_status, 'active') AS account_status
      FROM users WHERE lower(email) = lower($1) ORDER BY (role = 'user') DESC LIMIT 1`,
     [email]
   )
   return rows[0] ?? null
+}
+
+/**
+ * Gate for every route that MINTS a token or sends account mail — login, verify-otp,
+ * resend-otp, signup, the social providers and password reset. `getUserFromRequest`
+ * covers already-authenticated requests; these run before there is a session, so
+ * without their own check a blocked user could log in again for a fresh 30-day token
+ * and only discover the block on their next call.
+ *
+ * Returns null when the account may proceed, otherwise the response to return as-is.
+ * The 403 body deliberately carries no `needsVerification` — see blockedLoginBody
+ * for why that matters to the iOS and Android clients.
+ */
+export function blockedAccountResponse(
+  status: string | null | undefined,
+  headers: Record<string, string>,
+): NextResponse | null {
+  if (isActiveStatus(status)) return null
+  return NextResponse.json(blockedLoginBody(status), { status: BLOCKED_STATUS_CODE, headers })
 }
 
 /** Look up the account for a specific (email, role). One email can have a separate
@@ -115,7 +148,8 @@ export async function getUserRowByEmail(email: string): Promise<UserRow | null> 
 export async function getUserRowByEmailRole(email: string, role: string): Promise<UserRow | null> {
   const r = role === 'host' ? 'host' : 'user'
   const { rows } = await pool.query(
-    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified
+    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified,
+            COALESCE(account_status, 'active') AS account_status
      FROM users WHERE lower(email) = lower($1) AND role = $2`,
     [email, r]
   )
@@ -126,7 +160,8 @@ export async function getUserRowByEmailRole(email: string, role: string): Promis
 export async function getUserById(id: string): Promise<UserRow | null> {
   if (!/^[0-9a-fA-F-]{36}$/.test(id)) return null
   const { rows } = await pool.query(
-    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified
+    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified,
+            COALESCE(account_status, 'active') AS account_status
      FROM users WHERE id = $1`,
     [id]
   )
@@ -249,12 +284,16 @@ export async function resetPasswordWithOtp(
 ): Promise<User | null> {
   const useRole = role === 'user' || role === 'host'
   const { rows } = await pool.query(
-    `SELECT id, otp_code, otp_expires_at FROM users
+    `SELECT id, otp_code, otp_expires_at, COALESCE(account_status, 'active') AS account_status FROM users
       WHERE lower(email) = lower($1) ${useRole ? 'AND role = $2' : ''}
       ORDER BY (otp_code = ${useRole ? '$3' : '$2'}) DESC LIMIT 1`,
     useRole ? [email, role, code] : [email, code]
   )
   const r = rows[0]
+  // A blocked or removed account can't reset its way back in. Failing as "invalid
+  // code" rather than plumbing a distinct error is deliberate: login already refuses
+  // them with the real reason, and this path must not become a way to probe status.
+  if (r && !isActiveStatus(r.account_status)) return null
   if (!r || !r.otp_code || r.otp_code !== code) return null
   if (r.otp_expires_at && new Date(r.otp_expires_at).getTime() < Date.now()) return null
   const { rows: updated } = await pool.query(
@@ -359,7 +398,8 @@ export async function setPendingRoleOtp(args: {
 export async function verifyUserOtp(email: string, code: string, role?: string): Promise<User | null> {
   const useRole = role === 'user' || role === 'host'
   const { rows } = await pool.query(
-    `SELECT id, otp_code, otp_expires_at, email_verified FROM users
+    `SELECT id, otp_code, otp_expires_at, email_verified,
+            COALESCE(account_status, 'active') AS account_status FROM users
       WHERE lower(email) = lower($1) ${useRole ? 'AND role = $3' : ''}
       ORDER BY (otp_code = $2) DESC, email_verified ASC
       LIMIT 1`,
@@ -367,6 +407,9 @@ export async function verifyUserOtp(email: string, code: string, role?: string):
   )
   const r = rows[0]
   if (!r) return null
+  // Verifying an email must not resurrect a blocked or removed account — note the
+  // early-return below hands back the user whenever email_verified is already true.
+  if (!isActiveStatus(r.account_status)) return null
   if (r.email_verified) {
     const u = await pool.query(`SELECT ${USER_COLS} FROM users WHERE id = $1`, [r.id])
     return (u.rows[0] as User) ?? null

@@ -93,6 +93,16 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ entity: stri
     }
     const gate = await requireStaff(req, permission)
     if ('error' in gate) return gate.error
+    // Hard-deleting a user is retired (D4). It destroyed the booking and payment
+    // history a dispute needs, and it was a second, unaudited path around /ops's
+    // reversible block/remove — any holder of the `users` module could wipe an
+    // account through the mobile API. Other entities are unaffected.
+    if (entity === 'users') {
+      return NextResponse.json(
+        { error: 'Hard delete is retired. Block or remove the account in /ops → Users.' },
+        { status: 410, headers: CORS },
+      )
+    }
     const result = await deleteEntity(entity, id)
     return NextResponse.json(result, { headers: CORS })
   } catch (err) {

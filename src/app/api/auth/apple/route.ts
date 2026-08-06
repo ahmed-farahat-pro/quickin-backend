@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { verifyAppleIdToken, oauthConfigured } from '@/lib/local/oauth'
-import { upsertSocialUser, signToken } from '@/lib/local/auth'
+import { upsertSocialUser, signToken, getUserRowByEmail, blockedAccountResponse } from '@/lib/local/auth'
 import { withHostState } from '@/lib/local/db'
 
 export const dynamic = 'force-dynamic'
@@ -48,6 +48,14 @@ export async function POST(req: Request) {
       (body.fullName && String(body.fullName).trim()) ||
       String(claims.email).split('@')[0]
 
+    // BEFORE the upsert — upsertSocialUser writes the row and marks the email
+    // verified, so a removed user could otherwise reactivate themselves by tapping
+    // "Sign in with Apple".
+    const existing = await getUserRowByEmail(String(claims.email))
+    if (existing) {
+      const blocked = blockedAccountResponse(existing.account_status, CORS)
+      if (blocked) return blocked
+    }
     const user = await upsertSocialUser({
       email: String(claims.email),
       fullName,

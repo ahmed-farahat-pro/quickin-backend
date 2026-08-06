@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, getUserRowByEmailRole, setUserOtp, generateOtp, OTP_TTL_MS } from '@/lib/local/auth'
+import { getUserRowByEmail, getUserRowByEmailRole, setUserOtp, generateOtp, OTP_TTL_MS, blockedAccountResponse } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
 
 export const dynamic = 'force-dynamic'
@@ -37,6 +37,9 @@ export async function POST(req: Request) {
     if (!existing) {
       return NextResponse.json({ error: 'No pending account for this email' }, { status: 404, headers: CORS })
     }
+    // Never mail a code to a blocked or removed account.
+    const blocked = blockedAccountResponse(existing.account_status, CORS)
+    if (blocked) return blocked
     if (existing.email_verified) {
       return NextResponse.json({ error: 'This email is already verified — please log in' }, { status: 400, headers: CORS })
     }

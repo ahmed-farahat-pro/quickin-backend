@@ -78,6 +78,7 @@ const MIGRATIONS = [
   // Resorts must precede analytics only for readability; they are independent.
   'migrate-resorts.mjs',
   'migrate-analytics.mjs',
+  'migrate-account-status.mjs',
 ]
 
 const pool = new pg.Pool({ connectionString: url, ssl: isLocal ? false : { rejectUnauthorized: false } })

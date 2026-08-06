@@ -6,6 +6,7 @@ import {
   setUserOtp,
   generateOtp,
   OTP_TTL_MS,
+  blockedAccountResponse,
 } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
 
@@ -47,6 +48,12 @@ export async function POST(req: Request) {
     // ONE unified account per email (no guest/host split — matches the web). New
     // accounts register as a regular user; hosting is gained later via "become a host".
     const existing = await getUserRowByEmail(cleanEmail)
+    if (existing) {
+      // A blocked or removed account still holds this email. Reinstating one is an
+      // admin decision, not a re-registration, so say so instead of re-issuing a code.
+      const blocked = blockedAccountResponse(existing.account_status, CORS)
+      if (blocked) return blocked
+    }
     if (existing && existing.email_verified) {
       return NextResponse.json(
         { error: 'An account with this email already exists. Please sign in.' },

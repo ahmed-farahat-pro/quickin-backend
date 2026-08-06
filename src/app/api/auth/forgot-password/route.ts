@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, getUserRowByEmailRole, setResetOtp, generateOtp, OTP_TTL_MS } from '@/lib/local/auth'
+import { getUserRowByEmail, getUserRowByEmailRole, setResetOtp, generateOtp, OTP_TTL_MS, blockedAccountResponse } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
 
 // POST /api/auth/forgot-password { email } → emails a 6-digit reset code.
@@ -33,6 +33,11 @@ export async function POST(req: Request) {
         ? await getUserRowByEmailRole(clean, role)
         : await getUserRowByEmail(clean)
     if (existing) {
+      // A blocked or removed account can't reset its way back in — send no mail.
+      // The generic { sent: true } below already hides whether an email exists, so
+      // saying so plainly here costs nothing and saves a support round trip.
+      const blocked = blockedAccountResponse(existing.account_status, CORS)
+      if (blocked) return blocked
       const otp = generateOtp()
       await setResetOtp(clean, otp, new Date(Date.now() + OTP_TTL_MS), existing.role)
       await sendOtpEmail(clean, otp)

@@ -3,6 +3,7 @@ import { createNotification } from './notifications'
 import { sendPush } from './push'
 import { sendNotificationEmail } from './mailer'
 import { genReservationCode } from './db'
+import { ACTIVE_ACCOUNT_SQL } from './account-status-core'
 
 const WEB_URL = process.env.WEB_URL || 'https://quickin-frontend.vercel.app'
 
@@ -259,7 +260,11 @@ export async function adminBroadcast(args: {
 
   const filter =
     audience === 'guests' ? `role = 'user'` : audience === 'hosts' ? `role IN ('host','admin')` : `true`
-  const { rows } = await pool.query(`SELECT id, email FROM users WHERE ${filter}`)
+  // Blocked and removed accounts get no push and no email — a suspended user should
+  // hear nothing from the product until they're reinstated.
+  const { rows } = await pool.query(
+    `SELECT id, email FROM users WHERE (${filter}) AND ${ACTIVE_ACCOUNT_SQL}`
+  )
 
   let emailed = 0
   for (const u of rows as { id: string; email: string | null }[]) {

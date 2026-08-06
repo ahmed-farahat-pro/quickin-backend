@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, verifyPassword, signToken } from '@/lib/local/auth'
+import { getUserRowByEmail, verifyPassword, signToken, blockedAccountResponse } from '@/lib/local/auth'
 import { withHostState } from '@/lib/local/db'
 
 export const dynamic = 'force-dynamic'
@@ -62,6 +62,11 @@ export async function POST(req: Request) {
         { status: 401, headers: CORS }
       )
     }
+    // Blocked / removed → stop here. AFTER the password check, so this never tells a
+    // stranger which emails are suspended; BEFORE the email_verified branch, so a
+    // blocked account is not routed to the OTP screen it could never get past.
+    const blocked = blockedAccountResponse(row.account_status, CORS)
+    if (blocked) return blocked
     if (!row.email_verified) {
       return NextResponse.json(
         { error: 'Please verify your email first', needsVerification: true, email: row.email },
