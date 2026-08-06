@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { deleteEntity, updateUserRole, adminSetBookingStatus, adminSetListingPublished } from '@/lib/local/admin'
-import { requireStaff, staffActor, type StaffModule } from '@/lib/local/staff'
+import { requireStaff, staffActor, logStaffAction, clientIpOf, type StaffModule } from '@/lib/local/staff'
 
 // DELETE /api/local/admin/:entity/:id — admin removes any row.
 //   entity ∈ users | listings | bookings | services | service-requests
@@ -77,6 +77,13 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ entity: strin
       )
     }
     const result = await updateUserRole(id, role)
+    // Granting 'admin' is effectively granting super admin while the legacy fallback
+    // is on, so this one especially needs a name against it.
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId, staffEmail: gate.staff.email,
+      action: 'user_role_changed', targetType: 'user', targetId: id,
+      detail: { role }, ip: clientIpOf(req),
+    })
     return NextResponse.json(result, { headers: CORS })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -104,6 +111,13 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ entity: stri
       )
     }
     const result = await deleteEntity(entity, id)
+    // A hard delete through the direct API surface. /ops can't reach this route,
+    // which is exactly why it needed a trail.
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId, staffEmail: gate.staff.email,
+      action: 'entity_deleted', targetType: entity, targetId: id,
+      detail: result, ip: clientIpOf(req),
+    })
     return NextResponse.json(result, { headers: CORS })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)

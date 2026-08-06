@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { requireStaff } from '@/lib/local/staff'
+import { requireStaff, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import { listPendingVerifications, setVerification } from '@/lib/local/trust'
 
 // Admin verification queue.
@@ -45,6 +45,15 @@ export async function POST(req: Request) {
     }
     const state = await setVerification(userId, /^approve$/i.test(action))
     if (!state) return NextResponse.json({ error: 'User not found' }, { status: 404, headers: CORS })
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId,
+      staffEmail: gate.staff.email,
+      action: 'verification_reviewed',
+      targetType: 'verification',
+      targetId: userId,
+      detail: { action },
+      ip: clientIpOf(req),
+    })
     return NextResponse.json(state, { headers: CORS })
   } catch (err) {
     return NextResponse.json({ error: 'Failed to update verification', detail: String(err) }, { status: 500, headers: CORS })

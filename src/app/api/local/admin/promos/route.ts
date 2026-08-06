@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { requireStaff, staffActor } from '@/lib/local/staff'
+import { requireStaff, staffActor, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import { listPromos, createPromo, setPromoActive, deletePromo } from '@/lib/local/promote'
 
 // Admin promo-code management.
@@ -43,6 +43,11 @@ export async function POST(req: Request) {
     if (b.action === 'toggle' && b.id) {
       const ok = await setPromoActive(String(b.id), Boolean(b.active))
       if (!ok) return NextResponse.json({ error: 'Code not found' }, { status: 404, headers: CORS })
+      await logStaffAction({
+        staffId: gate.staff.legacy ? null : gate.staff.staffId, staffEmail: gate.staff.email,
+        action: 'promo_changed', targetType: 'promo', targetId: String(b.code ?? ''),
+        detail: { active: Boolean(b.active) }, ip: clientIpOf(req),
+      })
       return NextResponse.json({ ok: true, active: Boolean(b.active) }, { headers: CORS })
     }
     const promo = await createPromo({
@@ -51,6 +56,11 @@ export async function POST(req: Request) {
       value: Number(b.value),
       maxRedemptions: b.max_redemptions ?? b.maxRedemptions ?? null,
       expiresAt: b.expires_at ?? b.expiresAt ?? null,
+    })
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId, staffEmail: gate.staff.email,
+      action: 'promo_created', targetType: 'promo', targetId: String(promo?.code ?? ''),
+      detail: {}, ip: clientIpOf(req),
     })
     return NextResponse.json(promo, { status: 201, headers: CORS })
   } catch (err) {

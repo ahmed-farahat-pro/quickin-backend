@@ -164,6 +164,40 @@ verification query plus the smoke scripts.
 > `next build`, so a failing test cannot block a deploy. `npm run check` is a
 > **manual gate**. Wiring it into a GitHub Action is the obvious next step.
 
+## Admin actions are audited
+
+Every staff-gated mutation in this repo now writes a `staff_audit_log` row — it
+previously wrote **none at all**, so an action taken through this API was
+unattributable. That includes `admin/notify` (a push + email blast to every user) and
+`admin/settings/instapay` (the account guests are told to pay).
+
+`admin/host-applications` was gated on `users.role === 'admin'` — the pre-RBAC check,
+which bypassed the staff module system entirely. It now uses
+`requireStaff(req, 'applications')` like every other admin route.
+
+Sign-ins are recorded to `user_logins` from every token-minting path here (login,
+verify-otp, social, google, apple, reset-password) so the web `/ops` activity feed sees
+mobile sign-ins too. Best-effort: a logging failure never blocks a sign-in.
+
+## Account verification — the verified badge
+
+`users.verification_status` (`unverified | pending | verified | rejected`) is written
+by `/ops` in the web project and only **read** here — by `getUserBadges`
+(`trust.ts`) and by `host_verified` in `LISTING_COLS`, which ships on every listing
+payload the apps receive.
+
+Until this landed, nothing wrote that column: `/ops` updated only
+`id_verifications.status`, so **every iOS and Android verified badge was permanently
+false** and this repo's own verification queue (which reads
+`users WHERE verification_status = 'pending'`) was permanently empty. The apps needed
+no change — the columns they already read simply started being populated.
+
+`GET /api/local/admin/listings` no longer returns the inline `ownership_doc`; it
+returns `has_ownership_doc` instead. The document itself is served by the web
+project's audited `/api/local/admin/documents/:kind/:id`, behind the `documents`
+module. No mobile client ever read that field (iOS only writes it, on listing
+creation).
+
 ## Account status — blocked and removed accounts
 
 `users.account_status` (`'active' | 'blocked' | 'removed'`) is written by `/ops` in the
@@ -199,6 +233,8 @@ the list of record. Recent additions:
 | `migrate-resorts.mjs` | `resorts`, `resort_aliases`, `resort_submissions`, `listings.resort_id`/`resort_name` — the curated compound catalog that replaces free-text location as the geographic filter |
 | `migrate-analytics.mjs` | `bookings.cancelled_by`/`cancelled_by_role`/`cancellation_policy`/`commission_rate`/`refunded_at`, the `platform_commission_rate` setting, and the analytics indexes |
 | `migrate-instapay.mjs` | `app_settings`, `payment_proofs`, and the four seeded `instapay_*` setting rows |
+| `migrate-activity.mjs` | `user_logins` (the one activity event nothing recorded) plus timestamp indexes on `users`/`listings`/`payment_proofs` and a partial index on open reports — the derived activity feed and alert centre in `/ops` |
+| `migrate-documents-audit.mjs` | The `staff_audit_log (target_type, target_id)` index, a partial index on `users.verification_status`, the `documents` module grant for existing `verifications`/`listings` moderators, and the backfill of `users.verification_status` from `id_verifications` — the source of truth behind the verified badge |
 | `migrate-account-status.mjs` | `users.account_status`/`status_reason`/`status_changed_at`/`status_changed_by`, `listings.unpublished_by_admin`, and the user search indexes — the block / remove lifecycle behind `/ops` → Users |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The

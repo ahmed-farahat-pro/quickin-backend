@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { recordLogin } from '@/lib/local/db'
 import { resetPasswordWithOtp, hashPassword, signToken } from '@/lib/local/auth'
 
 // POST /api/auth/reset-password { email, code, password } → verifies the reset code,
@@ -39,6 +40,8 @@ export async function POST(req: Request) {
     )
     if (!user) return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400, headers: CORS })
     const token = signToken({ sub: user.id, email: user.email, role: user.role })
+    // F1: the one activity event nothing else records. Best-effort.
+    await recordLogin(user.id, 'password', req)
     const res = NextResponse.json({ token, user }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
     return res

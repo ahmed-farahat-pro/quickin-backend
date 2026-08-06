@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { adminListDisputes, adminResolveDispute } from '@/lib/local/db'
-import { requireStaff, staffActor } from '@/lib/local/staff'
+import { requireStaff, staffActor, logStaffAction, clientIpOf } from '@/lib/local/staff'
 
 // Admin payment-dispute queue.
 //   GET  /api/local/admin/payments                         → open disputes
@@ -48,6 +48,15 @@ export async function POST(req: Request) {
     }
     const booking = await adminResolveDispute(bookingId, staffActor(gate.staff), action, body.note ?? null)
     if (!booking) return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId,
+      staffEmail: gate.staff.email,
+      action: 'dispute_resolved',
+      targetType: 'booking',
+      targetId: bookingId,
+      detail: { outcome: action },
+      ip: clientIpOf(req),
+    })
     return NextResponse.json(booking, { headers: CORS })
   } catch (err) {
     return NextResponse.json({ error: 'Failed to resolve dispute', detail: String(err) }, { status: 500, headers: CORS })

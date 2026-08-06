@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { requireStaff } from '@/lib/local/staff'
+import { requireStaff, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import { listPendingListings, setListingApproval } from '@/lib/local/db'
 
 // Admin listing-moderation queue.
@@ -45,6 +45,15 @@ export async function POST(req: Request) {
     }
     const updated = await setListingApproval(listingId, /^approve$/i.test(action))
     if (!updated) return NextResponse.json({ error: 'Listing not found' }, { status: 404, headers: CORS })
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId,
+      staffEmail: gate.staff.email,
+      action: 'listing_moderated',
+      targetType: 'listing',
+      targetId: listingId,
+      detail: { action },
+      ip: clientIpOf(req),
+    })
     return NextResponse.json(updated, { headers: CORS })
   } catch (err) {
     return NextResponse.json({ error: 'Failed to update listing', detail: String(err) }, { status: 500, headers: CORS })

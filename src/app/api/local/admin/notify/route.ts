@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { requireStaff } from '@/lib/local/staff'
+import { requireStaff, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import { adminBroadcast } from '@/lib/local/admin'
 
 // POST /api/local/admin/notify (admin) — fire a notification to users.
@@ -35,6 +35,15 @@ export async function POST(req: Request) {
       audience: b.audience,
       push: b.push !== false,
       email: Boolean(b.email),
+    })
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId,
+      staffEmail: gate.staff.email,
+      action: 'broadcast_sent',
+      targetType: 'setting',
+      targetId: 'broadcast',
+      detail: { audience: b?.audience ?? 'all', recipients: result?.recipients ?? null },
+      ip: clientIpOf(req),
     })
     return NextResponse.json(result, { headers: CORS })
   } catch (err) {

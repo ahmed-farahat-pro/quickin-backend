@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserFromRequest } from '@/lib/local/auth'
+import { requireStaff, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import { listHostApplications, reviewHostApplication } from '@/lib/local/db'
 
 // Admin host-application queue.
@@ -27,9 +27,11 @@ export async function OPTIONS() {
 
 export async function GET(req: Request) {
   try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    // Was gated on users.role === 'admin' — the pre-RBAC check, which bypassed the
+    // staff module system entirely and left the action unattributable. Now it goes
+    // through the same gate as every other admin route.
+    const gate = await requireStaff(req, 'applications')
+    if ('error' in gate) return gate.error
     const status = new URL(req.url).searchParams.get('status') || 'pending'
     return NextResponse.json({ applications: await listHostApplications(status) }, { headers: CORS })
   } catch (err) {
@@ -39,9 +41,11 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    if (user.role !== 'admin') return NextResponse.json({ error: 'Admins only' }, { status: 403, headers: CORS })
+    // Was gated on users.role === 'admin' — the pre-RBAC check, which bypassed the
+    // staff module system entirely and left the action unattributable. Now it goes
+    // through the same gate as every other admin route.
+    const gate = await requireStaff(req, 'applications')
+    if ('error' in gate) return gate.error
     const b = await req.json().catch(() => ({}))
     const userId = String(b.user_id ?? b.userId ?? '')
     const action = String(b.action ?? '')
@@ -51,6 +55,12 @@ export async function POST(req: Request) {
     const note = typeof b.note === 'string' && b.note.trim() ? b.note.trim().slice(0, 500) : null
     const application = await reviewHostApplication(userId, /^approve$/i.test(action) ? 'approve' : 'reject', note)
     if (!application) return NextResponse.json({ error: 'Application not found' }, { status: 404, headers: CORS })
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId, staffEmail: gate.staff.email,
+      action: /^approve$/i.test(action) ? 'host_application_approved' : 'host_application_rejected',
+      targetType: 'user', targetId: userId,
+      detail: { note }, ip: clientIpOf(req),
+    })
     return NextResponse.json({ ok: true, application }, { headers: CORS })
   } catch (err) {
     return NextResponse.json({ error: 'Failed to update host application', detail: String(err) }, { status: 500, headers: CORS })

@@ -829,17 +829,22 @@ export async function getStayQuote(listingId: string, checkIn: string, checkOut:
 /** Listings awaiting moderation, with the host's name/email + the ownership doc
  *  (admin only — the doc is never exposed publicly). */
 export async function listPendingListings(): Promise<
-  (Listing & { host_email: string | null; ownership_doc: string | null })[]
+  (Listing & { host_email: string | null; has_ownership_doc: boolean })[]
 > {
+  // The ownership document itself is NOT returned. It used to ride inline, as base64,
+  // on every pending listing, for anyone holding the `listings` module and with no
+  // record of who saw it. The web project now serves one document at a time from
+  // /api/local/admin/documents/ownership/:id, behind the `documents` module, and
+  // audits every open. No mobile client ever read this field.
   const { rows } = await pool.query(
     `SELECT ${LISTING_COLS},
             (SELECT u.email FROM users u WHERE u.id = l.host_id) AS host_email,
-            l.ownership_doc
+            (l.ownership_doc IS NOT NULL AND l.ownership_doc <> '') AS has_ownership_doc
        FROM listings l
       WHERE COALESCE(l.approval_status, 'approved') = 'pending'
       ORDER BY l.created_at DESC`
   )
-  return rows as (Listing & { host_email: string | null; ownership_doc: string | null })[]
+  return rows as (Listing & { host_email: string | null; has_ownership_doc: boolean })[]
 }
 
 /** Admin approves (publish + 'approved') or rejects (unpublish + 'rejected') a
@@ -2685,4 +2690,32 @@ export async function postChatMessage(userId: string, conversationId: string, ra
   await createNotification(other, { type: 'message', title: 'New message', body: body.slice(0, 80), link: '/messages' })
   const msg = rows[0] as ChatThreadMessage
   return { ...msg, mine: true }
+}
+
+/**
+ * Record a user sign-in (F1) — the ONE activity event that can't be derived, because
+ * nothing else in the schema records that a user logged in: no last_login_at, and no
+ * user session table (auth is a stateless 30-day JWT). The web project's /ops activity
+ * feed reads this table; both projects write it, since the mobile apps sign in here.
+ *
+ * Best-effort by design: a logging failure must never stop someone signing in.
+ */
+export async function recordLogin(
+  userId: string,
+  method: 'password' | 'otp' | 'google' | 'apple' | 'social',
+  req?: Request,
+): Promise<void> {
+  try {
+    if (!isUuid(userId)) return
+    const ip = req
+      ? (req.headers.get('x-forwarded-for')?.split(',')[0].trim() || req.headers.get('x-real-ip') || null)
+      : null
+    const ua = req ? (req.headers.get('user-agent') || '').slice(0, 300) || null : null
+    await pool.query(
+      `INSERT INTO user_logins (user_id, method, ip, user_agent) VALUES ($1, $2, $3, $4)`,
+      [userId, method, ip, ua],
+    )
+  } catch {
+    /* never block a sign-in over telemetry */
+  }
 }

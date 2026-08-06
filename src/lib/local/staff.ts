@@ -58,12 +58,14 @@ export const STAFF_MODULES = [
   { key: 'bookings', label: 'Bookings', description: 'Reservations and their status' },
   { key: 'applications', label: 'Host applications', description: 'Approve or reject new hosts' },
   { key: 'verifications', label: 'ID verifications', description: 'Review submitted ID documents' },
+  { key: 'documents', label: 'Documents', description: 'Open ID and ownership documents' },
   { key: 'payments', label: 'Payments & disputes', description: 'Instapay proofs, disputes, handle' },
   { key: 'promos', label: 'Promo codes', description: 'Discount codes and limits' },
   { key: 'reports', label: 'Reports', description: 'User-filed abuse reports' },
   { key: 'notify', label: 'Broadcasts', description: 'Send push and email to segments' },
   { key: 'analytics', label: 'Analytics', description: 'Booking, revenue and cancellation reports' },
   { key: 'resorts', label: 'Resorts', description: 'Compound catalog and pending submissions' },
+  { key: 'audit', label: 'Audit log', description: 'Read the record of every staff action', superAdminOnly: true },
   { key: 'staff', label: 'Staff & permissions', description: 'Manage moderators', superAdminOnly: true },
 ] as const satisfies ReadonlyArray<{
   key: string

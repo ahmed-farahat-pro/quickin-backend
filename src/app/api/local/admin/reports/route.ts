@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { requireStaff } from '@/lib/local/staff'
+import { requireStaff, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import { listReports, resolveReport } from '@/lib/local/trust'
 
 // Admin reports triage.
@@ -45,6 +45,15 @@ export async function POST(req: Request) {
     if (!status) return NextResponse.json({ error: 'action must be "resolve" or "dismiss"' }, { status: 400, headers: CORS })
     const ok = await resolveReport(reportId, status)
     if (!ok) return NextResponse.json({ error: 'Report not found' }, { status: 404, headers: CORS })
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId,
+      staffEmail: gate.staff.email,
+      action: 'report_reviewed',
+      targetType: 'report',
+      targetId: reportId,
+      detail: { status },
+      ip: clientIpOf(req),
+    })
     return NextResponse.json({ ok: true, status }, { headers: CORS })
   } catch (err) {
     return NextResponse.json({ error: 'Failed to update report', detail: String(err) }, { status: 500, headers: CORS })

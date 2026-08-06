@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getPaymentConfig, setSetting } from '@/lib/local/db'
-import { requireStaff, staffActor } from '@/lib/local/staff'
+import { requireStaff, staffActor, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import {
   INSTAPAY_KEYS,
   isPaymentConfigError,
@@ -65,6 +65,15 @@ export async function PUT(req: Request) {
     }
 
     for (const [key, value] of updates) await setSetting(key, value, actor)
+    await logStaffAction({
+      staffId: gate.staff.legacy ? null : gate.staff.staffId,
+      staffEmail: gate.staff.email,
+      action: 'instapay_updated',
+      targetType: 'setting',
+      targetId: 'instapay',
+      detail: { fields: updates.map(([k]) => k) },
+      ip: clientIpOf(req),
+    })
     return NextResponse.json(await getPaymentConfig(), { headers: CORS })
   } catch (err) {
     if (isPaymentConfigError(err)) {

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getUserRowByEmail, verifyPassword, signToken, blockedAccountResponse } from '@/lib/local/auth'
-import { withHostState } from '@/lib/local/db'
+import { withHostState, recordLogin } from '@/lib/local/db'
 
 export const dynamic = 'force-dynamic'
 
@@ -77,6 +77,8 @@ export async function POST(req: Request) {
       id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role,
     })
     const token = signToken({ sub: user.id, email: user.email, role: row.role })
+    // F1: the one activity event nothing else records. Best-effort.
+    await recordLogin(user.id, 'password', req)
     const res = NextResponse.json({ token, user }, { headers: CORS })
     res.cookies.set('qk_token', token, { httpOnly: true, sameSite: 'lax', path: '/' })
     return res
