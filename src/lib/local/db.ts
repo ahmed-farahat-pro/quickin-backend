@@ -1967,18 +1967,30 @@ export async function submitPaymentProof(
     [bookingId, userId, m]
   )
   const booking = (rows[0] as Booking) ?? null
-  if (booking && booking.host_id) {
-    await createNotification(booking.host_id, {
+  if (booking) {
+    // The GUEST is told their part is done. This used to notify only the host, with
+    // "Payment to review" and a link to /host — but hosts no longer confirm transfers
+    // (the money goes to QuickIn's account, and an admin decides), so that message
+    // asked them to do something they can't. The host is still told money arrived.
+    await createNotification(userId, {
       type: 'payment_submitted',
-      title: 'Payment to review',
-      body: `${booking.title} — a guest uploaded a transfer receipt`,
-      link: '/host',
+      title: 'Transfer received',
+      body: `We got your screenshot for ${booking.title}. We'll confirm it shortly.`,
+      link: '/reservations',
     })
-    await sendPush(booking.host_id, {
-      title: 'Payment to review',
-      body: `${booking.title} — ${booking.reservation_code ?? ''}`,
-      link: '/host',
-    })
+    if (booking.host_id) {
+      await createNotification(booking.host_id, {
+        type: 'payment_submitted',
+        title: 'Guest sent a payment',
+        body: `${booking.title} — QuickIn is confirming the transfer`,
+        link: '/host',
+      })
+      await sendPush(booking.host_id, {
+        title: 'Guest sent a payment',
+        body: `${booking.title} — ${booking.reservation_code ?? ''}`,
+        link: '/host',
+      })
+    }
   }
   return booking
 }
@@ -2024,57 +2036,10 @@ export async function getBookingProof(
  * Only the listing's host, only while the booking is 'pending'. Updates the
  * latest proof row and notifies the guest. Returns null if not the host / not pending.
  */
-export async function hostReviewPayment(
-  bookingId: string,
-  hostUserId: string,
-  action: 'accept' | 'reject',
-  reason: string | null = null,
-): Promise<Booking | null> {
-  if (!isUuid(bookingId) || !isUuid(hostUserId)) return null
-  const accept = action === 'accept'
-  const { rows } = await pool.query(
-    `WITH upd AS (
-       UPDATE bookings b SET
-         status = CASE WHEN $3 THEN 'confirmed' ELSE 'rejected' END,
-         payment_status = CASE WHEN $3 THEN 'paid' ELSE 'rejected' END,
-         paid_at = CASE WHEN $3 THEN COALESCE(b.paid_at, now()) ELSE b.paid_at END,
-         -- Accepting the transfer confirms the stay → issue the reservation code.
-         ${issueCodeSql('$3', '$4')}
-       FROM listings l
-       WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2 AND b.status = 'pending'
-       RETURNING b.*
-     )
-     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
-    [bookingId, hostUserId, accept, genReservationCode()]
-  )
-  const booking = (rows[0] as Booking) ?? null
-  if (!booking) return null
-  await pool.query(
-    `UPDATE payment_proofs SET
-        status = CASE WHEN $2 THEN 'approved' ELSE 'rejected' END,
-        reviewed_by = $3, reviewed_at = now(),
-        reject_reason = CASE WHEN $2 THEN NULL ELSE $4 END
-      WHERE id = (SELECT id FROM payment_proofs WHERE booking_id = $1 ORDER BY submitted_at DESC LIMIT 1)`,
-    [bookingId, accept, hostUserId, reason ? String(reason).slice(0, 500) : null]
-  )
-  await createNotification(booking.user_id, {
-    type: accept ? 'payment_approved' : 'payment_rejected',
-    title: accept ? 'Payment confirmed' : 'Payment not accepted',
-    body: accept
-      ? `Your stay at ${booking.title} is confirmed`
-      : `${booking.title}: ${reason || 'the transfer could not be verified'}`,
-    link: `/reservation/${booking.id}`,
-  })
-  await sendPush(booking.user_id, {
-    title: accept ? 'Booking confirmed 🎉' : 'Payment not accepted',
-    body: accept ? `${booking.title} is confirmed & paid` : `${booking.title} — tap for details`,
-    link: `/reservation/${booking.id}`,
-  })
-  return booking
-}
-
-/** Guest disputes a host-rejected payment ("I did pay"). Flags the latest proof +
- *  booking as 'disputed' for admin review. Only the guest, only on a rejected proof. */
+// hostReviewPayment was removed with the payment-flow change: hosts no longer approve
+// transfers, an admin does (adminReviewProof). It was also unreachable in practice —
+// it required b.status = 'pending' while a guest can only pay once a booking is
+// 'confirmed', so a normal screenshot could never be approved through it.
 export async function guestDisputePayment(
   bookingId: string,
   userId: string,

@@ -179,6 +179,23 @@ Sign-ins are recorded to `user_logins` from every token-minting path here (login
 verify-otp, social, google, apple, reset-password) so the web `/ops` activity feed sees
 mobile sign-ins too. Best-effort: a logging failure never blocks a sign-in.
 
+## Who confirms a payment
+
+**QuickIn, not the host.** Guests transfer to QuickIn's Instapay account and upload a
+screenshot; an admin accepts or rejects it in the web project's `/ops/payments`. Hosts
+still accept or decline the *reservation* — they no longer review transfers, and
+`POST /api/local/host/bookings/:id/review` is gone from both repos.
+
+`submitPaymentProof` therefore notifies the **guest** ("we got your screenshot") and
+tells the host money arrived without asking them to act. It previously notified only
+the host, with "Payment to review" and a link to `/host` — a request they can no longer
+fulfil.
+
+The flow, unchanged in the schema: `payment_proofs.status = 'submitted'` +
+`bookings.payment_status = 'submitted'` is the pending-confirmation state that both
+mobile apps already gate on (`payment_status == "submitted"`), so no app change was
+needed.
+
 ## Account verification — the verified badge
 
 `users.verification_status` (`unverified | pending | verified | rejected`) is written
