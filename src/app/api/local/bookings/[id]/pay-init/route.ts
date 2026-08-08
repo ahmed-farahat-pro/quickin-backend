@@ -16,8 +16,6 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Cache-Control': 'no-store',
 }
-const SERVICE_FEE_RATE = 0.1
-
 // Where the web client may ask Paymob to return the browser after checkout. We only honour
 // a caller-supplied redirect_url if its origin is allowlisted (WEB_APP_URL, comma-separated),
 // so this can't become an open redirect. Returns a safe absolute URL with ?booking=<id>, or null.
@@ -65,9 +63,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const body = await req.json().catch(() => ({})) as { redirect_url?: unknown }
     // Web clients pass their own /reservations URL; mobile omits it and lands on our return page.
     const redirectionUrl = safeRedirect(body.redirect_url, id) || `${returnPrefix}?booking=${id}`
+    // total_price arrives commission-inclusive from BOOKING_COLS — there is no
+    // separate service fee to add any more.
     const subtotal = Math.round(bk.total_price)
-    const serviceFee = Math.round(subtotal * SERVICE_FEE_RATE)
-    const amountCents = (subtotal + serviceFee) * 100
+    const amountCents = subtotal * 100
 
     // Paymob configured → create the intention. On error, surface a failure to the client;
     // NEVER fall through to marking the booking paid (that would confirm it without a charge).

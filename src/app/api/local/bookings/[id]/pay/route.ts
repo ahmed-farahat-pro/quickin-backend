@@ -13,11 +13,11 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Cache-Control': 'no-store',
 }
-// Mocked guest service fee added on top of the stay subtotal.
-const SERVICE_FEE_RATE = 0.1
-// Payment-method adjustment on the subtotal: paying by card adds 5%, paying by
-// bank transfer takes 5% off. (Mock — no real gateway yet.)
-const METHOD_RATE: Record<string, number> = { card: 0.05, bank_transfer: -0.05 }
+// No fees are added here any more. `booking.total_price` already arrives
+// COMMISSION-INCLUSIVE from BOOKING_COLS (raw host price × the rate snapshotted
+// on the booking), which replaced both the 10% guest service fee and the ±5%
+// card/bank-transfer adjustment — Instapay is the only method now. `serviceFee`
+// and `methodFee` stay on the receipt as zeros for shipped mobile decoders.
 
 export async function OPTIONS() {
   return new Response(null, {
@@ -41,8 +41,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     if (existing.user_id !== user.id) {
       return NextResponse.json({ error: 'Not allowed' }, { status: 403, headers: CORS })
     }
-    // Payment method drives a ±5% adjustment (card +5%, bank transfer −5%).
-    // Card details, if any, are ignored — this is a mock.
+    // The method is still recorded on the booking, but it no longer moves the
+    // price. Card details, if any, are ignored — this is a mock.
     const body = await req.json().catch(() => ({}))
     const method = body?.method === 'bank_transfer' ? 'bank_transfer' : 'card'
 
@@ -54,9 +54,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       Math.round((new Date(booking.check_out).getTime() - new Date(booking.check_in).getTime()) / 86_400_000)
     )
     const subtotal = Math.round(booking.total_price)
-    const serviceFee = Math.round(subtotal * SERVICE_FEE_RATE)
-    // Signed: positive surcharge for card, negative discount for bank transfer.
-    const methodFee = Math.round(subtotal * (METHOD_RATE[method] ?? 0))
     // Optional promo code — redeemed against the subtotal (one-time increment).
     let promoCode: string | null = null
     let promoDiscount = 0
@@ -69,15 +66,15 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         await setBookingPromo(id, user.id, normalized, promoDiscount)
       }
     }
-    const total = Math.max(0, subtotal + serviceFee + methodFee - promoDiscount)
+    const total = Math.max(0, subtotal - promoDiscount)
     const receipt = {
       currency: 'EGP',
       nights,
       nightly: Math.round(subtotal / nights),
       subtotal,
-      serviceFee,
+      serviceFee: 0, // deprecated — see the note at the top of this file
       method,
-      methodFee, // +ve = card surcharge, −ve = bank-transfer discount
+      methodFee: 0, // deprecated
       promoCode,
       promoDiscount, // amount subtracted by the promo code (0 if none)
       total,

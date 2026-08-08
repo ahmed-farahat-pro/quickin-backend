@@ -9,7 +9,7 @@
     "start": "next start -p 4000",
     "test": "node --test scripts/_guardtest.mjs \"test/unit/*.test.mjs\"",
     "test:watch": "node --test --watch \"test/unit/*.test.mjs\"",
-    "check": "node scripts/check-staff-parity.mjs && node scripts/check-resort-core-parity.mjs && node scripts/check-payment-config-core-parity.mjs && npm test"
+    "check": "node scripts/check-staff-parity.mjs && node scripts/check-resort-core-parity.mjs && node scripts/check-payment-config-core-parity.mjs && node scripts/check-commission-core-parity.mjs && npm test"
   },
   "dependencies": {
     "next": "16.1.1",

@@ -34,12 +34,61 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/payment-config` | The Instapay destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload}` |
 | GET  | `/api/local/admin/settings/instapay` | Read the same config for editing. Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/instapay` | Update it — `{instapay_handle?, instapay_link?, instapay_qr_image?, instructions?}`. Each field is optional: omit to leave untouched, send `""` to clear. `400` on an invalid link or QR |
+| GET  | `/api/local/host/commission` | The platform commission — `{rate, percent}` — so the add/edit-listing screens can show a host what guests will pay. Auth required (a guest holding the rate could divide out the host's raw price) |
+| GET  | `/api/local/admin/settings/commission` | The platform commission — `{rate, percent, updated_at, updated_by}`. Staff session with the `pricing` module |
+| PUT  | `/api/local/admin/settings/commission` | Set it — `{percent}` (e.g. `12.5`). `400` outside 0–100. Reprices every listing and service immediately; existing bookings keep their snapshotted rate |
 
 All responses send `Access-Control-Allow-Origin: *`. Every POST route answers a CORS
 preflight (`OPTIONS` → `204`) so browsers can call the API cross-origin.
 
 Auth is stateless: an HMAC-signed token returned on login/signup, sent back either as a
 `Bearer` header (mobile) or the `qk_token` cookie (web).
+
+### The platform commission
+
+QuickIn takes its cut as a **markup**, not a fee. A host names the price they want to
+receive; a guest is quoted `raw × (1 + rate)`, rounded **up to the nearest 10 EGP**.
+The commission is never itemised — the guest sees one inclusive price, and the host is
+paid their full raw price.
+
+This replaced the older fee model, which charged the guest a 10% service fee *and*
+withheld 10% from the host, plus a ±5% card/bank-transfer adjustment that stopped
+meaning anything once Instapay became the only method. `serviceFee` and `methodFee`
+still appear on the pay receipt as hardcoded **zeros**, purely so already-installed
+mobile builds — whose decoders require those keys — don't fail to parse a receipt.
+Delete them once those builds are retired.
+
+The rate is one `app_settings` row, `platform_commission_rate`, stored as a fraction
+(`'0.1'` = 10%) and edited at `/ops/pricing` behind the `pricing` staff module.
+
+**Guest prices are derived at read time, never stored**, so changing the rate reprices
+the whole catalogue at once with no backfill and nothing to drift. The one thing that
+*is* stored is `bookings.commission_rate`: every booking snapshots the rate it was
+taken at, so a rate change can never restate a reservation a guest already agreed to.
+
+Which price a query returns is decided by the **projection**, not by the caller
+remembering to convert:
+
+| | `price_per_night` / `total_price` | Extra fields |
+| --- | --- | --- |
+| `LISTING_COLS`, `BOOKING_COLS`, `SERVICE_COLS` (guest) | commission-inclusive | — (the raw price is never sent to a guest) |
+| `LISTING_COLS_HOST`, `SERVICE_COLS_HOST` | the host's raw price | `guest_price_per_night`, `guest_weekend_price`, `guest_monthly_prices` |
+| `getHostBookings` | commission-inclusive | `host_payout` — the raw amount owed |
+
+The host projection returns the **raw** price on purpose: the edit form loads that
+field and PATCHes it straight back, so returning the marked-up figure there would
+inflate the listing a little more on every save. `getListingById(id, { asHost: true })`
+selects it; every write path already does.
+
+The formula and its rounding rule live in `src/lib/local/commission-core.ts`, in both
+TypeScript **and** SQL (`sqlWithCommission()`), because the markup has to run inside
+Postgres too — for the price filter and the per-night stay sum. `scripts/_verify-commission.mjs`
+runs both against a local database and asserts they agree to the pound; the file is
+byte-identical in the web repo, guarded by `scripts/check-commission-core-parity.mjs`.
+
+One subtlety worth keeping: `raw * (1 + rate)` is binary-float, so `100 × 1.1` is
+`110.00000000000001` and a naive `ceil` would bill 120. `roundUpToStep()` settles to
+piasters before rounding up.
 
 ### The Instapay destination
 
@@ -250,6 +299,7 @@ the list of record. Recent additions:
 | `migrate-resorts.mjs` | `resorts`, `resort_aliases`, `resort_submissions`, `listings.resort_id`/`resort_name` — the curated compound catalog that replaces free-text location as the geographic filter |
 | `migrate-analytics.mjs` | `bookings.cancelled_by`/`cancelled_by_role`/`cancellation_policy`/`commission_rate`/`refunded_at`, the `platform_commission_rate` setting, and the analytics indexes |
 | `migrate-instapay.mjs` | `app_settings`, `payment_proofs`, and the four seeded `instapay_*` setting rows |
+| `migrate-commission.mjs` | Makes the platform commission safe on any database: creates `app_settings` if absent, seeds `platform_commission_rate`, adds `bookings.commission_rate` — and backfills it on **every** booking, not just paid ones (`migrate-analytics.mjs` only did the paid ones, which was fine when the column was a reporting field and is not now that guest prices derive from it) |
 | `migrate-activity.mjs` | `user_logins` (the one activity event nothing recorded) plus timestamp indexes on `users`/`listings`/`payment_proofs` and a partial index on open reports — the derived activity feed and alert centre in `/ops` |
 | `migrate-documents-audit.mjs` | The `staff_audit_log (target_type, target_id)` index, a partial index on `users.verification_status`, the `documents` module grant for existing `verifications`/`listings` moderators, and the backfill of `users.verification_status` from `id_verifications` — the source of truth behind the verified badge |
 | `migrate-account-status.mjs` | `users.account_status`/`status_reason`/`status_changed_at`/`status_changed_by`, `listings.unpublished_by_admin`, and the user search indexes — the block / remove lifecycle behind `/ops` → Users |

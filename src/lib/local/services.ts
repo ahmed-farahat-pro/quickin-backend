@@ -1,6 +1,7 @@
 import { randomInt } from 'node:crypto'
 import { pool } from './pool'
 import { createNotification } from './notifications'
+import { COMMISSION_RATE_SQL, sqlWithCommission } from './commission-core'
 
 // Services = a "booking system" for standalone experiences (jet ski, diving, tours…).
 // A host posts a service; a user "subscribes"/requests it; like a booking it goes
@@ -25,7 +26,11 @@ export interface Service {
   description: string | null
   category: string | null
   location: string | null
+  /** Guest projection: commission-inclusive. Host projection: the host's raw price. */
   price: number
+  /** Host projection only — what a guest is quoted. */
+  guest_price?: number
+  commission_rate?: number
   currency: string
   image_url: string | null
   lat: number | null
@@ -56,16 +61,33 @@ export interface ServiceRequest {
   requester_email: string | null
 }
 
+// Services carry the platform commission exactly like listings do: services.price
+// is the host's RAW price, and a guest is quoted price × (1 + rate). Which one
+// lands in `price` is decided by the projection — see the note above LISTING_COLS
+// in db.ts. Services have no snapshot column (there is no payment flow yet), so
+// they always price at the LIVE rate.
+
+/** Guest projection — `price` includes the commission, raw is never returned. */
 export const SERVICE_COLS = `
   s.id, s.host_id, u.full_name AS host_name, s.title, s.description, s.category,
+  s.location, ${sqlWithCommission('s.price')}::float8 AS price, s.currency, s.image_url, s.lat, s.lng,
+  ${COMMISSION_RATE_SQL}::float8 AS commission_rate,
+  s.is_published, s.created_at`
+
+/** Host projection — `price` is the host's raw amount (what they edit), plus a
+ *  read-only `guest_price` for "guests pay X". Never serve this to a guest. */
+export const SERVICE_COLS_HOST = `
+  s.id, s.host_id, u.full_name AS host_name, s.title, s.description, s.category,
   s.location, s.price::float8 AS price, s.currency, s.image_url, s.lat, s.lng,
+  ${sqlWithCommission('s.price')}::float8 AS guest_price,
+  ${COMMISSION_RATE_SQL}::float8 AS commission_rate,
   s.is_published, s.created_at`
 export const SERVICE_FROM = `services s JOIN users u ON u.id = s.host_id`
 
 const REQUEST_COLS = `
   r.id, r.service_id, r.user_id, r.status, r.preferred_date, r.note, r.request_code, r.created_at,
   s.title AS service_title, s.category AS service_category, s.image_url AS service_image,
-  s.price::float8 AS service_price, s.currency AS service_currency, s.location AS service_location,
+  ${sqlWithCommission('s.price')}::float8 AS service_price, s.currency AS service_currency, s.location AS service_location,
   s.host_id AS host_id, hu.full_name AS host_name,
   ru.full_name AS requester_name, ru.email AS requester_email`
 const REQUEST_FROM = `service_requests r
@@ -101,7 +123,7 @@ export async function createService(hostUserId: string, input: CreateServiceInpu
       input.location ?? null, price, input.imageUrl ?? null, input.lat ?? null, input.lng ?? null,
     ]
   )
-  const created = await getServiceById(rows[0].id as string)
+  const created = await getServiceById(rows[0].id as string, { asHost: true })
   if (!created) throw new Error('Failed to create service')
   return created
 }
@@ -114,17 +136,21 @@ export async function getServices(): Promise<Service[]> {
   return rows as Service[]
 }
 
-export async function getServiceById(id: string): Promise<Service | null> {
+/** One service. Defaults to the GUEST projection; pass `{ asHost: true }` when
+ *  the response goes to the owning host (create/update round-trips especially,
+ *  since the host PATCHes the price straight back). */
+export async function getServiceById(id: string, opts: { asHost?: boolean } = {}): Promise<Service | null> {
   if (!isUuid(id)) return null
-  const { rows } = await pool.query(`SELECT ${SERVICE_COLS} FROM ${SERVICE_FROM} WHERE s.id = $1`, [id])
+  const cols = opts.asHost ? SERVICE_COLS_HOST : SERVICE_COLS
+  const { rows } = await pool.query(`SELECT ${cols} FROM ${SERVICE_FROM} WHERE s.id = $1`, [id])
   return (rows[0] as Service) ?? null
 }
 
-/** A host's own services. */
+/** A host's own services — raw prices, with guest_price alongside. */
 export async function getHostServices(hostUserId: string): Promise<Service[]> {
   if (!isUuid(hostUserId)) return []
   const { rows } = await pool.query(
-    `SELECT ${SERVICE_COLS} FROM ${SERVICE_FROM} WHERE s.host_id = $1 ORDER BY s.created_at DESC`,
+    `SELECT ${SERVICE_COLS_HOST} FROM ${SERVICE_FROM} WHERE s.host_id = $1 ORDER BY s.created_at DESC`,
     [hostUserId]
   )
   return rows as Service[]

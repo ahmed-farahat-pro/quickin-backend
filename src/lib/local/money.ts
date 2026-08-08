@@ -1,14 +1,22 @@
 import { pool } from './pool'
+import { COMMISSION_RATE_SQL, parseRate, sqlWithCommission } from './commission-core'
 
-// Money views (S9) — all MOCK / derived (no real gateway, no payout rails).
-// Receipt math MUST match the pay route: service fee 10%, method ±5%, minus promo.
+// Money views (S9) — derived (no real gateway, no payout rails).
+//
+// PRICING MODEL — markup, not fees. The host is paid their raw price in full;
+// the guest is quoted raw × (1 + commission rate). Receipt math MUST match the
+// pay route: commission-inclusive total, minus promo. Nothing else.
+//
+// This replaced a fee model that charged the guest a 10% service fee AND
+// withheld 10% from the host. Both are gone: `serviceFee` and `methodFee`
+// survive on the receipt as hardcoded zeros ONLY so that already-installed
+// mobile builds, whose decoders require the keys, keep working. Remove them once
+// those builds are retired.
 
 const isUuid = (s: string) => /^[0-9a-fA-F-]{36}$/.test(s)
 
-const SERVICE_FEE_RATE = 0.1
-const METHOD_RATE: Record<string, number> = { card: 0.05, bank_transfer: -0.05 }
-// Platform commission withheld from the host (host keeps the rest).
-const HOST_COMMISSION = 0.1
+/** The rate to price a booking by: its snapshot, else the live setting. */
+const BOOKING_RATE_SQL = `COALESCE(b.commission_rate, ${COMMISSION_RATE_SQL})`
 
 // Currencies QuickIn displays (EGP base). Display-only — bookings are always EGP.
 const DISPLAY_CURRENCIES = ['EGP', 'USD', 'EUR', 'GBP', 'SAR', 'AED'] as const
@@ -70,9 +78,13 @@ export interface GuestReceipt {
   check_in: string
   check_out: string
   nights: number
+  /** Commission-inclusive stay total. The commission is never itemised. */
   subtotal: number
+  /** @deprecated Always 0 — the service fee was replaced by the price markup.
+   *  Kept only so shipped mobile decoders don't fail on a missing key. */
   serviceFee: number
   method: string
+  /** @deprecated Always 0 — the ±5% card/bank adjustment is gone (Instapay only). */
   methodFee: number
   promoCode: string | null
   promoDiscount: number
@@ -89,7 +101,7 @@ export async function getGuestReceipts(userId: string): Promise<GuestReceipt[]> 
             to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
             to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
             (b.check_out - b.check_in) AS nights,
-            b.total_price::float8 AS subtotal,
+            ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS subtotal,
             COALESCE(b.payment_method, 'card') AS method,
             b.promo_code,
             COALESCE(b.promo_discount, 0)::float8 AS promo_discount,
@@ -101,10 +113,8 @@ export async function getGuestReceipts(userId: string): Promise<GuestReceipt[]> 
   )
   return rows.map((r) => {
     const subtotal = Math.round(Number(r.subtotal))
-    const serviceFee = Math.round(subtotal * SERVICE_FEE_RATE)
-    const methodFee = Math.round(subtotal * (METHOD_RATE[r.method] ?? 0))
     const promoDiscount = Math.round(Number(r.promo_discount) || 0)
-    const total = Math.max(0, subtotal + serviceFee + methodFee - promoDiscount)
+    const total = Math.max(0, subtotal - promoDiscount)
     return {
       booking_id: r.booking_id,
       reservation_code: r.reservation_code,
@@ -113,9 +123,9 @@ export async function getGuestReceipts(userId: string): Promise<GuestReceipt[]> 
       check_out: r.check_out,
       nights: Math.max(1, Number(r.nights)),
       subtotal,
-      serviceFee,
+      serviceFee: 0,
       method: r.method,
-      methodFee,
+      methodFee: 0,
       promoCode: r.promo_code ?? null,
       promoDiscount,
       total,
@@ -131,30 +141,41 @@ export interface HostEarnings {
   paidOut: number
   pending: number
   bookingsCount: number
+  /** The live platform rate — shown to the host as "guests pay N% above your
+   *  price", NOT as a deduction. Nothing here is reduced by it. */
   commissionRate: number
+  /** What guests were charged in total, across the same bookings. The
+   *  difference from totalEarned is the platform's commission. */
+  guestPaid: number
   recent: {
     booking_id: string
     title: string
     check_in: string
     check_out: string
+    /** What the guest paid (commission-inclusive). */
     gross: number
+    /** What this host earns — under the markup model, their full raw price. */
     net: number
     status: 'paid_out' | 'upcoming'
     paid_at: string | null
   }[]
 }
 
-/** A host's mock earnings: 90% of each paid booking's stay subtotal. A stay
- *  whose checkout has passed counts as "paid out"; otherwise it's pending. */
+/** A host's earnings: the FULL raw price of each paid booking. The platform's
+ *  commission is charged on top of it to the guest, never withheld from the
+ *  host, so net === the host's own price. A stay whose checkout has passed
+ *  counts as "paid out"; otherwise it's pending. */
 export async function getHostEarnings(hostId: string): Promise<HostEarnings> {
+  const rate = await getCommissionRate()
   if (!isUuid(hostId)) {
-    return { currency: 'EGP', totalEarned: 0, paidOut: 0, pending: 0, bookingsCount: 0, commissionRate: HOST_COMMISSION, recent: [] }
+    return { currency: 'EGP', totalEarned: 0, paidOut: 0, pending: 0, bookingsCount: 0, commissionRate: rate, guestPaid: 0, recent: [] }
   }
   const { rows } = await pool.query(
     `SELECT b.id AS booking_id, l.title,
             to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
             to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
-            b.total_price::float8 AS gross,
+            ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS gross,
+            b.total_price::float8 AS net,
             (b.check_out < now()) AS stay_over,
             to_char(b.paid_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS paid_at
        FROM bookings b JOIN listings l ON l.id = b.listing_id
@@ -164,10 +185,12 @@ export async function getHostEarnings(hostId: string): Promise<HostEarnings> {
   )
   let totalEarned = 0
   let paidOut = 0
+  let guestPaid = 0
   const recent = rows.map((r) => {
     const gross = Math.round(Number(r.gross))
-    const net = Math.round(gross * (1 - HOST_COMMISSION))
+    const net = Math.round(Number(r.net))
     totalEarned += net
+    guestPaid += gross
     const status: 'paid_out' | 'upcoming' = r.stay_over ? 'paid_out' : 'upcoming'
     if (status === 'paid_out') paidOut += net
     return { booking_id: r.booking_id, title: r.title, check_in: r.check_in, check_out: r.check_out, gross, net, status, paid_at: r.paid_at }
@@ -178,8 +201,20 @@ export async function getHostEarnings(hostId: string): Promise<HostEarnings> {
     paidOut,
     pending: totalEarned - paidOut,
     bookingsCount: rows.length,
-    commissionRate: HOST_COMMISSION,
+    commissionRate: rate,
+    guestPaid,
     recent: recent.slice(0, 50),
+  }
+}
+
+/** The live platform commission rate (fraction). Falls back to the default if
+ *  the row is missing, so a half-migrated DB still serves. */
+export async function getCommissionRate(): Promise<number> {
+  try {
+    const { rows } = await pool.query(`SELECT ${COMMISSION_RATE_SQL} AS rate`)
+    return parseRate(rows[0]?.rate)
+  } catch {
+    return parseRate(null)
   }
 }
 
@@ -242,26 +277,28 @@ export async function getHostAnalytics(hostId: string): Promise<HostAnalytics> {
 
   const totalBookings = Number(h.total_bookings)
   const paidBookings = Number(h.paid_bookings)
+  // Revenue = host net, consistent with the earnings view. Under the markup
+  // model that IS the raw total_price the queries above already sum: the
+  // commission is added on top for the guest, not withheld from the host.
   return {
     currency: 'EGP',
     listings: Number(h.listings),
     totalBookings,
     paidBookings,
     cancelledBookings: Number(h.cancelled_bookings),
-    // Revenue = host net (90% of paid gross), consistent with the earnings view.
-    revenue: Math.round(Number(h.gross_revenue) * (1 - HOST_COMMISSION)),
+    revenue: Math.round(Number(h.gross_revenue)),
     avgRating: Number(h.avg_rating),
     reviewCount: Number(h.review_count),
     conversionRate: totalBookings > 0 ? Math.round((paidBookings / totalBookings) * 100) / 100 : 0,
     byMonth: monthly.rows.map((m) => ({
       month: m.month,
       bookings: Number(m.bookings),
-      revenue: Math.round(Number(m.revenue) * (1 - HOST_COMMISSION)),
+      revenue: Math.round(Number(m.revenue)),
     })),
     topListings: top.rows.map((t) => ({
       title: t.title,
       bookings: Number(t.bookings),
-      revenue: Math.round(Number(t.revenue) * (1 - HOST_COMMISSION)),
+      revenue: Math.round(Number(t.revenue)),
     })),
   }
 }

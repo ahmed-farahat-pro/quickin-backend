@@ -65,6 +65,7 @@ export const STAFF_MODULES = [
   { key: 'notify', label: 'Broadcasts', description: 'Send push and email to segments' },
   { key: 'analytics', label: 'Analytics', description: 'Booking, revenue and cancellation reports' },
   { key: 'resorts', label: 'Resorts', description: 'Compound catalog and pending submissions' },
+  { key: 'pricing', label: 'Pricing & commission', description: 'The platform commission added to every listing price' },
   { key: 'audit', label: 'Audit log', description: 'Read the record of every staff action', superAdminOnly: true },
   { key: 'staff', label: 'Staff & permissions', description: 'Manage moderators', superAdminOnly: true },
 ] as const satisfies ReadonlyArray<{
