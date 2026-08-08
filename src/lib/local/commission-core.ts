@@ -155,3 +155,27 @@ export const COMMISSION_RATE_SQL = `COALESCE((SELECT value::numeric FROM app_set
 export function sqlWithCommission(expr: string, rateSql: string = COMMISSION_RATE_SQL): string {
   return `(ceil(round((${expr}) * (1 + ${rateSql}), 2) / ${ROUNDING_STEP}.0) * ${ROUNDING_STEP})`
 }
+
+/**
+ * The rate to price an EXISTING booking by: the one snapshotted when it was taken,
+ * falling back to the live rate for rows written before the column existed. Never
+ * the live rate for a booking that already has one — changing the rate must not
+ * restate a reservation a guest already agreed to.
+ */
+export function bookingRateSql(alias = 'b'): string {
+  return `COALESCE(${alias}.commission_rate, ${COMMISSION_RATE_SQL})`
+}
+
+/**
+ * The platform's cut of one booking, in EGP — the SQL twin of commissionAmount().
+ *
+ * NOT `total_price * rate`. The guest price rounds UP to the nearest ROUNDING_STEP,
+ * so the true margin sits a few pounds above the raw percentage; reporting the
+ * percentage would never reconcile against what the guest was actually charged.
+ * GREATEST(…, 0) because a zero or negative stored price must not read as a
+ * negative commission.
+ */
+export function bookingCommissionSql(alias = 'b'): string {
+  const raw = `${alias}.total_price`
+  return `GREATEST(${sqlWithCommission(raw, bookingRateSql(alias))} - ${raw}, 0)`
+}

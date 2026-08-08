@@ -22,6 +22,8 @@ import {
   rateToStored,
   roundUpToStep,
   sqlWithCommission,
+  bookingRateSql,
+  bookingCommissionSql,
   stripCommission,
   withCommission,
 } from '../../src/lib/local/commission-core.ts'
@@ -178,5 +180,34 @@ describe('SQL builders', () => {
 
   test('accepts a caller-supplied rate expression, for a booking-snapshot rate', () => {
     assert.match(sqlWithCommission('b.total_price', 'b.commission_rate'), /b\.commission_rate/)
+  })
+
+  test('bookingRateSql prefers the snapshot and falls back to the live rate', () => {
+    const sql = bookingRateSql()
+    assert.match(sql, /b\.commission_rate/)
+    assert.match(sql, /platform_commission_rate/)
+    // Order matters: COALESCE(snapshot, live). The reverse would reprice history
+    // every time an admin moved the rate.
+    assert.ok(sql.indexOf('b.commission_rate') < sql.indexOf('platform_commission_rate'))
+  })
+
+  test('bookingRateSql honours a caller alias', () => {
+    assert.match(bookingRateSql('bk'), /bk\.commission_rate/)
+    assert.doesNotMatch(bookingRateSql('bk'), /\bb\.commission_rate/)
+  })
+
+  test('bookingCommissionSql is guest minus raw, not a percentage of raw', () => {
+    const sql = bookingCommissionSql()
+    // The guest side must carry the round-up, or the margin will not reconcile
+    // against what was actually charged.
+    assert.match(sql, /ceil/)
+    assert.match(sql, new RegExp(`\\* ${ROUNDING_STEP}\\) - b\\.total_price`))
+    // A bare `total_price * rate` would have no subtraction at all.
+    assert.ok(sql.includes('- b.total_price'))
+  })
+
+  test('bookingCommissionSql floors at zero', () => {
+    assert.match(bookingCommissionSql(), /GREATEST\(/)
+    assert.match(bookingCommissionSql(), /, 0\)$/)
   })
 })

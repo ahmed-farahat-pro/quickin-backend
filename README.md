@@ -121,6 +121,20 @@ Postgres too — for the price filter and the per-night stay sum. `scripts/_veri
 runs both against a local database and asserts they agree to the pound; the file is
 byte-identical in the web repo, guarded by `scripts/check-commission-core-parity.mjs`.
 
+**Reporting the platform's margin.** Two more SQL builders live in the same file, for
+any query that has to say what QuickIn actually earned:
+
+| Builder | Yields |
+| --- | --- |
+| `bookingRateSql(alias)` | `COALESCE(<alias>.commission_rate, <live rate>)` — the booking's own snapshot, never the live rate for a booking that already has one |
+| `bookingCommissionSql(alias)` | the cut in EGP: **guest price − raw price**, floored at zero |
+
+The margin is deliberately **not** `total_price × rate`. The guest price rounds up to
+the nearest 10 EGP, so the true cut sits a few pounds above the flat percentage, and a
+percentage would never reconcile against what the guest was charged. Anything reporting
+commission — the `/ops` dashboard tiles, the bookings table, the analytics revenue
+report, the CSV export — goes through these, so all four agree by construction.
+
 One subtlety worth keeping: `raw * (1 + rate)` is binary-float, so `100 × 1.1` is
 `110.00000000000001` and a naive `ceil` would bill 120. `roundUpToStep()` settles to
 piasters before rounding up.
