@@ -961,9 +961,30 @@ export async function listPendingListings(): Promise<
 }
 
 /** Admin approves (publish + 'approved') or rejects (unpublish + 'rejected') a
- *  listing; notifies the host. Returns the refreshed listing. */
+ *  listing; notifies the host. Returns the refreshed listing.
+ *
+ *  Approving is refused while the listing's host is not identity-verified. The
+ *  create route already blocks unverified hosts, but this is the actual publish
+ *  step — a listing can outlive the verification that allowed it (an admin can
+ *  revoke, or a listing may predate the gate), and going live is the moment that
+ *  matters. Throws so the caller surfaces the reason rather than silently
+ *  reporting success on a listing that stayed hidden. */
 export async function setListingApproval(listingId: string, approve: boolean): Promise<Listing | null> {
   if (!isUuid(listingId)) return null
+  if (approve) {
+    const { rows: hostRows } = await pool.query(
+      `SELECT COALESCE(u.verification_status, 'unverified') AS status, u.email
+         FROM listings l JOIN users u ON u.id = l.host_id
+        WHERE l.id = $1`,
+      [listingId]
+    )
+    const host = hostRows[0]
+    if (host && host.status !== 'verified') {
+      throw new ListingInputError(
+        `This host is not identity-verified (${host.status}). Approve their ID in Verifications first — a listing must not go live before its host is verified.`
+      )
+    }
+  }
   const status = approve ? 'approved' : 'rejected'
   const { rows } = await pool.query(
     `UPDATE listings SET approval_status = $2, is_published = $3 WHERE id = $1
@@ -2526,6 +2547,33 @@ export async function reviewHostApplication(
   return getHostApplication(userId)
 }
 
+// ---- The host listing gate ---------------------------------------------------
+
+/**
+ * The two facts that decide whether someone may put a listing in front of
+ * guests: are they an approved host, and did an admin approve their ID?
+ *
+ * Host status is read from `is_host` OR `role='host'` because the two projects
+ * write different columns — the web's application approval sets `is_host` (and
+ * syncs `role` behind a SAVEPOINT that may not fire on a DB without the column),
+ * while this backend has always keyed off `role`. Trusting only one would lock
+ * out hosts approved through the other.
+ */
+export async function getListingGateState(
+  userId: string
+): Promise<{ isHost: boolean; verificationStatus: string }> {
+  if (!isUuid(userId)) return { isHost: false, verificationStatus: 'unverified' }
+  const { rows } = await pool.query(
+    `SELECT (COALESCE(is_host, false) = true OR role = 'host') AS is_host,
+            COALESCE(verification_status, 'unverified') AS verification_status
+       FROM users WHERE id = $1`,
+    [userId]
+  )
+  const r = rows[0]
+  if (!r) return { isHost: false, verificationStatus: 'unverified' }
+  return { isHost: Boolean(r.is_host), verificationStatus: String(r.verification_status) }
+}
+
 // ---- ID verification (id_verifications table — shared with web /ops admin) ---
 
 export type VerificationTableStatus = 'unverified' | 'pending' | 'verified' | 'rejected'
@@ -2546,8 +2594,11 @@ export async function submitVerificationImages(args: {
   back?: string | null
   idNumber?: string | null
   fullName?: string | null
+  /** Which document this is. Required on new submissions (the reviewer checks
+   *  the photo against the declared type); null only on rows predating it. */
+  docType?: string | null
 }): Promise<VerificationTableState> {
-  const { userId, front, back = null, idNumber = null, fullName = null } = args
+  const { userId, front, back = null, idNumber = null, fullName = null, docType = null } = args
   if (!isUuid(userId)) throw new Error('Invalid user')
   const f = String(front ?? '').trim()
   if (!/^data:image\//i.test(f) && !/^https?:\/\//i.test(f)) {
@@ -2570,19 +2621,38 @@ export async function submitVerificationImages(args: {
           SET image_data = $2, back_image_data = $3,
               id_number = COALESCE($4, id_number),
               full_name = COALESCE($5, full_name),
+              doc_type = COALESCE($6, doc_type),
               source = 'manual', status = 'pending',
               submitted_at = now(), reviewed_at = NULL, reviewed_by = NULL, notes = NULL
         WHERE id = $1`,
-      [existing.rows[0].id, f, b, idNumber, fullName]
+      [existing.rows[0].id, f, b, idNumber, fullName, docType]
     )
   } else {
     await pool.query(
-      `INSERT INTO id_verifications (user_id, image_data, back_image_data, id_number, full_name, source, status)
-       VALUES ($1, $2, $3, $4, $5, 'manual', 'pending')`,
-      [userId, f, b, idNumber, fullName]
+      `INSERT INTO id_verifications (user_id, image_data, back_image_data, id_number, full_name, doc_type, source, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'manual', 'pending')`,
+      [userId, f, b, idNumber, fullName, docType]
     )
   }
+  // A resubmission must clear a previous rejection on the user row, or the gate
+  // would keep reporting 'rejected' while a fresh submission sits in the queue.
+  await pool.query(
+    `UPDATE users SET verification_status = 'pending', verified_at = NULL
+      WHERE id = $1 AND COALESCE(verification_status, 'unverified') <> 'verified'`,
+    [userId]
+  )
   return { status: 'pending', verified_at: null }
+}
+
+/** The reviewer's note on the user's latest ID submission, or null.
+ *  Only meaningful on a rejection, where it is the reason written for the host. */
+export async function getVerificationNote(userId: string): Promise<string | null> {
+  if (!isUuid(userId)) return null
+  const { rows } = await pool.query(
+    `SELECT notes FROM id_verifications WHERE user_id = $1 ORDER BY submitted_at DESC LIMIT 1`,
+    [userId]
+  )
+  return (rows[0]?.notes as string | null) ?? null
 }
 
 /** The signed-in user's verification status, read from the latest

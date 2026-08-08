@@ -34,6 +34,7 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/payment-config` | The Instapay destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload}` |
 | GET  | `/api/local/admin/settings/instapay` | Read the same config for editing. Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/instapay` | Update it — `{instapay_handle?, instapay_link?, instapay_qr_image?, instructions?}`. Each field is optional: omit to leave untouched, send `""` to clear. `400` on an invalid link or QR |
+| GET  | `/api/local/host/listing-gate` | May this host add a listing — `{allowed, code, message, reason}`. Same `code` the create route returns on 403, so the apps can refuse up front. `reason` only on a rejection |
 | GET  | `/api/local/host/commission` | The platform commission — `{rate, percent}` — so the add/edit-listing screens can show a host what guests will pay. Auth required (a guest holding the rate could divide out the host's raw price) |
 | GET  | `/api/local/admin/settings/commission` | The platform commission — `{rate, percent, updated_at, updated_by}`. Staff session with the `pricing` module |
 | PUT  | `/api/local/admin/settings/commission` | Set it — `{percent}` (e.g. `12.5`). `400` outside 0–100. Reprices every listing and service immediately; existing bookings keep their snapshotted rate |
@@ -43,6 +44,40 @@ preflight (`OPTIONS` → `204`) so browsers can call the API cross-origin.
 
 Auth is stateless: an HMAC-signed token returned on login/signup, sent back either as a
 `Bearer` header (mobile) or the `qk_token` cookie (web).
+
+### Host identity verification
+
+A host must be **both** an approved host (`users.is_host`, or the legacy `users.role='host'`)
+**and** identity-verified (`users.verification_status`) before they can create or publish a
+listing. `canPublishListing()` in `src/lib/local/host-verification-core.ts` is the single
+place those two facts are combined; every refusal carries a `code`
+(`not_host` | `verification_missing` | `verification_pending` | `verification_rejected`)
+that web, iOS and Android switch on to pick a call to action. Clients must never parse the
+message — the wording is server-owned so all three say the same thing.
+
+The gate bites in three places:
+
+| Where | What happens |
+| --- | --- |
+| `POST /api/local/listings` | 403 `{error, code}` — on **both** projects. The web route previously required only a session, so any signed-in guest could create a listing there |
+| `setListingApproval(id, true)` | Throws rather than publishing an unverified host's listing. A listing can outlive the verification that allowed it, and going live is the moment that matters |
+| `GET /api/local/host/listing-gate` | Advisory — lets the apps and `/host/new` refuse before the host fills in a whole listing |
+
+**Losing verification unpublishes.** `reviewVerification` compares the old status to the new
+one and, when a verified host stops being verified (including re-opening a decided case),
+takes their published listings down, flagged with `listings.unpublished_by_verification` so
+re-verifying restores exactly those. That flag is deliberately **separate** from the account
+block's `unpublished_by_admin`: sharing one would let unblocking an account republish
+listings verification had hidden. The two reasons compose — hidden for both stays hidden
+until both clear.
+
+**Identity is folded into the host application.** The apply form submits the ID documents
+with the application (`doc_type` + front/back/selfie), linked by
+`host_applications.verification_id`, so one admin decision in /ops approves host status
+*and* identity. They used to be two requests, the second fired after the first succeeded —
+so a failed upload left an application on file with no ID attached. The standalone
+`/verify-id` path stays: verification is open to any signed-in user (guests verify for the
+trust badge), and already-approved hosts need it to satisfy the cutover.
 
 ### The platform commission
 
@@ -299,6 +334,7 @@ the list of record. Recent additions:
 | `migrate-resorts.mjs` | `resorts`, `resort_aliases`, `resort_submissions`, `listings.resort_id`/`resort_name` — the curated compound catalog that replaces free-text location as the geographic filter |
 | `migrate-analytics.mjs` | `bookings.cancelled_by`/`cancelled_by_role`/`cancellation_policy`/`commission_rate`/`refunded_at`, the `platform_commission_rate` setting, and the analytics indexes |
 | `migrate-instapay.mjs` | `app_settings`, `payment_proofs`, and the four seeded `instapay_*` setting rows |
+| `migrate-host-verification.mjs` | `id_verifications.doc_type`, `host_applications.verification_id` (links an application to the ID filed with it), `listings.unpublished_by_verification`, and the host verification-status index. Also **reports** how many approved hosts are unverified and how many live listings they hold — read that before deploying, since the gate is a hard cutover |
 | `migrate-commission.mjs` | Makes the platform commission safe on any database: creates `app_settings` if absent, seeds `platform_commission_rate`, adds `bookings.commission_rate` — and backfills it on **every** booking, not just paid ones (`migrate-analytics.mjs` only did the paid ones, which was fine when the column was a reporting field and is not now that guest prices derive from it) |
 | `migrate-activity.mjs` | `user_logins` (the one activity event nothing recorded) plus timestamp indexes on `users`/`listings`/`payment_proofs` and a partial index on open reports — the derived activity feed and alert centre in `/ops` |
 | `migrate-documents-audit.mjs` | The `staff_audit_log (target_type, target_id)` index, a partial index on `users.verification_status`, the `documents` module grant for existing `verifications`/`listings` moderators, and the backfill of `users.verification_status` from `id_verifications` — the source of truth behind the verified badge |

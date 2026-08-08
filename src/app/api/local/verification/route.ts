@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/local/auth'
 import { submitVerificationImages, getVerificationStatusFromTable } from '@/lib/local/db'
+import { normalizeDocType } from '@/lib/local/host-verification-core'
 
 // Identity verification for the signed-in user. Writes to the shared
 // id_verifications TABLE so the web /ops admin can see mobile submissions.
@@ -58,10 +59,18 @@ export async function POST(req: Request) {
 
     const idNumber = typeof b.id_number === 'string' && b.id_number.trim() ? b.id_number.trim() : null
     const fullName = typeof b.full_name === 'string' && b.full_name.trim() ? b.full_name.trim() : null
+    // Required going forward — the reviewer checks the photo against the declared
+    // document. Older app builds omit it, so an absent value is accepted rather
+    // than 400-ing a client that cannot know to send it.
+    const docType = b.doc_type === undefined && b.docType === undefined
+      ? null
+      : normalizeDocType(b.doc_type ?? b.docType)
 
-    const state = await submitVerificationImages({ userId: user.id, front, back, idNumber, fullName })
+    const state = await submitVerificationImages({ userId: user.id, front, back, idNumber, fullName, docType })
     return NextResponse.json(state, { status: 201, headers: CORS })
   } catch (err) {
+    // Everything here is host-fixable input (a missing photo, an unknown document
+    // type), so it is all 400 — including HostVerificationError from normalizeDocType.
     const msg = err instanceof Error ? err.message : 'Failed to submit verification'
     return NextResponse.json({ error: msg }, { status: 400, headers: CORS })
   }

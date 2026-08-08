@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
-import { getListings, createListing } from '@/lib/local/db'
+import { getListings, createListing, getListingGateState } from '@/lib/local/db'
 import { getUserFromRequest } from '@/lib/local/auth'
+import { canPublishListing } from '@/lib/local/host-verification-core'
 
 // Local-only API (no Supabase).
 //   GET  /api/local/listings → JSON array (search: ?location=&guests=&checkIn=&checkOut=)
@@ -62,13 +63,22 @@ export async function GET(req: Request) {
   }
 }
 
-// A host creates a listing. Requires a signed-in user with role 'host' (or 'admin').
+// A host creates a listing. Requires an approved host whose identity an admin has
+// verified — see host-verification-core.ts. The refusal carries a `code` so the
+// apps can show the right next step ("verify now" vs "we're reviewing it" vs
+// "here's why it was rejected") instead of parsing the message.
 export async function POST(req: Request) {
   try {
     const user = await getUserFromRequest(req)
     if (!user) return NextResponse.json({ error: 'Please sign in' }, { status: 401, headers: CORS })
-    if (user.role !== 'host' && user.role !== 'admin') {
-      return NextResponse.json({ error: 'Only hosts can add a listing. Register as a host first.' }, { status: 403, headers: CORS })
+    // The hardcoded admin token has no DB row, so it can't be looked up; treat it
+    // as staff and let it through, as it is elsewhere.
+    const gate =
+      user.role === 'admin'
+        ? canPublishListing({ isHost: true, verificationStatus: 'verified', isStaff: true })
+        : canPublishListing(await getListingGateState(user.id))
+    if (!gate.allowed) {
+      return NextResponse.json({ error: gate.message, code: gate.code }, { status: 403, headers: CORS })
     }
     const b = await req.json()
     const listing = await createListing(user.id, {
