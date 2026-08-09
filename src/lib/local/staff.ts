@@ -62,6 +62,8 @@ export const STAFF_MODULES = [
   { key: 'payments', label: 'Payments & disputes', description: 'Instapay proofs, disputes, handle' },
   { key: 'promos', label: 'Promo codes', description: 'Discount codes and limits' },
   { key: 'reports', label: 'Reports', description: 'User-filed abuse reports' },
+  { key: 'moderation', label: 'Moderation', description: 'Users caught sharing contact details, warnings and suspensions' },
+  { key: 'disputes', label: 'Guest disputes', description: 'Issues guests raise about a stay — investigate and resolve' },
   { key: 'notify', label: 'Broadcasts', description: 'Send push and email to segments' },
   { key: 'analytics', label: 'Analytics', description: 'Booking, revenue and cancellation reports' },
   { key: 'resorts', label: 'Resorts', description: 'Compound catalog and pending submissions' },

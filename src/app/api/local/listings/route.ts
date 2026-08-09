@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { getListings, createListing, getListingGateState } from '@/lib/local/db'
 import { getUserFromRequest } from '@/lib/local/auth'
 import { canPublishListing } from '@/lib/local/host-verification-core'
+import { isContactBlockedError } from '@/lib/local/contentguard'
 
 // Local-only API (no Supabase).
 //   GET  /api/local/listings → JSON array (search: ?location=&guests=&checkIn=&checkOut=)
@@ -110,7 +111,7 @@ export async function POST(req: Request) {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('POST /api/local/listings failed:', msg)
-    const status = /required|positive|Invalid/i.test(msg) ? 400 : 500
+    const status = isContactBlockedError(err) || /required|positive|Invalid/i.test(msg) ? 400 : 500
     return NextResponse.json({ error: msg }, { status, headers: CORS })
   }
 }

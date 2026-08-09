@@ -225,7 +225,7 @@ npm run test:watch
 | --- | --- | --- |
 | `test/unit/*.test.mjs` | **Unit tests.** Offline, assertion-based, what `npm test` runs. | Yes |
 | `test/*.mjs` | **Live-HTTP smoke scripts that hit PRODUCTION** and write real rows. | **No** — run deliberately |
-| `scripts/_guardtest.mjs` | The original offline guard (phone-number content filter). Included in `npm test`. | Yes |
+| `scripts/_guardtest.mjs` | The original offline guard script (phone numbers only). Superseded by `test/unit/contentguard.test.mjs`; kept because it still passes and costs nothing. | Yes |
 | `scripts/check-*-parity.mjs` | Fail if a file duplicated across both repos has drifted. | Yes |
 
 The scripts name `test/unit/*.test.mjs` explicitly rather than passing a directory —
@@ -242,8 +242,9 @@ imported by a test at all**. The rule that works around it:
 > imports the core — never the reverse. A test then imports the core directly, with
 > an explicit `.ts` extension.
 
-`src/lib/local/resort-core.ts`, `payment-config-core.ts`, `contentguard.ts` and
-`account-status-core.ts` are the working examples.
+`src/lib/local/resort-core.ts`, `payment-config-core.ts`, `contentguard.ts`,
+`moderation-core.ts`, `disputes-core.ts` and `account-status-core.ts` are the
+working examples.
 
 `account-status-core.ts` is the one core that is **not** parity-guarded, on purpose.
 It is a deliberately smaller sibling of the web project's `user-admin-core.ts`: only
@@ -261,6 +262,156 @@ verification query plus the smoke scripts.
 > **There is no CI.** No `.github/`, no `vercel.json` here — Vercel only runs
 > `next build`, so a failing test cannot block a deploy. `npm run check` is a
 > **manual gate**. Wiring it into a GitHub Action is the obvious next step.
+
+## Contact details are blocked, everywhere a user can type
+
+QuickIn earns on the booking, so a host and a guest agreeing to settle off-platform
+costs the platform the reservation *and* removes the guest's protection. The counter
+is `src/lib/local/contentguard.ts`: one module, enforced server-side on every path
+that stores free text.
+
+**What it blocks** — phone numbers, email addresses, social/messaging handles, and
+links to other sites. It never lifts: there is no "after the booking is confirmed"
+exemption, so check-in details belong in the stay guide, not in chat.
+
+**Where it runs**
+
+| Surface | Enforced in |
+| --- | --- |
+| Booking chat (`POST /api/local/bookings/:id/messages`) | `createMessage` (db.ts) |
+| Pre-booking chat (`POST /api/local/chat`) | `postChatMessage` (db.ts) |
+| Reviews (`POST /api/local/reviews`) | `createReview` (reviews.ts) |
+| Listing title + description (`POST/PATCH /api/local/listings`) | `createListing`, `updateListingDetails` (db.ts) |
+| Profile name + bio (`PATCH /api/local/profile`) | `updateProfile` (auth.ts) |
+
+`users.phone` is deliberately **exempt** — it is the user's own number and is only
+ever returned to themselves, never on a listing or a booking.
+
+**How it resists evasion.** Every detector runs after one shared `fold()` pass:
+NFKD (which flattens fullwidth `０１０`, enclosed `⓪①`, and presentation forms),
+combining marks dropped (Arabic harakat, the keycap on `0️⃣`), invisible characters
+dropped (zero-width space, soft hyphen, RTL marks), Cyrillic/Greek lookalikes mapped
+to Latin, and Arabic-Indic digits converted. On top of that the phone detector
+handles spelled-out numbers in English *and* Arabic, "double five", leet (`0l0`),
+and — when the sender has stated intent ("my number is…") — an all-letter number
+like `OIO IZ34S67`. Addresses survive `at`/`dot` spelling and bracketing; links are
+matched against an explicit TLD list, so "arrive at 5 p.m." is not a domain.
+
+**Split across messages.** `combinesIntoContact` stitches the sender's last 16
+messages in the thread, so `010` / `1234567` / `8` is caught, as is `kareem@gmail`
+followed by `.com`. Ordinary chat never accumulates: a message only counts as a
+fragment if it is nearly all digits, and the sentence path additionally requires
+contact intent in the window.
+
+**Allowed through.** QuickIn's own links and a Google/OpenStreetMap map pin — the
+guard is about leaving the platform, not about links as such. Extend `ALLOWED_HOSTS`
+if that list needs to grow.
+
+**Errors.** `assertNoContactInfo` throws a `ContactBlockedError`; routes detect it
+with `isContactBlockedError` and answer **400** with `err.message` verbatim, which is
+the sentence the user sees. The iOS and Android clients already surface that text
+inline and keep the typed draft.
+
+**Two copies, one policy.** The web project enforces the same module against the same
+Neon rows, so `contentguard.ts` is duplicated byte-for-byte and guarded by
+`scripts/check-contentguard-parity.mjs` (part of `npm run check`). If the copies
+drifted, the weaker one would become the way around the policy for everyone. Edit one,
+copy it over the other verbatim, and add cases to `test/unit/contentguard.test.mjs` —
+the false-positive half of that file matters as much as the block half.
+
+## Every blocked attempt is recorded
+
+The guard refusing a message left no trace, so someone could try forty times and
+nobody would know — and a novel obfuscation that got through was invisible by
+definition. `src/lib/local/moderation.ts` is what remembers.
+
+**One row per blocked attempt** in `policy_violations`: who, which category, which
+surface, **the full text they typed**, and whether it was only caught by stitching
+their recent messages together (`split` — drip-feeding a number over four messages is
+not something anyone does by accident). Every guarded write path goes through
+`guardContent` / `guardSplitContent` rather than a bare `assertNoContactInfo`, so no
+surface can block something silently.
+
+Storing the text is deliberate: a count alone can't tell a determined evader from
+someone whose booking reference tripped the guard, and that difference is the whole
+decision a moderator makes. It sits behind the `moderation` staff module and reading
+it writes a `moderation_viewed` row to `staff_audit_log`.
+
+**Recording is best-effort; blocking is not.** If the insert fails — the migration
+hasn't run, the table is briefly unavailable — the user is still refused. A logging
+fault must never become a way past the guard. Same reasoning inverted for the gate
+below: if `policy_warnings` can't be read, chat keeps working.
+
+**The warning gate.** A moderator can issue a warning, and until the user
+acknowledges it every chat send answers **409** with
+`{ error, policyWarning: { id, message } }`. Enforced server-side precisely so an app
+build that predates the acknowledge dialog cannot ignore it — and `error` repeats the
+warning text so such a build still *shows* it rather than a dead end.
+
+|  |  |
+| --- | --- |
+| `GET /api/local/policy-warning` | `{ warning: { id, message } \| null }` |
+| `POST /api/local/policy-warning` | `{ id }` → acknowledged; chat reopens |
+
+Nothing else notifies the user — no email, no push, by design — so the dialog is the
+delivery as well as the gate. The clients keep the typed draft, so acknowledging
+reopens the composer with the message still in it.
+
+**The console is in the web project** (`/ops` → Moderation, `moderation` module). This
+project has no console to serve; what lives here is the recording and the gate, which
+must exist on both because the mobile apps only ever talk to this one.
+
+## Guest disputes
+
+A guest raising an issue about a stay — before, during or after — routed to /ops
+for investigation. `src/lib/local/disputes.ts` owns filing and reading-your-own;
+the console lives in the web project.
+
+**Three separate things, deliberately.** This is none of the two that already
+existed, and conflating them would have broken both:
+
+| | What it is | Where |
+| --- | --- | --- |
+| `payment_proofs.status='disputed'` | "The host rejected my proof and I did pay" — one payment proof's lifecycle | /ops → Payments |
+| `reports` | Abuse about a listing, user or review. No booking target, no attachments, three states | /ops → Reports |
+| `disputes` | The stay itself: not as described, couldn't get in, host never replied | /ops → Guest disputes |
+
+**Not `/bookings/:id/dispute`** — that path is the payment dispute. Two features
+on one path would be a trap for whoever reads it next.
+
+|  |  |
+| --- | --- |
+| `GET /api/local/disputes` | `{ disputes, categories }` — the guest's own, plus the category list so no client hardcodes it |
+| `GET /api/local/disputes?id=…` | `{ dispute, events }` — one, with its full history |
+| `GET /api/local/disputes?eligible=1` | `{ eligible[], existing{} }` — which bookings can be disputed, and which already are |
+| `POST /api/local/disputes` | `{ bookingId, category, description, photos? }` → 201 |
+
+**Eligible bookings are `confirmed` or `completed`.** Confirmed covers before and
+during the stay, completed covers after. `pending` is out (nothing agreed yet —
+that's a question for the host, in chat) and so are `cancelled`/`rejected` (no
+stay happened; a refund goes through the refund path). The rule is
+`canDisputeBooking` in disputes-core, and the clients ask the server rather than
+carrying a second copy of it.
+
+**All history is stored** in `dispute_events`: one row when it is filed, one for
+every status change, each with the actor and an optional note. Nothing is
+overwritten, so "who moved this to Resolved, when, and why" always has an answer.
+`closed` is terminal — a resolved dispute can be reopened, a closed one cannot,
+which is what makes the queue trustworthy.
+
+**Photos** are base64 data-URLs inline in Postgres, the same convention as
+`payment_proofs.image_data`, capped at 6 × ~3.5MB. Every client downscales before
+upload; an unmodified phone photo is several MB of base64 and dies against the
+request-body limit with no usable error.
+
+**Deliberately NOT content-guarded.** Every other free-text surface runs through
+contentguard, but a dispute is addressed to QuickIn staff rather than to the other
+party, and it routinely needs to quote contact details as *evidence* ("the host
+told me to pay him directly on 010…"). Guarding it would suppress exactly what an
+investigator needs.
+
+**The host is not shown the dispute.** It goes to QuickIn, and the copy on every
+client says so.
 
 ## Admin actions are audited
 
@@ -353,6 +504,8 @@ the list of record. Recent additions:
 | `migrate-activity.mjs` | `user_logins` (the one activity event nothing recorded) plus timestamp indexes on `users`/`listings`/`payment_proofs` and a partial index on open reports — the derived activity feed and alert centre in `/ops` |
 | `migrate-documents-audit.mjs` | The `staff_audit_log (target_type, target_id)` index, a partial index on `users.verification_status`, the `documents` module grant for existing `verifications`/`listings` moderators, and the backfill of `users.verification_status` from `id_verifications` — the source of truth behind the verified badge |
 | `migrate-account-status.mjs` | `users.account_status`/`status_reason`/`status_changed_at`/`status_changed_by`, `listings.unpublished_by_admin`, and the user search indexes — the block / remove lifecycle behind `/ops` → Users |
+| `migrate-policy-violations.mjs` | `policy_violations` (every blocked contact-sharing attempt, with the text) and `policy_warnings` (a warning the user must acknowledge before chatting again) — the record behind `/ops` → Moderation. Purely additive, so it is safe to apply well ahead of the deploy |
+| `migrate-disputes.mjs` | `disputes` (a guest's issue with a stay: category, description, photos, four-state status, resolution) and `dispute_events` (the filing plus every status change, with actor and note) — behind `/ops` → Guest disputes. Additive |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The
 reverse gap is safe — the columns are additive and unread until the deploy lands.

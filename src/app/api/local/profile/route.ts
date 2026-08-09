@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getUserFromRequest, getFullProfile, updateProfile } from '@/lib/local/auth'
+import { isContactBlockedError } from '@/lib/local/contentguard'
 
 // Profile of the signed-in user.
 //   GET   /api/local/profile           → { id, email, full_name, role, age, id_document, phone, … }
@@ -59,6 +60,11 @@ export async function PATCH(req: Request) {
     })
     return NextResponse.json(updated, { headers: CORS })
   } catch (err) {
+    // A name or bio carrying contact details is the user's input to fix, so it
+    // answers 400 with the guard's wording rather than a generic failure.
+    if (isContactBlockedError(err)) {
+      return NextResponse.json({ error: (err as Error).message }, { status: 400, headers: CORS })
+    }
     return NextResponse.json({ error: 'Failed to update profile', detail: String(err) }, { status: 500, headers: CORS })
   }
 }

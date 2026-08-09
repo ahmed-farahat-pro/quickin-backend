@@ -100,7 +100,7 @@ export async function listPromos(): Promise<PromoCode[]> {
   const { rows } = await pool.query(
     `SELECT id, code, kind, value::float8 AS value, max_redemptions, times_redeemed, active,
             to_char(expires_at, 'YYYY-MM-DD') AS expires_at, to_char(created_at, 'YYYY-MM-DD') AS created_at
-       FROM promo_codes ORDER BY created_at DESC`
+       FROM promo_codes ORDER BY promo_codes.created_at DESC`
   )
   return rows as PromoCode[]
 }

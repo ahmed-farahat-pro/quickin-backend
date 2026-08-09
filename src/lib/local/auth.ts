@@ -2,6 +2,7 @@ import { scryptSync, randomBytes, timingSafeEqual, createHmac, randomInt } from 
 import { NextResponse } from 'next/server'
 import { pool } from './pool'
 import { blockedLoginBody, BLOCKED_STATUS_CODE, isActiveStatus } from './account-status-core'
+import { guardContent } from './moderation'
 
 // Local auth — no Supabase. Postgres via node-postgres (Vercel/Neon-ready),
 // password hashing via node:crypto (scrypt), stateless HMAC-signed tokens.
@@ -236,6 +237,11 @@ export async function updateProfile(
     country?: string | null
   }
 ): Promise<Profile | null> {
+  // Name and bio are shown to the other party in every thread, so they're a way
+  // to publish a number without ever typing it into chat. `phone` is exempt on
+  // purpose: it is the user's own number, only ever returned to themselves.
+  if (fields.fullName != null) await guardContent(id, fields.fullName, 'profile')
+  if (fields.bio != null) await guardContent(id, fields.bio, 'profile')
   await pool.query(
     `UPDATE users SET
         full_name   = COALESCE($2, full_name),

@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server'
 import { getBookingById, getBookingMessages, createMessage } from '@/lib/local/db'
 import { getUserFromRequest } from '@/lib/local/auth'
+import { pendingWarningFor } from '@/lib/local/moderation'
+import { warningGateBody, WARNING_GATE_STATUS } from '@/lib/local/moderation-core'
 
 // Per-booking chat between the guest and the listing's host.
 //   GET  /api/local/bookings/:id/messages           → the thread
@@ -54,6 +56,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const body = await req.json().catch(() => ({}))
     const text = String(body.body ?? body.message ?? '').trim()
     if (!text) return NextResponse.json({ error: 'Message cannot be empty' }, { status: 400, headers: CORS })
+    // The acknowledge gate — same rule as the pre-booking thread. See moderation-core.
+    const warning = await pendingWarningFor(a.user!.id)
+    if (warning) {
+      return NextResponse.json(warningGateBody(warning), { status: WARNING_GATE_STATUS, headers: CORS })
+    }
     const message = await createMessage(id, a.user!.id, text)
     return NextResponse.json(message, { status: 201, headers: CORS })
   } catch (err) {

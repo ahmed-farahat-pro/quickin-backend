@@ -1,6 +1,7 @@
 import { pool } from './pool'
 import { createNotification } from './notifications'
 import { sendPush } from './push'
+import { guardContent } from './moderation'
 
 // Reviews & star ratings. A guest may review a stay only AFTER it's done
 // (booking confirmed + check-out date passed), one review per booking. Ratings
@@ -46,6 +47,9 @@ export async function createReview(args: {
   const photos = sanitizePhotos(args.photos)
   if (!isUuid(userId) || !isUuid(bookingId)) throw new Error('Invalid request')
   if (!(rating >= 1 && rating <= 5)) throw new Error('Rating must be between 1 and 5 stars')
+  // A review is public and permanent, so it's the most attractive place to park
+  // a phone number. Same guard as chat.
+  await guardContent(userId, args.comment ?? '', 'review', { type: 'booking', id: bookingId })
 
   const { rows } = await pool.query(
     `SELECT id, listing_id, user_id, status, check_out FROM bookings WHERE id = $1`,

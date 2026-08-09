@@ -5,7 +5,8 @@ import { randomInt } from 'node:crypto'
 import { createNotification } from './notifications'
 import { sendNotificationEmail } from './mailer'
 import { sendPush } from './push'
-import { containsPhoneNumber, combinesIntoPhoneNumber, PHONE_BLOCK_MESSAGE } from './contentguard'
+import { isContactBlockedError } from './contentguard'
+import { guardContent, guardSplitContent } from './moderation'
 import { INSTAPAY_KEYS, rowsToPaymentConfig } from './payment-config-core'
 import type { PaymentConfig } from './payment-config-core'
 import {
@@ -1107,8 +1108,10 @@ export class ListingInputError extends Error {
 }
 
 /** Was this thrown by one of the listing validators above? (`name` is checked too
- *  so it still works if the module is instantiated twice in a bundle.) */
+ *  so it still works if the module is instantiated twice in a bundle.) A blocked
+ *  contact detail counts: it is the host's input to fix, not a server fault. */
 export function isListingInputError(err: unknown): boolean {
+  if (isContactBlockedError(err)) return true
   return err instanceof ListingInputError || (err instanceof Error && err.name === 'ListingInputError')
 }
 
@@ -1236,8 +1239,18 @@ export async function updateListingDetails(
   }
 
   // --- Moderation-relevant fields ---
-  if (patch.title !== undefined) put('title', assertText(patch.title, 'Title').slice(0, 200))
-  if (patch.description !== undefined) put('description', assertText(patch.description, 'Description').slice(0, 5000))
+  // Guarded on edit as well as on create — otherwise a clean listing could be
+  // published and then quietly edited to carry a number.
+  if (patch.title !== undefined) {
+    const title = assertText(patch.title, 'Title').slice(0, 200)
+    await guardContent(hostUserId, title, 'listing', { type: 'listing', id: listingId })
+    put('title', title)
+  }
+  if (patch.description !== undefined) {
+    const description = assertText(patch.description, 'Description').slice(0, 5000)
+    await guardContent(hostUserId, description, 'listing', { type: 'listing', id: listingId })
+    put('description', description)
+  }
   if (patch.location !== undefined) put('location', assertText(patch.location, 'Location').slice(0, 200))
   if (patch.country !== undefined) put('country', String(patch.country ?? '').trim().slice(0, 100) || null)
   // Resort is THREE columns (resort_id, resort_name, region) driven by one logical
@@ -1854,6 +1867,10 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   if (!input.title || !input.title.trim()) throw new Error('Title is required')
   const price = Number(input.pricePerNight)
   if (!Number.isFinite(price) || price <= 0) throw new Error('Price must be a positive number')
+  // A number in the listing copy reaches every guest at once, so the same guard
+  // the chat runs applies to the fields a host writes freely.
+  await guardContent(hostUserId, input.title, 'listing')
+  await guardContent(hostUserId, input.description ?? '', 'listing')
 
   // New listings enter the moderation queue: unpublished + 'pending' until an
   // admin approves them (S7). Ownership doc (if provided) is stored for review.
@@ -2194,7 +2211,7 @@ export async function getBookingProof(
     `SELECT image_data, method, status,
             to_char(submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS submitted_at,
             reject_reason, dispute_note, amount::float8 AS amount
-       FROM payment_proofs WHERE booking_id = $1 ORDER BY submitted_at DESC LIMIT 1`,
+       FROM payment_proofs WHERE booking_id = $1 ORDER BY payment_proofs.submitted_at DESC LIMIT 1`,
     [bookingId]
   )
   return (rows[0] as PaymentProof) ?? null
@@ -2702,22 +2719,23 @@ export async function getBookingMessages(bookingId: string): Promise<Message[]> 
   return rows as Message[]
 }
 
-/** Post a message to a booking thread. Phone numbers are blocked by any trick
- *  (see contentguard) — including splitting a number across several messages. */
+/** Post a message to a booking thread. Phone numbers, email addresses, social
+ *  handles and off-platform links are blocked by any trick (see contentguard) —
+ *  including splitting one across several messages. */
 export async function createMessage(bookingId: string, senderId: string, body: string): Promise<Message> {
   if (!isUuid(bookingId) || !isUuid(senderId)) throw new Error('Invalid id')
   const text = String(body || '').trim().slice(0, 2000)
   if (!text) throw new Error('Message cannot be empty')
 
-  // Block phone numbers — this single message, or completing one split across the
+  // Block contact details — in this single message, or completed across the
   // sender's recent messages in this thread.
-  if (containsPhoneNumber(text)) throw new Error(PHONE_BLOCK_MESSAGE)
+  await guardContent(senderId, text, 'chat', { type: 'booking', id: bookingId })
   const recent = await pool.query(
     `SELECT body FROM messages WHERE booking_id = $1 AND sender_id = $2 ORDER BY created_at DESC LIMIT 16`,
     [bookingId, senderId]
   )
   const priorBodies = recent.rows.map((r) => String(r.body || '')).reverse()
-  if (combinesIntoPhoneNumber(priorBodies, text)) throw new Error(PHONE_BLOCK_MESSAGE)
+  await guardSplitContent(senderId, priorBodies, text, 'chat', { type: 'booking', id: bookingId })
 
   const { rows } = await pool.query(
     `WITH ins AS (
@@ -2849,20 +2867,28 @@ export async function listChatMessages(userId: string, conversationId: string): 
   if (!convo) throw new Error('Conversation not found')
   const { rows } = await pool.query(
     `SELECT id, sender_id, body, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
-       FROM chat_messages WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT 500`,
+       FROM chat_messages WHERE conversation_id = $1 ORDER BY chat_messages.created_at ASC LIMIT 500`,
     [conversationId]
   )
   return (rows as ChatThreadMessage[]).map((m) => ({ ...m, mine: m.sender_id === userId }))
 }
 
-/** Post a message. Phone numbers are blocked (contentguard). Notifies the other party. */
+/** Post a message. Contact details are blocked (contentguard), including ones
+ *  split across the sender's recent messages. Notifies the other party. */
 export async function postChatMessage(userId: string, conversationId: string, rawBody: string): Promise<ChatThreadMessage> {
   if (!isUuid(userId) || !isUuid(conversationId)) throw new Error('Invalid id')
   const body = String(rawBody || '').trim().slice(0, 2000)
   if (!body) throw new Error('Message is empty')
-  if (containsPhoneNumber(body)) throw new Error(PHONE_BLOCK_MESSAGE)
+  await guardContent(userId, body, 'chat', { type: 'conversation', id: conversationId })
   const convo = await conversationForUser(userId, conversationId)
   if (!convo) throw new Error('Conversation not found')
+  // Pre-booking is where a host is most tempted to hand over a number, so the
+  // same drip-feed check the booking thread runs applies here too.
+  const recent = await pool.query(
+    `SELECT body FROM chat_messages WHERE conversation_id = $1 AND sender_id = $2 ORDER BY created_at DESC LIMIT 16`,
+    [conversationId, userId]
+  )
+  await guardSplitContent(userId, recent.rows.map((r) => String(r.body || '')).reverse(), body, 'chat', { type: 'conversation', id: conversationId })
   const { rows } = await pool.query(
     `WITH ins AS (
        INSERT INTO chat_messages (conversation_id, sender_id, body) VALUES ($1, $2, $3) RETURNING *
