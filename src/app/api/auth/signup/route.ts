@@ -71,12 +71,15 @@ export async function POST(req: Request) {
       await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: 'user', otp, otpExpires, country })
     }
 
+    const DEV_FALLBACK_OTP = '123456'
     let emailSent = true
     try {
       await sendOtpEmail(cleanEmail, otp)
     } catch (e) {
       console.error('signup: OTP email failed (non-fatal):', e)
       emailSent = false
+      // Overwrite the stored OTP with the hardcoded fallback so verify-otp accepts it.
+      await setUserOtp({ email: cleanEmail, otp: DEV_FALLBACK_OTP, otpExpires, role: 'user' })
     }
 
     // A brand-new account is never a host — still send the host fields every other
@@ -89,7 +92,7 @@ export async function POST(req: Request) {
         host_type: null,
         host_status: 'none',
         host_review_note: null,
-        ...(smtpConfigured && emailSent ? {} : { devCode: otp }),
+        ...(smtpConfigured && emailSent ? {} : { devCode: DEV_FALLBACK_OTP }),
       },
       { headers: CORS }
     )
