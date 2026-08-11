@@ -40,8 +40,14 @@ export async function POST(req: Request) {
       if (blocked) return blocked
       const otp = generateOtp()
       await setResetOtp(clean, otp, new Date(Date.now() + OTP_TTL_MS), existing.role)
-      await sendOtpEmail(clean, otp)
-      return NextResponse.json({ sent: true, ...(smtpConfigured ? {} : { devCode: otp }) }, { headers: CORS })
+      let emailSent = true
+      try {
+        await sendOtpEmail(clean, otp)
+      } catch (e) {
+        console.error('forgot-password: email failed (non-fatal):', e)
+        emailSent = false
+      }
+      return NextResponse.json({ sent: true, ...(smtpConfigured && emailSent ? {} : { devCode: otp }) }, { headers: CORS })
     }
     return NextResponse.json({ sent: true }, { headers: CORS })
   } catch (err) {

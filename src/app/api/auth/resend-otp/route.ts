@@ -46,8 +46,14 @@ export async function POST(req: Request) {
     const otp = generateOtp()
     const otpExpires = new Date(Date.now() + OTP_TTL_MS)
     await setUserOtp({ email: cleanEmail, otp, otpExpires, role: existing.role })
-    await sendOtpEmail(cleanEmail, otp)
-    return NextResponse.json({ pending: true, email: cleanEmail, ...(smtpConfigured ? {} : { devCode: otp }) }, { headers: CORS })
+    let emailSent = true
+    try {
+      await sendOtpEmail(cleanEmail, otp)
+    } catch (e) {
+      console.error('resend-otp: email failed (non-fatal):', e)
+      emailSent = false
+    }
+    return NextResponse.json({ pending: true, email: cleanEmail, ...(smtpConfigured && emailSent ? {} : { devCode: otp }) }, { headers: CORS })
   } catch (err) {
     console.error('resend-otp failed:', err)
     return NextResponse.json({ error: 'Could not resend code', detail: String(err) }, { status: 500, headers: CORS })

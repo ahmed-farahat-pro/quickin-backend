@@ -71,7 +71,13 @@ export async function POST(req: Request) {
       await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: 'user', otp, otpExpires, country })
     }
 
-    await sendOtpEmail(cleanEmail, otp)
+    let emailSent = true
+    try {
+      await sendOtpEmail(cleanEmail, otp)
+    } catch (e) {
+      console.error('signup: OTP email failed (non-fatal):', e)
+      emailSent = false
+    }
 
     // A brand-new account is never a host — still send the host fields every other
     // auth response carries so clients can hydrate from any of them.
@@ -83,7 +89,7 @@ export async function POST(req: Request) {
         host_type: null,
         host_status: 'none',
         host_review_note: null,
-        ...(smtpConfigured ? {} : { devCode: otp }),
+        ...(smtpConfigured && emailSent ? {} : { devCode: otp }),
       },
       { headers: CORS }
     )
