@@ -74,6 +74,15 @@ describe('phone numbers — blocked', () => {
     ['contact app + number', 'واتساب ٠١٠١٢٣٤٥٦٧٨'],
     ['spaced single digits', 'call me on 0 1 0 1 2 3 4 5 6 7 8'],
     ['landline', 'tel: 0233334444'],
+    // Letters wedged between the groups. No run reaches 8 and every separator is
+    // a letter, so only the digit-only reduction sees these.
+    ['letter-prefixed groups', 'A0101 S416 M3280'],
+    ['letter-separated', '0101x416x3280'],
+    ['letters, no spaces', 'a0101s416m3280'],
+    ['letters + single digits', 'Call K0 1 0 M1 2 3 A4 5 6 7 8'],
+    ['letters, in a bio', 'Villa owner. A0101 S416 M3280. Sea view.'],
+    ['letters + Arabic-Indic', 'x٠١٠y١٢٣z٤٥٦٧٨'],
+    ['letters + intent, landline', 'my number is x02 y3333 z4444'],
   ]
   for (const [label, text] of cases) {
     test(label, () => assert.ok(containsPhoneNumber(text), `should block: ${text}`))
@@ -155,6 +164,15 @@ describe('ordinary chat — allowed', () => {
     'الاجمالي 15000 جنيه لمدة 5 ليالي',
     'احنا عائلة من 4 افراد هنوصل يوم 20',
     'الشقة في الدور الخامس عمارة 12',
+    // Number-dense profile bios. These are the cost of reducing a whole field to
+    // its digits: every number in the text ends up adjacent to the next one, so
+    // the shape being matched has to stay narrow enough not to find a phone in
+    // an honest listing.
+    'Host since 2018. 3 properties, 45 reviews, 4.9 average rating.',
+    'Sleeps 10, 1 bedroom, 5 min to the beach, 3 pools, 2 floors, 8 km from town',
+    'Built 2003, 12 rooms, 3 pools, 45 guests, 6 baths, 2 kitchens',
+    'Check-in 2pm, checkout 11am. 3 nights minimum, 15% off for 7+ nights.',
+    'مضيف منذ 2018، 3 شقق، 45 تقييم، 5 نجوم',
   ]
   for (const text of cases) {
     test(JSON.stringify(text).slice(0, 56), () => {

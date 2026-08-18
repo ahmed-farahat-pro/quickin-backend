@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/local/auth'
 import { getHostState, submitHostApplication, HOST_TYPES, type HostType } from '@/lib/local/db'
+import { checkName, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
+import { normalizePhone } from '@/lib/local/phone-core'
 
 // POST /api/local/host/apply — submit (or re-submit after a rejection) a host
 // application for admin review. It NEVER grants hosting: only an admin approval in
@@ -32,9 +34,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
     }
     const b = await req.json().catch(() => ({}))
-    const fullName = str(b.full_name ?? b.fullName)
+    // Collapses whitespace and drops invisibles as well as trimming, so what we
+    // store is exactly what the policy judged.
+    const fullName = normalizeName(b.full_name ?? b.fullName)
     const nationalId = str(b.national_id ?? b.nationalId)
-    const phone = str(b.phone)
+    const rawPhone = str(b.phone)
+    // Canonical form, or null when it isn't a phone number. Stored normalized so
+    // the same mobile sent as `+20 10…` by one client and `010…` by another is
+    // one applicant in /ops, and reaches the web's rows in the same shape.
+    const phone = normalizePhone(rawPhone)
     const address = str(b.address)
     const hostType = str(b.host_type ?? b.hostType).toLowerCase()
     const company = str(b.company)
@@ -43,13 +51,26 @@ export async function POST(req: Request) {
     // Per-field messages so the clients can highlight the offending input
     // (same copy as the web's submitHostApplication). Only company + notes are optional.
     const fields: Record<string, string> = {}
-    if (!fullName) fields.full_name = 'Full name is required'
+    // Presence is not the test — "12345" is non-empty, so the old `!fullName`
+    // check filed it for review as a host's legal name. An operator reads this
+    // against the ID photos, so it goes through the same policy signup uses.
+    // `nameProblem` is echoed so a client can localize the reason.
+    const nameProblem = checkName(fullName)
+    if (nameProblem) fields.full_name = nameProblemMessage(nameProblem)
     if (!nationalId) fields.national_id = 'National ID is required'
-    if (!phone) fields.phone = 'Phone is required'
+    // Presence is not the test here either — the apps' field took `asdf` and filed
+    // it for review as the number our team would call.
+    if (!rawPhone) fields.phone = 'Phone is required'
+    else if (!phone) fields.phone = 'Enter a valid phone number, like 010 1234 5678'
     if (!address) fields.address = 'Address is required'
     if (!(HOST_TYPES as readonly string[]).includes(hostType)) fields.host_type = 'Choose individual, company or brokerage'
     if (Object.keys(fields).length) {
-      return NextResponse.json({ error: 'Please check the highlighted fields', fields }, { status: 400, headers: CORS })
+      return NextResponse.json(
+        nameProblem
+          ? { error: 'Please check the highlighted fields', fields, nameProblem }
+          : { error: 'Please check the highlighted fields', fields },
+        { status: 400, headers: CORS }
+      )
     }
 
     // Existing hosts don't apply, and a pending application can't be replaced.
@@ -64,7 +85,7 @@ export async function POST(req: Request) {
     const application = await submitHostApplication(me.id, {
       full_name: fullName,
       national_id: nationalId,
-      phone,
+      phone: phone as string, // non-null: a null phone was refused above
       address,
       host_type: hostType as HostType,
       company: company || null,

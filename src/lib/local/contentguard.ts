@@ -10,6 +10,7 @@
 // the evasions people actually reach for are covered:
 //
 //   • separators              010 123 45 67 · 010-123-4567 · (010)/123 · 0_1_0
+//   • letters as separators   A0101 S416 M3280 · 0101x416x3280
 //   • Arabic-Indic digits     ٠١٠١٢٣٤٥٦٧٨ and Eastern ۰۱۰
 //   • fullwidth / enclosed    ０１０１２３４５６７８ · ⓪①⓪ · 0️⃣1️⃣0️⃣
 //   • invisible characters    zero-width space, soft hyphen, RTL/LTR marks
@@ -180,6 +181,12 @@ function collapseDigitSeparators(t: string): string {
   return s
 }
 
+/** Every digit in `s`, in order, with everything between them dropped. Used to
+ *  see through separators the collapse above won't bridge — letters, mainly. */
+function digitsOnly(s: string): string {
+  return s.replace(/\D/g, '')
+}
+
 /** Longest run of consecutive digits in `s`. */
 function longestDigitRun(s: string): number {
   let max = 0
@@ -204,13 +211,26 @@ export function containsPhoneNumber(text: string): boolean {
   if (/01[0125]\d{6,8}/.test(compact)) return true
   // International country-code forms.
   if (/(?:\+|00)\s*\d[\d\s.\-]{6,}/.test(norm)) return true
+  // Letters used as separators — "A0101 S416 M3280", "0101x416x3280". A letter
+  // is not punctuation, so `collapseDigitSeparators` deliberately won't bridge
+  // one: every group stays short and no run ever reaches 8. Reduce the whole
+  // text to its digits instead, and match a phone SHAPE against that
+  // concatenation — never a bare "long enough" run, which would read "built
+  // 2000, 12 rooms, 34 beds, 567 sqm" as a 14-digit number. A full Egyptian
+  // mobile is specific enough to survive whole-text concatenation: it needs a 0,
+  // a 1, one of 0/1/2/5, then eight more digits, all consecutive.
+  //
+  // This also covers digits scattered through a sentence ("my number: 010, then
+  // 1234, then 5678"), which is why no intent check gates it any more.
+  if (/01[0125]\d{8}/.test(digitsOnly(norm))) return true
   if (!CONTACT_HINT.test(norm)) return false
   // From here on the sender has said they're handing over contact details, so a
   // weaker signal is enough.
   if (longestDigitRun(compact) >= 6) return true
-  // Digits scattered through the sentence that concatenate to an Egyptian mobile
-  // ("my number: 010, then 1234, then 5678").
-  if (/01[0125]\d{8}/.test(norm.replace(/\D/g, ''))) return true
+  // A landline (area code + subscriber) interleaved the same way. Kept behind
+  // the intent check, because 0[23] plus eight digits is a much likelier
+  // accident in a number-heavy listing than a mobile prefix is.
+  if (/0[23]\d{8}/.test(digitsOnly(norm))) return true
   // An all-letter number written out in lookalikes ("my number is OIO IZ34567").
   if (longestDigitRun(collapseDigitSeparators(normalizeForPhone(text, true))) >= 8) return true
   return false

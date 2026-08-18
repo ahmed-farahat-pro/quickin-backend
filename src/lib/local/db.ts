@@ -9,6 +9,8 @@ import { isContactBlockedError } from './contentguard'
 import { guardContent, guardSplitContent } from './moderation'
 import { INSTAPAY_KEYS, rowsToPaymentConfig } from './payment-config-core'
 import type { PaymentConfig } from './payment-config-core'
+import { rowToPayoutMethod } from './payout-method-core'
+import type { PayoutMethodRecord, PayoutMethodView } from './payout-method-core'
 import {
   COMMISSION_RATE_KEY,
   COMMISSION_RATE_SQL,
@@ -17,6 +19,7 @@ import {
   roundUpToStep,
   sqlWithCommission,
 } from './commission-core'
+import { sqlRankingOrderBy } from './ranking-core'
 
 export type { PaymentConfig }
 
@@ -325,11 +328,17 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
   // Sorting stays on the raw column: the markup is a monotone non-decreasing
   // transform of it, so the guest-visible order is identical and this keeps any
   // index on price_per_night usable.
+  //
+  // `recommended` — the default, so this is what most guests actually see — is
+  // the performance ranking: guest ratings (shrunk, so one 5★ can't top a body
+  // of them) plus COMPLETED stays (never a cancellation), both recency-weighted.
+  // See ranking-core.ts. It replaced `is_guest_favorite DESC, created_at DESC`,
+  // which is now folded in as a small bonus and the tie-break.
   const ORDER: Record<string, string> = {
     price_asc: 'l.price_per_night ASC, l.created_at DESC',
     price_desc: 'l.price_per_night DESC, l.created_at DESC',
     newest: 'l.created_at DESC',
-    recommended: 'l.is_guest_favorite DESC, l.created_at DESC',
+    recommended: sqlRankingOrderBy('l'),
   }
   const orderBy = ORDER[filters.sort ?? 'recommended'] ?? ORDER.recommended
 
@@ -2928,4 +2937,75 @@ export async function recordLogin(
   } catch {
     /* never block a sign-in over telemetry */
   }
+}
+
+// ---- Host payout method (host_payout_methods) --------------------------------
+
+/**
+ * Where a host wants their earnings sent. One row per host, so this reads at
+ * most one; `null` means they have not completed that part of their profile.
+ *
+ * Returns the view shape (labels + the masked `display` line) rather than the
+ * raw row, so web, iOS and Android all render the same wording.
+ */
+export async function getPayoutMethod(userId: string): Promise<PayoutMethodView | null> {
+  if (!isUuid(userId)) return null
+  try {
+    const { rows } = await pool.query(
+      `SELECT method, account_name, account_ref, bank_name, iban, account_number,
+              swift_bic, branch, provider, updated_at
+         FROM host_payout_methods WHERE user_id = $1`,
+      [userId]
+    )
+    return rowToPayoutMethod(rows[0] ?? null)
+  } catch (e) {
+    // The table is absent until migrate-payout-methods.mjs runs. Read as "none
+    // set" rather than 500ing the whole profile over a feature the host has not
+    // used yet.
+    console.error('getPayoutMethod fell back to null:', e)
+    return null
+  }
+}
+
+/**
+ * Save the host's chosen destination, replacing whatever was there.
+ *
+ * `record` must come from validatePayout — that is what guarantees the fields of
+ * the other two methods are cleared rather than carried over. Upsert on user_id:
+ * a host has one payout method, and switching from a bank account to a wallet
+ * rewrites the row rather than adding one.
+ */
+export async function savePayoutMethod(
+  userId: string,
+  record: PayoutMethodRecord
+): Promise<PayoutMethodView | null> {
+  if (!isUuid(userId)) throw new Error('Invalid user')
+  const { rows } = await pool.query(
+    `INSERT INTO host_payout_methods
+       (user_id, method, account_name, account_ref, bank_name, iban, account_number, swift_bic, branch, provider)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (user_id) DO UPDATE
+        SET method         = EXCLUDED.method,
+            account_name   = EXCLUDED.account_name,
+            account_ref    = EXCLUDED.account_ref,
+            bank_name      = EXCLUDED.bank_name,
+            iban           = EXCLUDED.iban,
+            account_number = EXCLUDED.account_number,
+            swift_bic      = EXCLUDED.swift_bic,
+            branch         = EXCLUDED.branch,
+            provider       = EXCLUDED.provider,
+            updated_at     = now()
+     RETURNING method, account_name, account_ref, bank_name, iban, account_number,
+               swift_bic, branch, provider, updated_at`,
+    [userId, record.method, record.account_name, record.account_ref, record.bank_name,
+     record.iban, record.account_number, record.swift_bic, record.branch, record.provider]
+  )
+  return rowToPayoutMethod(rows[0] ?? null)
+}
+
+/** Remove the host's payout method. Idempotent — returns false if none existed. */
+export async function deletePayoutMethod(userId: string): Promise<boolean> {
+  if (!isUuid(userId)) return false
+  const { rowCount } = await pool.query(`DELETE FROM host_payout_methods WHERE user_id = $1`, [userId])
+  return (rowCount ?? 0) > 0
 }

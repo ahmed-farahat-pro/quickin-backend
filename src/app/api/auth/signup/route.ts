@@ -9,6 +9,8 @@ import {
   blockedAccountResponse,
 } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
+import { checkName, fallbackNameFromEmail, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
+import { checkPassword, passwordProblemMessage } from '@/lib/local/password-policy'
 
 export const dynamic = 'force-dynamic'
 
@@ -39,11 +41,37 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: CORS })
     }
     const country = typeof rawCountry === 'string' && rawCountry.trim() ? rawCountry.trim().slice(0, 80) : null
-    if (String(password).length < 6) {
-      return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400, headers: CORS })
+    // Six characters of anything let `123456` create a real account with a real
+    // booking history behind it. `passwordProblem` is echoed alongside the plain
+    // sentence so a client can localize the reason without re-deciding it — the
+    // same shape `nameProblem` uses.
+    const weak = checkPassword(password, String(email))
+    if (weak) {
+      return NextResponse.json(
+        { error: passwordProblemMessage(weak), passwordProblem: weak },
+        { status: 400, headers: CORS }
+      )
     }
     const cleanEmail = String(email).trim()
-    const fullName = String(full_name || '').trim() || cleanEmail.split('@')[0]
+    // The name, by the same rule the host application uses — `12345` used to
+    // become a real display name, the one a host reads next to a booking request
+    // and an operator matches against an ID at verification time. A client that
+    // sends no name at all is still let through (social sign-in does): it falls
+    // back below. `nameProblem` is echoed so a client can localize the reason;
+    // `error` stays the plain English sentence every shipped build renders.
+    const name = normalizeName(full_name)
+    if (name) {
+      const nameProblem = checkName(name)
+      if (nameProblem) {
+        return NextResponse.json(
+          { error: nameProblemMessage(nameProblem), nameProblem },
+          { status: 400, headers: CORS }
+        )
+      }
+    }
+    // No name sent → the local part of the address, which is guest input too:
+    // `0100@gmail.com` would seed exactly the numeric-only name refused above.
+    const fullName = name || fallbackNameFromEmail(cleanEmail)
 
     // ONE unified account per email (no guest/host split — matches the web). New
     // accounts register as a regular user; hosting is gained later via "become a host".

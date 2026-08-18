@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { recordLogin } from '@/lib/local/db'
 import { resetPasswordWithOtp, hashPassword, signToken } from '@/lib/local/auth'
+import { checkPassword, passwordProblemMessage } from '@/lib/local/password-policy'
 
 // POST /api/auth/reset-password { email, code, password } → verifies the reset code,
 // sets the new password, and logs the user in (returns { token, user }).
@@ -28,8 +29,16 @@ export async function POST(req: Request) {
     if (!email || !code || !password) {
       return NextResponse.json({ error: 'Email, code and new password are required' }, { status: 400, headers: CORS })
     }
-    if (String(password).length < 6) {
-      return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400, headers: CORS })
+    // A reset is exactly where people reach for the most guessable thing they can
+    // remember, so the account's own address is passed in and refused too. Same
+    // policy as signup and /api/local/change-password — a floor only one of the
+    // three enforces is not a floor.
+    const weak = checkPassword(password, String(email))
+    if (weak) {
+      return NextResponse.json(
+        { error: passwordProblemMessage(weak), passwordProblem: weak },
+        { status: 400, headers: CORS }
+      )
     }
     const user = await resetPasswordWithOtp(
       String(email).trim(),

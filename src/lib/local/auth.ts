@@ -223,8 +223,13 @@ export async function getFullProfile(id: string): Promise<Profile | null> {
   return (rows[0] as Profile) ?? null
 }
 
-/** Update editable profile fields (name, bio, avatar, age, id document, phone).
- *  COALESCE keeps any field the caller omits (passes null). */
+/** Update editable profile fields (name, bio, avatar, age, phone, country).
+ *  COALESCE keeps any field the caller omits (passes null).
+ *
+ *  `id_document` is deliberately NOT here. It is identity, and it is only written by
+ *  an approved change request (see reviewIdChangeRequest / id-change-core.ts). Leaving
+ *  it on this helper would mean any future caller could quietly reopen the hole the
+ *  request queue was built to close. */
 export async function updateProfile(
   id: string,
   fields: {
@@ -232,7 +237,6 @@ export async function updateProfile(
     bio?: string | null
     avatarUrl?: string | null
     age?: number | null
-    idDocument?: string | null
     phone?: string | null
     country?: string | null
   }
@@ -246,17 +250,15 @@ export async function updateProfile(
     `UPDATE users SET
         full_name   = COALESCE($2, full_name),
         age         = COALESCE($3, age),
-        id_document = COALESCE($4, id_document),
-        phone       = COALESCE($5, phone),
-        bio         = COALESCE($6, bio),
-        avatar_url  = COALESCE($7, avatar_url),
-        country     = COALESCE($8, country)
+        phone       = COALESCE($4, phone),
+        bio         = COALESCE($5, bio),
+        avatar_url  = COALESCE($6, avatar_url),
+        country     = COALESCE($7, country)
       WHERE id = $1`,
     [
       id,
       fields.fullName ?? null,
       fields.age ?? null,
-      fields.idDocument ?? null,
       fields.phone ?? null,
       fields.bio ?? null,
       fields.avatarUrl ?? null,

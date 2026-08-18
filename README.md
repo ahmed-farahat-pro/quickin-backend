@@ -18,8 +18,11 @@ npm run dev        # API at http://localhost:4000
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET  | `/api/local/listings` | All published listings. Filters: `?location=&guests=&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD` |
+| GET  | `/api/local/listings` | All published listings. Filters: `?location=&guests=&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD`. `?sort=` is `recommended` (default) \| `price_asc` \| `price_desc` \| `newest`; **`recommended` ranks by rating + completed bookings** — see Search ranking below |
 | GET  | `/api/local/listings/[id]` | One listing by UUID (404 if missing) |
+| GET  | `/api/local/profile/id-change` | The signed-in user's ID number and the state of any request to change it → `{ current, request, can_request }` |
+| POST | `/api/local/profile/id-change` | File a change request: `{ requested_value, doc_type, front, back?, reason? }`. **`front` is required** — without a document the reviewer has nothing to check the number against. Resubmitting replaces a request still awaiting review |
+| DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
 | POST | `/api/local/bookings` | Create a reservation (auth required) |
 | GET  | `/api/local/bookings` | The signed-in user's reservations |
 | POST | `/api/auth/signup` | Register (email + password) |
@@ -34,8 +37,12 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/payment-config` | The Instapay destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload}` |
 | GET  | `/api/local/admin/settings/instapay` | Read the same config for editing. Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/instapay` | Update it — `{instapay_handle?, instapay_link?, instapay_qr_image?, instructions?}`. Each field is optional: omit to leave untouched, send `""` to clear. `400` on an invalid link or QR |
+| POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, company?, notes?}`. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review |
 | GET  | `/api/local/host/listing-gate` | May this host add a listing — `{allowed, code, message, reason}`. Same `code` the create route returns on 403, so the apps can refuse up front. `reason` only on a rejection |
 | GET  | `/api/local/host/commission` | The platform commission — `{rate, percent}` — so the add/edit-listing screens can show a host what guests will pay. Auth required (a guest holding the rate could divide out the host's raw price) |
+| GET  | `/api/local/host/payout-method` | Where QuickIn sends this host's earnings — `{payout_method, payout_ready, is_host}`. `payout_method` is `null` until they add one. Host-only; a guest gets `403 {code:'not_host'}` |
+| PUT  | `/api/local/host/payout-method` | Add or replace it — `{method, account_name, …}` where `method` is `bank_account` \| `instapay` \| `wallet`. `400` with the reason on invalid input (the IBAN checksum included) |
+| DELETE | `/api/local/host/payout-method` | Remove it — `{removed, payout_method:null, payout_ready:false}`. Idempotent |
 | GET  | `/api/local/admin/settings/commission` | The platform commission — `{rate, percent, updated_at, updated_by}`. Staff session with the `pricing` module |
 | PUT  | `/api/local/admin/settings/commission` | Set it — `{percent}` (e.g. `12.5`). `400` outside 0–100. Reprices every listing and service immediately; existing bookings keep their snapshotted rate |
 
@@ -78,6 +85,49 @@ with the application (`doc_type` + front/back/selfie), linked by
 so a failed upload left an application on file with no ID attached. The standalone
 `/verify-id` path stays: verification is open to any signed-in user (guests verify for the
 trust badge), and already-approved hosts need it to satisfy the cutover.
+
+**The phone number has to be a phone number.** Presence was the only test, so `asdf`
+was filed for review as the number our team would call. `src/lib/local/phone-core.ts`
+now decides, and it is **byte-identical to the web's copy**
+(`scripts/check-phone-core-parity.mjs`) — both repos write the same
+`host_applications.phone`, so a rule that held on one surface and not the other would
+let the apps file what the web refuses. It normalizes as well as validates, for the
+same reason `payout-method-core.ts` does: an Egyptian mobile sent as `+20 10…`,
+`0020 10…` or `010…` is stored once as `01XXXXXXXXX`, so one host is one row in `/ops`
+and not three. A mobile is 01 + 9 digits **exactly** (a number typed a digit short is
+caught here, not by the person dialling it); landlines keep their local form and
+anything foreign keeps `+<digits>` E.164, because a host abroad still has to be
+reachable. Arabic-Indic and Persian digits fold to ASCII — the apps run in Arabic.
+
+`national_id` is deliberately **not** given the same treatment: a foreign applicant's
+passport number contains letters, so "digits only" would refuse a valid document.
+
+**A name has to be a name.** `POST /api/auth/signup` asked only that `full_name` be
+non-empty, so `12345` created an account whose display name is `12345` — what a host
+reads next to a booking request and what an operator matches against an ID document.
+`src/lib/local/name-policy.ts` decides now, and it is **byte-identical to the web's
+copy** (`scripts/check-name-policy-parity.mjs`), because both repos create accounts in
+the same `users` table. A name must contain **letters** (`\p{L}`, so Arabic counts),
+at least two of them, and at most 60 characters. Deliberately *not* "no digits":
+Franco-Arabic writes real names with numerals (`Ma7moud`, `3omar`), and refusing those
+would turn away exactly the guests this app serves. A 400 carries the plain sentence in
+`error` **and** the code in `nameProblem` (`required` · `letters` · `tooShort` ·
+`tooLong`), the same shape `emailProblem` and `passwordProblem` use, so a client can
+localize the reason without re-deciding it — iOS does, in `Sources/NameRules.swift`.
+
+A request that sends **no** name at all is still accepted, because social sign-in has
+none: the name falls back to the local part of the address, and to `Guest` when that
+isn't a name either — `0100@gmail.com` would otherwise seed the very thing the rule
+refuses.
+
+**`POST /api/local/host/apply` applies the same policy**, and this is where it bites
+hardest: the application's `full_name` is the name an operator reads *against the ID
+photos* when approving a host, so `12345` was not merely ugly, it was unreviewable. The
+name arrives in `fields.full_name` like the other per-field messages, with the code in
+`nameProblem` beside it. Both clients check the same rule before submitting — iOS
+through `NameRules` (the host form and sign-up share it), Android in
+`HostApplyScreen.kt`, which shows the reason under the field and keeps Submit disabled
+until the name has letters.
 
 ### The platform commission
 
@@ -139,6 +189,67 @@ One subtlety worth keeping: `raw * (1 + rate)` is binary-float, so `100 × 1.1` 
 `110.00000000000001` and a naive `ceil` would bill 120. `roundUpToStep()` settles to
 piasters before rounding up.
 
+### Search ranking — chalets earn their position
+
+`GET /api/local/listings` defaults to `sort=recommended`, and that order is no longer
+"newest first with the editorial favourites on top". It is a performance score in
+`[0, 1.05]`, built in `src/lib/local/ranking-core.ts` and evaluated inside Postgres:
+
+```
+score = 0.6 × rating component      (guest reviews, shrunk and discounted for doubt)
+      + 0.4 × bookings component    (COMPLETED stays, log-damped)
+      + 0.05 if is_guest_favorite
+```
+
+**Reviews — why the average alone is not enough.** A chalet with one 5★ review must
+not outrank one with hundreds of good ones, so the rating half applies two corrections
+in order:
+
+1. **Shrinkage.** Every listing is scored as though it also carried `PRIOR_REVIEWS` (5)
+   reviews at the platform's own mean, so a lone 5★ lands near that mean instead of at
+   the top.
+2. **A lower confidence bound.** Shrinkage alone was **not sufficient**, and this was
+   caught against real rows rather than reasoned about: on a catalogue averaging 4.71,
+   a single 5★ shrinks to 4.76 and *still* beat forty reviews averaging 4.70. So the
+   score subtracts `1.28 / √(n + 5)` — one review is worth ±0.52★ of doubt, forty is
+   worth ±0.19★. A large body of strong reviews now wins because the platform is *sure*
+   of it, which is what the rule was always about.
+
+The boundary is deliberate: a large body of reviews that is genuinely *below* the
+catalogue average still ranks lower, because "stronger customer reviews" has to respect
+the average too. Volume buys certainty, not immunity.
+
+**Bookings — only stays that happened.** The booking half counts `status = 'completed'`
+**or** a `confirmed` booking whose `check_out` has passed — the same test `reviews.ts`
+uses to decide a stay is over. `pending`, `rejected` and **`cancelled` never count**, so
+a host cannot lift a listing by taking reservations that fall through. It is
+`ln(1+n) / ln(1+50)`, capped: proving demand at all is worth far more than extending an
+already long record, and past ~50 stays a listing competes on rating alone rather than
+crowding out the catalogue.
+
+**Both halves are recency-weighted.** Full weight for a year, then a straight line down
+to a 0.25 floor over the following two. A chalet that was busy three years ago and quiet
+since drifts down; nothing ever falls to zero, because old success is weaker evidence,
+not no evidence.
+
+**Cold start.** A listing with no history scores the platform average minus the doubt of
+having no reviews — below a proven listing, above one with genuinely bad reviews, and
+never zero. `created_at DESC` breaks ties, so two brand-new listings keep exactly the
+order this replaced.
+
+`is_guest_favorite` used to *be* the whole recommended order; it survives as the 0.05
+bonus, enough to break a tie but never enough to float a poor listing over a good one.
+
+Nothing is stored or backfilled — the score is derived at read time from `reviews` and
+`bookings`, like guest prices are (see the commission above), so a new review or a
+completed stay reorders search immediately. The cost is three correlated subqueries per
+listing; `scripts/migrate-ranking-indexes.mjs` adds the two indexes that keep them cheap
+as the catalogue grows.
+
+`ranking-core.ts` is **byte-identical** to the frontend's copy — both projects rank the
+same catalogue, and a drifted weight would put the same two chalets in different orders
+on the web and in the apps. `scripts/check-ranking-core-parity.mjs` fails on drift.
+
 ### The Instapay destination
 
 Guests pay by transferring manually, so the number, QR code and link they see are all
@@ -153,6 +264,46 @@ World-1 image. When it is empty, clients draw their own QR from `qr_payload` (th
 if one is set, else the handle) — the web with `qrcode.react`, iOS with CoreImage — so
 a guest always has something to scan. Nothing is stored twice: `qr_payload` is derived
 on read, never persisted.
+
+## Password policy — one floor, all three doors
+
+Six characters of anything used to be the whole rule, in all three places that write
+a `password_hash`: `POST /api/auth/signup`, `POST /api/auth/reset-password` and
+`POST /api/local/change-password`. So `123456` opened a real account, and — because
+the web and this API sign into the *same* `users` row — an account created strong on
+the web could be weakened back to `123456` through the mobile API. A floor only one
+door enforces is not a floor.
+
+`src/lib/local/password-policy.ts` decides now, and it is **byte-identical to the
+web's copy** (`scripts/check-password-policy-parity.mjs`), for exactly the reason
+`name-policy.ts` is. Like it, the module has no imports, so the same code runs in the
+routes and under `node --test`.
+
+Five rules, checked in the order a form's checklist shows them: **8 characters**,
+**uppercase**, **lowercase**, **digit**, **symbol**. The order is the point — a
+refusal names the first box the guest hasn't ticked, not a paragraph of policy. Three
+more checks can't be drawn as a box and are decided after: `whitespace` (a password of
+only spaces), `email` (signup and reset pass the address, and change-password passes
+the signed-in user's — an account's own address is the top of every
+credential-stuffing list) and `common`.
+
+`common` strips the decoration people add to get past exactly this kind of rule:
+`Password1!` and `P@ssw0rd123` clear all five character rules, both reduce to
+`password`, and both are refused. The blocklist is a few dozen bases rather than a
+dictionary, and it matches the *whole* reduced password — `Cairo-Nights-42!` is not
+`cairo`.
+
+A 400 carries the plain sentence in `error` **and** the code in `passwordProblem`
+(`required` · `tooLong` · `whitespace` · `length` · `uppercase` · `lowercase` ·
+`digit` · `symbol` · `email` · `common`), the same shape `emailProblem` and
+`nameProblem` use, so a client can localize the reason without re-deciding it.
+
+Two things worth knowing. **A password written purely in a script without case
+(Arabic, for one) cannot satisfy `uppercase`/`lowercase`** — a real constraint on an
+app whose guests are Egyptian, which is why the web draws the checklist up front
+rather than failing on submit; the mobile apps have no such checklist yet and will
+show the sentence from `error` instead. And **existing weak passwords keep working** —
+nothing rehashes or expires them; the rules apply the next time one is set.
 
 ## Environment
 
@@ -243,8 +394,31 @@ imported by a test at all**. The rule that works around it:
 > an explicit `.ts` extension.
 
 `src/lib/local/resort-core.ts`, `payment-config-core.ts`, `contentguard.ts`,
-`moderation-core.ts`, `disputes-core.ts` and `account-status-core.ts` are the
-working examples.
+`moderation-core.ts`, `disputes-core.ts`, `ranking-core.ts`, `phone-core.ts`,
+`name-policy.ts`, `password-policy.ts` and `account-status-core.ts` are the working
+examples.
+
+`name-policy.test.mjs` carries the signup name rule in both directions: that `12345`,
+`٠١٢٣٤`, `0100` and `-----` are refused, and — the half that matters more — that
+`Ma7moud`, `Bo`, `محمد أحمد`, `李伟` and `O'Brien` still get in, because a name rule
+that turns away a paying guest is the worse failure.
+
+`password-policy.test.mjs` is the web's suite verbatim, which is the point: the two
+copies of the module are byte-identical, so the tests that hold one honest have to
+hold the other. It pins that `123456`, `password` and `qwerty` are refused; which
+single rule a password is told about first (the one a checklist shows unticked); that
+length counts characters and not UTF-16 units; that Arabic-Indic digits are digits
+while a space is not a symbol; the account-email rule; and the blocklist's
+decoration-stripping — `P@ssw0rd123` is `password`, `Cairo-Nights-42!` is not `cairo`.
+
+`ranking-core.test.mjs` is worth reading as a cautionary one. Its headline assertion —
+that one 5★ review cannot outrank two hundred — passed against an implementation that
+did not actually hold the property, because the test only ever asked at one platform
+average, and that average happened to be favourable. The bug surfaced only when the
+score was run against real rows. The suite now sweeps the assertion across the whole
+plausible range of platform averages, and pins the boundary where the rule stops
+applying. **A test that only asks under the conditions you had in mind is not a test of
+the rule.**
 
 `account-status-core.ts` is the one core that is **not** parity-guarded, on purpose.
 It is a deliberately smaller sibling of the web project's `user-admin-core.ts`: only
@@ -296,6 +470,21 @@ handles spelled-out numbers in English *and* Arabic, "double five", leet (`0l0`)
 and — when the sender has stated intent ("my number is…") — an all-letter number
 like `OIO IZ34S67`. Addresses survive `at`/`dot` spelling and bracketing; links are
 matched against an explicit TLD list, so "arrive at 5 p.m." is not a domain.
+
+**Letters used as separators.** `A0101 S416 M3280` was the one obfuscation that got
+through (reported against the iOS bio field, and it applied to all four surfaces).
+The separator collapse only bridges *punctuation* between digits — a letter is
+correctly not punctuation — so each group stayed under the 8-digit threshold and
+nothing matched. The phone detector now also reduces the whole field to its digits
+and matches a **shape** against that concatenation: `01[0125]` plus eight more
+digits, a full Egyptian mobile. Shape and not length is the whole point — testing a
+whole-field concatenation for a merely *long* run would read "built 2000, 12 rooms,
+34 beds, 567 sqm" as a 14-digit number. The landline form (`0[23]` + eight digits) is
+looser, so it stays behind the intent check. The residual cost is real and accepted:
+a bio dense enough to put eleven digits back to back in the right order can still
+false-positive, which is why `test/unit/contentguard.test.mjs` carries number-heavy
+honest bios in its allow half. A non-Egyptian international number interleaved with
+letters is still only caught when intent is stated.
 
 **Split across messages.** `combinesIntoContact` stitches the sender's last 16
 messages in the thread, so `010` / `1234567` / `8` is caught, as is `kareem@gmail`
@@ -445,6 +634,42 @@ The flow, unchanged in the schema: `payment_proofs.status = 'submitted'` +
 mobile apps already gate on (`payment_status == "submitted"`), so no app change was
 needed.
 
+## How a host gets paid — the payout method
+
+Money flows *in* through Instapay (above) and *out* to whatever destination the host
+declared. `host_payout_methods` holds **one row per host** — a single preferred
+destination, not a wallet of many — chosen from three:
+
+| `method` | Fields it carries | `account_ref` (the canonical destination) |
+| --- | --- | --- |
+| `bank_account` | `bank_name` (required), `iban`, `account_number`, `swift_bic`, `branch` | the IBAN, or the account number when there is no IBAN |
+| `instapay` | — | the InstaPay address, e.g. `kareem@instapay` |
+| `wallet` | `provider` (`vodafone_cash`, `etisalat_cash`, `orange_money`, `we_pay`, `other`) | the wallet number, normalised to `01XXXXXXXXX` |
+
+**All three are stored whole, because all three have to be payable.** That is why a
+credit-card option was withdrawn before this shipped: a card number cannot be paid out
+without a processor token, and holding one would have put this database in PCI-DSS
+scope for nothing. Bank details carry no such restriction — an IBAN exists to be handed
+out — so they are kept in full and shown back in full, which is what lets a host confirm
+they typed them correctly.
+
+A bank account needs the bank plus **an IBAN or an account number** — either identifies
+the account (an IBAN covers any transfer, an account number plus the bank covers a
+domestic one), and demanding both would block a host who only knows one of them.
+`normalizeIban()` enforces the ISO 7064 mod-97 checksum *and* the country length, since
+a transposition can survive one but not the other; `IBAN_LENGTHS` lists the countries
+QuickIn's hosts actually bank in, and an unlisted country is accepted on the checksum
+alone rather than refused.
+
+Everything else is derived, never stored: `display`, `method_label`, `provider_label`
+and `iban_formatted` come from `rowToPayoutMethod()` at read time, so all three clients
+render one wording.
+
+The section is **host-only** (`is_host` OR the legacy `role='host'`, the same rule the
+listing gate uses) and gates nothing — a host with no payout method can still list and
+still take bookings; they simply have nowhere to be paid. `payout_ready` on the GET is
+the profile-completeness flag the clients show that with.
+
 ## Account verification — the verified badge
 
 `users.verification_status` (`unverified | pending | verified | rejected`) is written
@@ -506,6 +731,10 @@ the list of record. Recent additions:
 | `migrate-account-status.mjs` | `users.account_status`/`status_reason`/`status_changed_at`/`status_changed_by`, `listings.unpublished_by_admin`, and the user search indexes — the block / remove lifecycle behind `/ops` → Users |
 | `migrate-policy-violations.mjs` | `policy_violations` (every blocked contact-sharing attempt, with the text) and `policy_warnings` (a warning the user must acknowledge before chatting again) — the record behind `/ops` → Moderation. Purely additive, so it is safe to apply well ahead of the deploy |
 | `migrate-disputes.mjs` | `disputes` (a guest's issue with a stay: category, description, photos, four-state status, resolution) and `dispute_events` (the filing plus every status change, with actor and note) — behind `/ops` → Guest disputes. Additive |
+| `migrate-payout-methods.mjs` | `host_payout_methods` — one row per host (`UNIQUE user_id`) holding the single destination they chose for their earnings (`bank_name`/`iban`/`account_number`/`swift_bic`/`branch` for a bank account). Also **reports** how many approved hosts have not added one. Additive, and the read path degrades to "none set" if it has not run, so it is safe to apply well ahead of the deploy. Re-running it converges a database built by the first version of the script, which had a `credit_card` method with an `expiry` — that version never reached production, so there is nothing to back-fill |
+
+| `migrate-id-change-requests.mjs` | `id_change_requests` — a user's request to change the ID number on their profile, with the document photo backing it, one open request per user (partial unique index). Behind `/ops` → ID verifications, and the only thing that writes `users.id_document` now that `PATCH /api/local/profile` refuses it. Also **reports** how many accounts already carry a self-declared number that nobody ever reviewed. Additive, and the reads degrade to an empty queue if it has not run, so it is safe to apply well ahead of the deploy |
+| `migrate-ranking-indexes.mjs` | Two indexes for the search ranking — `reviews(listing_id) INCLUDE (rating, created_at)` and `bookings(listing_id, status, check_out)`. **Pure performance, no schema change:** the ranking is correct without it, so the usual order does not apply and it can be run before or after the deploy |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The
 reverse gap is safe — the columns are additive and unread until the deploy lands.

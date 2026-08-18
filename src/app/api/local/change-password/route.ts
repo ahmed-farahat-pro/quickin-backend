@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getUserFromRequest, changePassword, hashPassword } from '@/lib/local/auth'
+import { checkPassword, passwordProblemMessage } from '@/lib/local/password-policy'
 
 // POST /api/local/change-password { current_password, new_password } — for a signed-in
 // user changing their password from inside the profile (must supply the current one).
@@ -29,8 +30,16 @@ export async function POST(req: Request) {
     const b = await req.json().catch(() => ({}))
     const current = String(b.current_password ?? b.currentPassword ?? '')
     const next = String(b.new_password ?? b.newPassword ?? '')
-    if (next.length < 6) {
-      return NextResponse.json({ error: 'New password must be at least 6 characters' }, { status: 400, headers: CORS })
+    // The strength policy — the same one signup and reset apply, and byte-identical
+    // to the web's copy, because all three doors write the same `users` row. Six
+    // characters of anything used to be the whole rule here, so a password the web
+    // refuses could be set through this endpoint on the very same account.
+    const weak = checkPassword(next, user.email)
+    if (weak) {
+      return NextResponse.json(
+        { error: passwordProblemMessage(weak), passwordProblem: weak },
+        { status: 400, headers: CORS }
+      )
     }
     const ok = await changePassword(user.id, current, hashPassword(next), next)
     if (!ok) return NextResponse.json({ error: 'Your current password is incorrect' }, { status: 400, headers: CORS })

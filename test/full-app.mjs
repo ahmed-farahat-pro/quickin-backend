@@ -53,9 +53,20 @@ async function cleanup() {
   chk((await req('POST', '/api/local/change-password', tok, { current_password: 'NewPass99', new_password: 'Zzz12345' })).s === 200, 'change password works')
   chk((await req('POST', '/api/auth/login', null, { email: em, password: 'Zzz12345' })).s === 200, 'login with changed password')
 
-  console.log('Profile (age / id / phone)')
-  const up = await req('PATCH', '/api/local/profile', tok, { full_name: 'Full Tester', age: 31, id_document: 'EG998877', phone: '+201234567890' })
-  chk(up.b.age === 31 && up.b.phone === '+201234567890' && up.b.id_document === 'EG998877', 'profile age/id/phone saved')
+  console.log('Profile (age / phone), and the ID number that is no longer editable here')
+  const up = await req('PATCH', '/api/local/profile', tok, { full_name: 'Full Tester', age: 31, phone: '+201234567890' })
+  chk(up.b.age === 31 && up.b.phone === '+201234567890', 'profile age/phone saved')
+  // id_document is identity: it is written only by an approved change request, so the
+  // profile PATCH refuses any value that differs from what is stored. An unchanged echo
+  // still has to pass, because released app builds send the field back on every save.
+  const idAttempt = await req('PATCH', '/api/local/profile', tok, { id_document: 'EG998877' })
+  chk(idAttempt.s === 400 && idAttempt.b.code === 'id_change_required', 'PATCH cannot change the ID number')
+  const echo = await req('PATCH', '/api/local/profile', tok, { id_document: up.b.id_document ?? '', full_name: 'Full Tester' })
+  chk(echo.s === 200, 'an unchanged id_document echo is still accepted')
+  const idState = await req('GET', '/api/local/profile/id-change', tok)
+  chk(idState.s === 200 && idState.b.can_request === true, 'id-change state readable, no request waiting')
+  const noDoc = await req('POST', '/api/local/profile/id-change', tok, { requested_value: '29801011234567', doc_type: 'national_id' })
+  chk(noDoc.s === 400, 'a request with no document photo is refused')
   const me = await req('GET', '/api/local/profile', tok)
   chk(me.b.email === em, 'GET profile returns me')
 

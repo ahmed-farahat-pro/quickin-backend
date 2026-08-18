@@ -58,6 +58,11 @@ export const STAFF_MODULES = [
   { key: 'bookings', label: 'Bookings', description: 'Reservations and their status' },
   { key: 'applications', label: 'Host applications', description: 'Approve or reject new hosts' },
   { key: 'verifications', label: 'ID verifications', description: 'Review submitted ID documents' },
+  // Separate from `verifications` so ID-number corrections can be delegated without
+  // also handing over the decision that verifies an account and gates its listings.
+  // Its surface lives on the /ops verifications screen, which is why that page admits
+  // either module.
+  { key: 'id_changes', label: 'ID change requests', description: 'Approve or reject changes to a user\'s ID number' },
   { key: 'documents', label: 'Documents', description: 'Open ID and ownership documents' },
   { key: 'payments', label: 'Payments & disputes', description: 'Instapay proofs, disputes, handle' },
   { key: 'promos', label: 'Promo codes', description: 'Discount codes and limits' },
