@@ -290,6 +290,71 @@ if one is set, else the handle) — the web with `qrcode.react`, iOS with CoreIm
 a guest always has something to scan. Nothing is stored twice: `qr_payload` is derived
 on read, never persisted.
 
+## The address has to be one mail can reach
+
+`POST /api/auth/signup` used to check one thing about an email: that the request
+carried one. Not a shape, not a domain — `if (!email)`. Everything downstream depends
+on that address being real, because the account is created *unverified* and the only
+way in is the OTP we mail to it. So two things went wrong quietly and constantly.
+
+`layla@email.con` created a real row. `.con` is not a delegated top-level domain, so
+nothing can ever be delivered there; the guest sat on the OTP screen waiting for a
+code that did not exist, and we kept a dead account. Neither `type="email"` on the
+client nor the usual `/^[^\s@]+@[^\s@]+\.[^\s@]+$/` catches it — both check the
+*shape* of an address, and the shape is fine. Only the root zone knows.
+
+And every temp-mail service was an unlimited supply of accounts. `x@mailinator.com`
+receives the OTP perfectly well, which is the problem: the verification step proves
+the mailbox exists, not that anyone owns it.
+
+`src/lib/local/email-core.ts` decides now, and it is **byte-identical to the web's
+copy** (`scripts/check-email-core-parity.mjs`), for the reason `name-policy.ts` and
+`password-policy.ts` are: both repos open accounts in the same `users` table, and a
+rule that holds on only one of the two doors does not hold. It is the largest of the
+shared cores — most of it is the IANA root zone, ~1,450 delegated TLDs as a plain
+string — and like the others it has no imports, so the same code runs in the routes
+and under `node --test`.
+
+Three tiers, cheapest first:
+
+1. **Shape.** RFC 5321 lengths (254 total, 64 local), a dot-atom local part, domain
+   labels that start and end alphanumeric, a TLD of the right shape.
+2. **The trusted-provider allowlist.** ~180 mailbox providers guests and hosts
+   actually use — Gmail, the Microsoft four and their regional suffixes, Yahoo,
+   Apple, Proton, Zoho, GMX, Yandex, the Egyptian and Gulf ISPs. A domain on the list
+   is accepted immediately and skips the two checks below. **This is a fast path, not
+   the policy**: a domain missing from it is *not* refused, which is exactly what
+   keeps company addresses (`ahmed@orascom.com`) and universities (`@aucegypt.edu`)
+   working. Adding to it is safe; deleting from it is not.
+   `privaterelay.appleid.com` is load-bearing — Sign in with Apple hands us that
+   domain whenever the user hides their real address.
+3. **Root zone, then blocklist.** Everything else must have a really-delegated TLD
+   and must not be a known disposable domain (or a subdomain of one — a parent-domain
+   walk, so `x@sub.mailinator.com` is refused too).
+
+A refusal names the real problem and, when it can, guesses: `gmail.con` comes back
+"“.con” isn't a valid domain extension. Did you mean @gmail.com?" Suggestions are
+drawn from a short shortlist of popular domains and TLDs, never from the whole root
+zone — `con` is one deletion from `cn` (China) just as it is from `com`, and
+searching 1,450 entries produces confident nonsense.
+
+A 400 carries the plain sentence in `error` **and** the code in `emailProblem`
+(`required` · `format` · `tooLong` · `unknownTld` · `disposable`, plus `tld` and
+`suggestion` when there is one), the same shape `nameProblem` and `passwordProblem`
+use, so iOS and Android can localize the reason without re-deciding it.
+
+**The recovery routes are deliberately looser.** `POST /api/auth/forgot-password` and
+`POST /api/auth/resend-otp` call `isValidEmail`, which enforces shape and the root
+zone but *tolerates* a disposable domain. Both only ever mail an account that already
+exists, so refusing there would strand anyone who signed up before the blocklist
+without stopping a single new account. The temp-mail gate belongs on `/signup`, and
+that is where it is. `POST /api/auth/reset-password` adds no check of its own: it
+consumes a code this API issued, so the address already cleared forgot-password.
+
+Refreshing the root zone is a two-repo job: run `npm run check:tlds` on the frontend,
+paste the new list into its `email-core.ts`, then copy the whole file over this one
+and let `scripts/check-email-core-parity.mjs` confirm they match.
+
 ## Password policy — one floor, all three doors
 
 Six characters of anything used to be the whole rule, in all three places that write
@@ -596,7 +661,7 @@ imported by a test at all**. The rule that works around it:
 
 `src/lib/local/resort-core.ts`, `payment-config-core.ts`, `contentguard.ts`,
 `moderation-core.ts`, `disputes-core.ts`, `ranking-core.ts`, `phone-core.ts`,
-`name-policy.ts`, `password-policy.ts`, `listing-geo-policy.ts`,
+`name-policy.ts`, `password-policy.ts`, `email-core.ts`, `listing-geo-policy.ts`,
 `listing-title-policy.ts`, `listing-review-note-core.ts` and `account-status-core.ts`
 are the working examples.
 
@@ -612,6 +677,17 @@ single rule a password is told about first (the one a checklist shows unticked);
 length counts characters and not UTF-16 units; that Arabic-Indic digits are digits
 while a space is not a symbol; the account-email rule; and the blocklist's
 decoration-stripping — `P@ssw0rd123` is `password`, `Cairo-Nights-42!` is not `cairo`.
+
+`email-core.test.mjs` is the web's suite verbatim, for the same reason
+`password-policy.test.mjs` is. Its headline assertion is the one the module was
+written for — `layla@email.con` must be refused, because both checks that used to
+guard signup (`type="email"` and a shape regex) pass it. But the larger half of the
+suite is the mirror image, and it is the half to keep growing: the ordinary addresses
+a hand-written allowlist would have quietly locked out. `.eg`, `.com.eg`, `.co.uk`
+and new gTLDs; a host on their company domain; a student on `@aucegypt.edu`; and
+`privaterelay.appleid.com`, which our own Sign in with Apple depends on. A domain
+rule that turns away a paying guest is the worse failure, and unlike a bounced OTP it
+generates no support ticket — they just leave.
 
 `ranking-core.test.mjs` is worth reading as a cautionary one. Its headline assertion —
 that one 5★ review cannot outrank two hundred — passed against an implementation that

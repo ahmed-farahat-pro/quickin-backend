@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getUserRowByEmail, getUserRowByEmailRole, setResetOtp, generateOtp, OTP_TTL_MS, blockedAccountResponse } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
+import { isValidEmail, normalizeEmail } from '@/lib/local/email-core'
 
 // POST /api/auth/forgot-password { email } → emails a 6-digit reset code.
 // Returns { sent: true } regardless of whether the email exists (no account-existence
@@ -27,7 +28,16 @@ export async function POST(req: Request) {
   try {
     const { email, role } = await req.json()
     if (!email) return NextResponse.json({ error: 'Email is required' }, { status: 400, headers: CORS })
-    const clean = String(email).trim()
+    // Shape + a real extension, so `layla@email.con` is turned away here instead
+    // of silently answering { sent: true } for a code that can never arrive.
+    // `isValidEmail` deliberately tolerates a disposable domain: this route only
+    // ever mails an account that ALREADY exists, so refusing one would strand
+    // whoever signed up before the blocklist without stopping a single new
+    // account. The gate that matters for temp-mail is on /signup.
+    if (!isValidEmail(email)) {
+      return NextResponse.json({ error: 'A valid email is required' }, { status: 400, headers: CORS })
+    }
+    const clean = normalizeEmail(email)
     const existing =
       role === 'user' || role === 'host'
         ? await getUserRowByEmailRole(clean, role)

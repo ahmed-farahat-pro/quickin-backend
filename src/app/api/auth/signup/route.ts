@@ -9,6 +9,7 @@ import {
   blockedAccountResponse,
 } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
+import { checkEmail, emailProblemMessage, normalizeEmail } from '@/lib/local/email-core'
 import { checkName, fallbackNameFromEmail, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
 import { checkPassword, passwordProblemMessage } from '@/lib/local/password-policy'
 
@@ -40,6 +41,19 @@ export async function POST(req: Request) {
     if (!email || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: CORS })
     }
+    // The address, by the same rule the web signup applies — this route used to
+    // check only that a value was present, so `layla@email.con` created a real
+    // account that could never receive its OTP, and every temp-mail domain was
+    // an unlimited supply of throwaway accounts. `emailProblem` is echoed
+    // alongside the sentence so iOS and Android can localize the reason without
+    // re-deciding it, the same shape `nameProblem` and `passwordProblem` use.
+    const badEmail = checkEmail(email)
+    if (badEmail) {
+      return NextResponse.json(
+        { error: emailProblemMessage(badEmail), emailProblem: badEmail },
+        { status: 400, headers: CORS }
+      )
+    }
     const country = typeof rawCountry === 'string' && rawCountry.trim() ? rawCountry.trim().slice(0, 80) : null
     // Six characters of anything let `123456` create a real account with a real
     // booking history behind it. `passwordProblem` is echoed alongside the plain
@@ -52,7 +66,7 @@ export async function POST(req: Request) {
         { status: 400, headers: CORS }
       )
     }
-    const cleanEmail = String(email).trim()
+    const cleanEmail = normalizeEmail(email)
     // The name, by the same rule the host application uses — `12345` used to
     // become a real display name, the one a host reads next to a booking request
     // and an operator matches against an ID at verification time. A client that

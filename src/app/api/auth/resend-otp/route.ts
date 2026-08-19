@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getUserRowByEmail, getUserRowByEmailRole, setUserOtp, generateOtp, OTP_TTL_MS, blockedAccountResponse } from '@/lib/local/auth'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
+import { isValidEmail, normalizeEmail } from '@/lib/local/email-core'
 
 export const dynamic = 'force-dynamic'
 
@@ -28,7 +29,12 @@ export async function POST(req: Request) {
     if (!email) {
       return NextResponse.json({ error: 'Email is required' }, { status: 400, headers: CORS })
     }
-    const cleanEmail = String(email).trim()
+    // Same gate as forgot-password, and disposable is tolerated for the same
+    // reason: this only re-sends to an account that already exists.
+    if (!isValidEmail(email)) {
+      return NextResponse.json({ error: 'A valid email is required' }, { status: 400, headers: CORS })
+    }
+    const cleanEmail = normalizeEmail(email)
     // Scope to the (email, role) account being verified when role is provided.
     const existing =
       role === 'user' || role === 'host'
