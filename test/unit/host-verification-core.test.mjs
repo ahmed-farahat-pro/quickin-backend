@@ -15,6 +15,7 @@ import {
   isHostVerificationError,
   isListingAllowed,
   normalizeDocType,
+  needsIdentityDocuments,
   normalizeVerificationStatus,
   revokesListingPrivileges,
 } from '../../src/lib/local/host-verification-core.ts'
@@ -151,5 +152,37 @@ describe('revokesListingPrivileges', () => {
   test('a host who was never verified has nothing to revoke', () => {
     assert.equal(revokesListingPrivileges('pending', 'rejected'), false)
     assert.equal(revokesListingPrivileges(null, 'rejected'), false)
+  })
+})
+
+describe('needsIdentityDocuments', () => {
+  test('an applicant with no submission must upload', () => {
+    assert.equal(needsIdentityDocuments('unverified'), true)
+    assert.equal(needsIdentityDocuments(null), true)
+    assert.equal(needsIdentityDocuments(undefined), true)
+    // Anything unrecognised reads as 'unverified' — never assume documents exist.
+    assert.equal(needsIdentityDocuments('nonsense'), true)
+  })
+
+  test('a verified applicant is never asked for the same ID twice', () => {
+    // The bug this closes: a guest who verified from their profile was made to
+    // photograph the same document again inside the become-a-host flow.
+    assert.equal(needsIdentityDocuments('verified'), false)
+  })
+
+  test('a submission still under review is enough', () => {
+    // It is already in the reviewer's queue and gets decided with the application.
+    assert.equal(needsIdentityDocuments('pending'), false)
+  })
+
+  test('a rejected submission must be replaced', () => {
+    // The reviewer said these documents were not good enough; re-filing the same
+    // row would put the same refused photos back in front of them.
+    assert.equal(needsIdentityDocuments('rejected'), true)
+  })
+
+  test('status is read case- and whitespace-insensitively', () => {
+    assert.equal(needsIdentityDocuments('  VERIFIED '), false)
+    assert.equal(needsIdentityDocuments('Pending'), false)
   })
 })

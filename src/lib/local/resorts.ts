@@ -9,7 +9,7 @@
 // is the SQL layer. A near-identical copy exists in quickin-frontend — both projects
 // create listings (iOS here, web there), so both need the write path.
 import { pool } from './pool'
-import { normalizeResortName, resortSlug, isRegion } from './resort-core'
+import { normalizeResortName, resortSlug, isRegion, isValidResortName } from './resort-core'
 
 export interface ResortOption {
   id: string
@@ -75,10 +75,19 @@ export async function resolveResortSelection(input: {
   }
 
   const typed = normalizeResortName(input.resortName)
-  if (!typed) return { resort_id: null, resort_name: null, region: fallbackRegion }
+  // The STORAGE backstop for the form rule: text that isn't a name ('@@@@@') is
+  // treated as no answer rather than written to the column. Every caller checks
+  // it first and answers 400, so reaching this means a caller forgot.
+  if (!typed || !isValidResortName(typed)) return { resort_id: null, resort_name: null, region: fallbackRegion }
 
+  // No slug is not "no answer": resortSlug() keeps only [a-z0-9], so a name typed
+  // in Arabic reduces to ''. It still gets STORED and shown to guests as typed —
+  // it just has no match key, so it can't auto-link, and it can't be queued
+  // (resort_submissions is keyed on the slug). An admin still sees it, in the
+  // unassigned-names sweep. Returning null here is what used to make a host's
+  // Arabic answer disappear on save.
   const slug = resortSlug(typed)
-  if (!slug) return { resort_id: null, resort_name: null, region: fallbackRegion }
+  if (!slug) return { resort_id: null, resort_name: typed, region: fallbackRegion }
 
   // 2 + 3. A previously-merged misspelling, or an existing catalog name.
   const { rows: matched } = await pool.query<{ id: string; region: string }>(

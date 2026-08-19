@@ -1,5 +1,6 @@
 import { pool } from './pool'
 import { resolveResortSelection } from './resorts'
+import { normalizeResortName, validateResortName } from './resort-core'
 import type { PoolClient } from 'pg'
 import { randomInt } from 'node:crypto'
 import { createNotification } from './notifications'
@@ -20,6 +21,16 @@ import {
   sqlWithCommission,
 } from './commission-core'
 import { sqlRankingOrderBy } from './ranking-core'
+import { listingRejectionMessage, normalizeListingReviewNote } from './listing-review-note-core'
+import { normalizeListingTitle, validateListingTitle } from './listing-title-policy'
+import {
+  checkListingCompleteness,
+  checkListingEdit,
+  listingCompletenessProblemMessage,
+  MIN_LISTING_PHOTOS,
+} from './listing-completeness-policy'
+import type { ListingCurrentState } from './listing-completeness-policy'
+import { checkOwnershipDoc, ownershipDocProblemMessage } from './ownership-doc-core'
 
 export type { PaymentConfig }
 
@@ -81,6 +92,12 @@ export interface Listing {
   resort?: string | null
   cancellation_policy: string
   approval_status: string
+  /** The operator's reason for rejecting this listing, or null when they gave none
+   *  (the note is optional) — see listing-review-note-core.ts. HOST PROJECTION ONLY:
+   *  staff-authored text about the host, never part of a guest read. Cleared when the
+   *  listing goes back into the queue, so it always describes the CURRENT rejection.
+   *  The mobile host dashboards render it under the "Rejected" badge. */
+  review_note?: string | null
   weekly_discount: number
   monthly_discount: number
   host_id: string | null
@@ -247,7 +264,11 @@ export const LISTING_COLS = `
 export const LISTING_COLS_HOST = `
   l.id, l.title, l.description, l.location, l.country,
   ${HOST_PRICE_COLS}
-  ${LISTING_COMMON_COLS}
+  ${LISTING_COMMON_COLS},
+  -- Deliberately NOT in LISTING_COMMON_COLS: the rejection note is staff-authored
+  -- text about this host's listing and belongs to the host alone. Adding it to the
+  -- shared block would publish it on every guest read of a listing.
+  l.review_note
 `
 
 export async function getListings(filters: SearchFilters = {}): Promise<Listing[]> {
@@ -615,94 +636,6 @@ export async function getUserBookings(userId: string): Promise<Booking[]> {
   return rows as Booking[]
 }
 
-/** MOCK payment — there is no real gateway yet (Paymob comes later). Marks the
- *  booking paid for its owner, confirms it (mock = instant book + pay), records a
- *  fake reference, and returns the updated booking. Returns null if the booking
- *  isn't the user's. Always "succeeds" for a valid owner. */
-export async function markBookingPaid(
-  bookingId: string,
-  userId: string,
-  method = 'card',
-  paymentRef?: string,
-): Promise<Booking | null> {
-  if (!isUuid(bookingId) || !isUuid(userId)) return null
-  const m = method === 'bank_transfer' ? 'bank_transfer' : method === 'mock' ? 'mock' : 'card'
-  // Prefer the gateway's real transaction reference (e.g. the Paymob transaction id) so the
-  // payment can be reconciled; only synthesize a QK-MOCK ref for the dev/mock path with none.
-  const ref = paymentRef && String(paymentRef).trim()
-    ? String(paymentRef).trim()
-    : 'QK-MOCK-' + genReservationCode().replace(/^QK-/, '')
-  // Idempotent on gateway retries: COALESCE keeps the first paid_at/ref/method. `prev` captures
-  // whether it was already paid, so the host is notified exactly once even if Paymob re-posts.
-  const { rows } = await pool.query(
-    `WITH prev AS (
-       SELECT paid_at AS prev_paid_at FROM bookings WHERE id = $1 AND user_id = $2
-     ), upd AS (
-       UPDATE bookings b SET
-         payment_status = 'paid',
-         paid_at = COALESCE(b.paid_at, now()),
-         payment_method = COALESCE(b.payment_method, $4),
-         payment_ref = COALESCE(b.payment_ref, $3),
-         status = CASE WHEN b.status = 'pending' THEN 'confirmed' ELSE b.status END,
-         -- Paying confirms the booking, so this is a confirmation transition: mint the
-         -- code here too (also backfills a legacy confirmed booking that has none).
-         ${issueCodeSql(`b.status IN ('pending', 'confirmed')`, '$5')}
-       WHERE b.id = $1 AND b.user_id = $2
-       RETURNING *
-     )
-     SELECT ${BOOKING_COLS}, prev.prev_paid_at FROM upd b JOIN listings l ON l.id = b.listing_id, prev`,
-    [bookingId, userId, ref, m, genReservationCode()]
-  )
-  const row = rows[0] as (Booking & { prev_paid_at: string | null }) | undefined
-  if (!row) return null
-  const booking = row as Booking
-  const newlyPaid = !row.prev_paid_at
-  if (newlyPaid && booking.host_id) {
-    await createNotification(booking.host_id, {
-      type: 'booking_paid',
-      title: 'Booking paid',
-      body: `${booking.title} is booked & paid · ${booking.check_in} → ${booking.check_out}`,
-      link: '/host',
-    })
-    await sendPush(booking.host_id, {
-      title: 'Booking paid 🎉',
-      body: `${booking.title} — ${booking.reservation_code ?? ''}`,
-      link: '/host',
-    })
-  }
-  return booking
-}
-
-/** Record a NON-success Paymob outcome from the (HMAC-verified, trusted) webhook. Never grants
- *  payment, and never touches payment_ref — that column is reserved for the SUCCESSFUL txn id, so
- *  a later success isn't masked by an earlier failure. 'failed'/'pending' only apply while still
- *  unpaid (a late failure must not un-pay a confirmed booking); 'refunded'/'voided' reverse a prior
- *  payment (clear paid_at). id-scoped only (server-to-server). Returns true if a row was updated.
- *  The transaction id is captured in the webhook logs for audit. */
-export async function setBookingPaymentOutcome(
-  bookingId: string,
-  outcome: 'failed' | 'pending' | 'refunded' | 'voided',
-): Promise<boolean> {
-  if (!isUuid(bookingId)) return false
-  if (outcome === 'refunded' || outcome === 'voided') {
-    const { rowCount } = await pool.query(
-      // paid_at is cleared here, which is exactly why refunded_at exists: without it
-      // a refunded booking has NO date at all and drops out of every money report.
-      // analytics-core's MONEY_AT_SQL falls back through it. Never reintroduce a
-      // `paid_at IS NOT NULL` revenue predicate — use PAID_SQL / REFUNDED_SQL.
-      `UPDATE bookings SET payment_status = $2, paid_at = NULL, refunded_at = COALESCE(refunded_at, now())
-        WHERE id = $1`,
-      [bookingId, outcome]
-    )
-    return (rowCount ?? 0) > 0
-  }
-  const { rowCount } = await pool.query(
-    `UPDATE bookings SET payment_status = $2 WHERE id = $1 AND paid_at IS NULL`,
-    [bookingId, outcome]
-  )
-  return (rowCount ?? 0) > 0
-}
-
 /** Records the promo code + discount applied to a booking (set at pay time). */
 export async function setBookingPromo(
   bookingId: string,
@@ -979,7 +912,12 @@ export async function listPendingListings(): Promise<
  *  revoke, or a listing may predate the gate), and going live is the moment that
  *  matters. Throws so the caller surfaces the reason rather than silently
  *  reporting success on a listing that stayed hidden. */
-export async function setListingApproval(listingId: string, approve: boolean): Promise<Listing | null> {
+export async function setListingApproval(
+  listingId: string,
+  approve: boolean,
+  /** Optional reason shown to the host on a rejection. Ignored when approving. */
+  note?: string | null
+): Promise<Listing | null> {
   if (!isUuid(listingId)) return null
   if (approve) {
     const { rows: hostRows } = await pool.query(
@@ -996,10 +934,15 @@ export async function setListingApproval(listingId: string, approve: boolean): P
     }
   }
   const status = approve ? 'approved' : 'rejected'
+  // The note is stored, not just announced — it used to live only inside the
+  // notification body, so a host who missed that notification saw a "Rejected" badge
+  // with no reason. Approving clears it: the note describes a rejection, and a stale
+  // one under a live listing reads as a fresh complaint.
+  const reviewNote = approve ? null : normalizeListingReviewNote(note)
   const { rows } = await pool.query(
-    `UPDATE listings SET approval_status = $2, is_published = $3 WHERE id = $1
+    `UPDATE listings SET approval_status = $2, is_published = $3, review_note = $4 WHERE id = $1
      RETURNING id, host_id, title`,
-    [listingId, status, approve]
+    [listingId, status, approve, reviewNote]
   )
   const r = rows[0]
   if (!r) return null
@@ -1007,9 +950,11 @@ export async function setListingApproval(listingId: string, approve: boolean): P
     await createNotification(r.host_id, {
       type: approve ? 'listing_approved' : 'listing_rejected',
       title: approve ? 'Your listing is live 🎉' : 'Listing needs changes',
+      // Composed from the SAME normalized note that was just stored, so the
+      // notification and the reason on the host's dashboard can never disagree.
       body: approve
         ? `“${r.title}” has been approved and is now visible to guests.`
-        : `“${r.title}” wasn’t approved. Please review the details and resubmit.`,
+        : listingRejectionMessage(r.title, reviewNote),
       link: '/host',
     })
     await sendPush(r.host_id, {
@@ -1029,7 +974,7 @@ export async function setListingOwnershipDoc(
   doc: string
 ): Promise<Listing | null> {
   if (!isUuid(listingId) || !isUuid(hostUserId)) return null
-  const d = assertImageSrc(doc, 'Please attach a photo of the document')
+  const d = assertOwnershipDoc(doc)
   const { rowCount } = await pool.query(
     `UPDATE listings SET ownership_doc = $3, ${REQUEUE_SET}
       WHERE id = $1 AND host_id = $2`,
@@ -1103,7 +1048,7 @@ export function requeuesForReview(fields: readonly string[]): boolean {
 const photosRequeue = () => requeuesForReview(['images'])
 
 /** The SET fragment every re-queueing edit appends — identical to the ownership-doc flow. */
-const REQUEUE_SET = `approval_status = 'pending', is_published = false`
+const REQUEUE_SET = `approval_status = 'pending', is_published = false, review_note = NULL`
 
 /** Something the host can fix in the form (→ HTTP 400), as opposed to a real
  *  failure (→ 500). A named class rather than message-sniffing, so adding a
@@ -1133,11 +1078,52 @@ function assertImageSrc(src: unknown, message = 'Please attach a valid photo'): 
   return v
 }
 
+/** The proof-of-ownership document, which unlike a listing photo may also be a
+ *  PDF — a title deed is issued as a document, not photographed as one. The rule
+ *  lives in ownership-doc-core.ts, a verbatim copy of quickin-frontend's, so a
+ *  document accepted on the website is accepted here too. */
+function assertOwnershipDoc(src: unknown): string {
+  const v = String(src ?? '').trim()
+  const problem = checkOwnershipDoc(v)
+  if (problem) throw new ListingInputError(ownershipDocProblemMessage(problem))
+  return v
+}
+
 /** Non-blank text, else a per-field error (the clients highlight the input). */
 function assertText(v: unknown, label: string): string {
   const s = String(v ?? '').trim()
   if (!s) throw new ListingInputError(`${label} is required`)
   return s
+}
+
+/** A title that reads as a title, else a per-field error. Shared by `createListing`
+ *  and the title branch of the edit patch, so the create and edit doors can never
+ *  disagree — and shared with the web repo through listing-title-policy.ts, so the
+ *  mobile apps and the website cannot either. `12345` is refused here; `Sa7el
+ *  chalet` is not. */
+function assertListingTitle(v: unknown): string {
+  const s = normalizeListingTitle(v)
+  const problem = validateListingTitle(s)
+  if (problem) throw new ListingInputError(problem)
+  return s
+}
+
+/**
+ * A typed "Other — not listed" compound name that reads as a name, else the same
+ * sentence the web host forms show. Shares its rule with them through
+ * resort-core.ts — `@@@@@` was accepted here too, and a name with no letters has
+ * no slug, so the write path stored it as no resort at all.
+ *
+ * Two cases pass straight through, and both are real answers rather than
+ * oversights: a resort PICKED from the catalog (the typed text is ignored when an
+ * id is present), and nothing typed at all (a chalet outside any compound, or an
+ * edit clearing the resort).
+ */
+function assertResortName(resortId: unknown, resortName: unknown): void {
+  if (typeof resortId === 'string' && resortId.trim()) return
+  if (normalizeResortName(resortName) === null) return
+  const problem = validateResortName(resortName)
+  if (problem) throw new ListingInputError(problem)
 }
 
 /** A whole number >= min, else a per-field error. */
@@ -1237,6 +1223,39 @@ export async function updateListingDetails(
 ): Promise<Listing | null> {
   if (!isUuid(listingId) || !isUuid(hostUserId)) return null
 
+  // The same bar the create door holds, applied to the fields THIS patch touches
+  // — see listing-completeness-policy.ts. A listing that cleared the bar when it
+  // was created must not be editable back below it, and clearing a field is
+  // touching it. Fields the patch leaves alone are not judged: a patch is
+  // partial by design here more than anywhere — the iOS app re-submits a proof
+  // document with `PATCH { ownership_doc }` and nothing else, and its edit screen
+  // never sends `images` at all, because photos travel through the /images
+  // routes (which carry their own floor — see deleteListingImage).
+  //
+  // Two of the rules span more than one column — the pin is a lat/lng pair, the
+  // area can be answered by a region OR by a resort — so when the patch touches
+  // either, the half already stored is read and merged before judging. That read
+  // doubles as the ownership check, which is why a miss returns the same `null`
+  // (404) the UPDATE would have.
+  const touchesMergedField =
+    patch.region !== undefined ||
+    patch.resort_id !== undefined ||
+    patch.resort_name !== undefined ||
+    patch.lat !== undefined ||
+    patch.lng !== undefined
+  let current: ListingCurrentState = {}
+  if (touchesMergedField) {
+    const { rows: cur } = await pool.query(
+      `SELECT region, resort_id, resort_name, lat::float8 AS lat, lng::float8 AS lng
+         FROM listings WHERE id = $1 AND host_id = $2`,
+      [listingId, hostUserId]
+    )
+    if (!cur.length) return null
+    current = cur[0] as ListingCurrentState
+  }
+  const editProblem = checkListingEdit(patch, current)
+  if (editProblem) throw new ListingInputError(listingCompletenessProblemMessage(editProblem))
+
   const sets: string[] = []
   const vals: unknown[] = [listingId, hostUserId]
   const touched: ListingEditField[] = []
@@ -1251,7 +1270,9 @@ export async function updateListingDetails(
   // Guarded on edit as well as on create — otherwise a clean listing could be
   // published and then quietly edited to carry a number.
   if (patch.title !== undefined) {
-    const title = assertText(patch.title, 'Title').slice(0, 200)
+    // `.slice(0, 200)` used to stand here and silently truncated; the policy
+    // refuses an over-long title instead of storing half of one.
+    const title = assertListingTitle(patch.title)
     await guardContent(hostUserId, title, 'listing', { type: 'listing', id: listingId })
     put('title', title)
   }
@@ -1268,6 +1289,9 @@ export async function updateListingDetails(
   const resortEdited = patch.resort_id !== undefined || patch.resort_name !== undefined
   if (patch.region !== undefined && !resortEdited) put('region', assertRegion(patch.region))
   if (resortEdited) {
+    // A listing that was created with a real compound name must not be editable
+    // down to `!!!!!` afterwards — same rule the create door runs.
+    assertResortName(patch.resort_id, patch.resort_name)
     const sel = await resolveResortSelection({
       resortId: patch.resort_id === undefined ? null : String(patch.resort_id ?? '') || null,
       resortName: patch.resort_name === undefined ? null : (patch.resort_name as string | null),
@@ -1289,7 +1313,7 @@ export async function updateListingDetails(
   if (patch.bathrooms !== undefined) put('bathrooms', assertInt(patch.bathrooms, 'Bathrooms', 0))
   if (patch.amenities !== undefined) put('amenities', assertAmenities(patch.amenities))
   if (patch.ownership_doc !== undefined) {
-    put('ownership_doc', assertImageSrc(patch.ownership_doc, 'Please attach a photo of the document'))
+    put('ownership_doc', assertOwnershipDoc(patch.ownership_doc))
   }
 
   // --- Commercial fields (same re-review rule today) ---
@@ -1440,6 +1464,21 @@ export async function deleteListingImage(
     if (!rowCount) {
       await client.query('ROLLBACK')
       return null
+    }
+    // A listing needs a photo — the create door and the edit patch both refuse a
+    // listing without one (listing-completeness-policy.ts), and removing them one
+    // at a time from here is the same listing arriving at the same place. Counted
+    // after the delete, inside the transaction, so the answer is the one this
+    // statement actually produced; the ROLLBACK puts the photo back.
+    const { rows: left } = await client.query(
+      `SELECT count(*)::int AS count FROM listing_images WHERE listing_id = $1`,
+      [listingId]
+    )
+    if ((left[0] as { count: number }).count < MIN_LISTING_PHOTOS) {
+      await client.query('ROLLBACK')
+      throw new ListingInputError(
+        'A listing needs at least one photo — add another before removing this one'
+      )
     }
     await client.query(
       `UPDATE listing_images li SET "order" = ranked.rn - 1
@@ -1873,27 +1912,60 @@ function cleanMonthlyPrices(v: unknown): string {
 /** A host (or admin) creates a listing. Returns the full listing with images. */
 export async function createListing(hostUserId: string, input: CreateListingInput): Promise<Listing> {
   if (!isUuid(hostUserId)) throw new Error('Invalid host id')
-  if (!input.title || !input.title.trim()) throw new Error('Title is required')
+  // A title is what the listing IS everywhere it appears — the explore card, the
+  // search result, the booking request. A non-empty check published `12345` and
+  // `@@@@@` as a listing's name; listing-title-policy is what decides now, and it
+  // is the same file the web repo runs, so the two doors onto this one database
+  // cannot disagree about what a listing may be called.
+  const title = assertListingTitle(input.title)
   const price = Number(input.pricePerNight)
   if (!Number.isFinite(price) || price <= 0) throw new Error('Price must be a positive number')
+  // A title and a price were the WHOLE bar on both doors onto this table: a
+  // listing was created with no description, no address, no area, no map pin and
+  // no photos, and neither the web form nor either mobile wizard said otherwise.
+  // listing-completeness-policy.ts is byte-identical to the web repo's copy
+  // (check-listing-completeness-policy-parity.mjs keeps it that way), so the
+  // phone and the website cannot disagree about what a listing must say.
+  const incomplete = checkListingCompleteness({
+    description: input.description,
+    location: input.location,
+    region: input.region,
+    resort_id: input.resortId,
+    resort_name: input.resortName,
+    lat: input.lat,
+    lng: input.lng,
+    property_type: input.propertyType,
+    images: input.images,
+  })
+  if (incomplete) throw new ListingInputError(listingCompletenessProblemMessage(incomplete))
   // A number in the listing copy reaches every guest at once, so the same guard
   // the chat runs applies to the fields a host writes freely.
-  await guardContent(hostUserId, input.title, 'listing')
+  await guardContent(hostUserId, title, 'listing')
   await guardContent(hostUserId, input.description ?? '', 'listing')
 
   // New listings enter the moderation queue: unpublished + 'pending' until an
   // admin approves them (S7). Ownership doc (if provided) is stored for review.
-  const ownershipDoc = typeof input.ownershipDoc === 'string' && /^(data:image\/|https?:\/\/)/i.test(input.ownershipDoc) && input.ownershipDoc.length < 3_500_000
-    ? input.ownershipDoc
-    : null
+  // Unlike the edit paths this one does NOT refuse the listing over a bad
+  // document — create has always stored what it could and left the rest to the
+  // moderation queue, and a host who attaches nothing usable simply lands there
+  // with no document to review.
+  const ownershipDoc = checkOwnershipDoc(input.ownershipDoc) === null ? String(input.ownershipDoc).trim() : null
   // The resort decides the region — that is the point of a resort belonging to one.
   // An unknown typed name is kept as free text AND queued for /ops.
+  assertResortName(input.resortId, input.resortName)
   const resort = await resolveResortSelection({
     resortId: input.resortId,
     resortName: input.resortName,
     region: input.region ?? null,
     userId: hostUserId,
   })
+  // The map pin. Create used to write whatever arrived straight into the column,
+  // so a latitude of 999 was stored here while the patch path (assertCoord) had
+  // always refused it. Whether the pin agrees with the country and region the
+  // host chose is a softer question answered by listing-geo-policy.ts — the route
+  // returns it as a warning and never refuses the listing over it.
+  const lat = input.lat === undefined ? null : assertCoord(input.lat, 'Latitude', 90)
+  const lng = input.lng === undefined ? null : assertCoord(input.lng, 'Longitude', 180)
   const { rows } = await pool.query(
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
@@ -1903,10 +1975,10 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
      VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18,$19,$20,$21,$22::jsonb,$23,$24)
      RETURNING id`,
     [
-      hostUserId, input.title.trim(), input.description ?? null, input.location ?? null, input.country ?? null,
+      hostUserId, title, input.description ?? null, input.location ?? null, input.country ?? null,
       price, Math.max(0, Math.floor(input.bedrooms ?? 1)), Math.max(0, Math.floor(input.beds ?? 1)),
       Math.max(0, Math.floor(input.bathrooms ?? 1)), Math.max(1, Math.floor(input.maxGuests ?? 2)),
-      input.propertyType ?? 'Apartment', resort.region, input.lat ?? null, input.lng ?? null, genReservationCode(),
+      input.propertyType ?? 'Apartment', resort.region, lat, lng, genReservationCode(),
       input.amenities ?? [], normalizePolicy(input.cancellationPolicy), ownershipDoc,
       clampDiscount(input.weeklyDiscount), clampDiscount(input.monthlyDiscount),
       cleanPrice(input.weekendPrice), cleanMonthlyPrices(input.monthlyPrices),

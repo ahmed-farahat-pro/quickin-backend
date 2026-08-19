@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
-import { getListings, createListing, getListingGateState } from '@/lib/local/db'
+import { getListings, createListing, getListingGateState, isListingInputError } from '@/lib/local/db'
+import { checkListingPin, listingPinProblemMessage } from '@/lib/local/listing-geo-policy'
 import { getUserFromRequest } from '@/lib/local/auth'
 import { canPublishListing } from '@/lib/local/host-verification-core'
 import { isContactBlockedError } from '@/lib/local/contentguard'
@@ -107,11 +108,31 @@ export async function POST(req: Request) {
       weekendPrice: b.weekend_price ?? b.weekendPrice,
       monthlyPrices: b.monthly_prices ?? b.monthlyPrices,
     })
-    return NextResponse.json(listing, { status: 201, headers: CORS })
+    // A pin that disagrees with the country/region the host chose is reported,
+    // never refused — a bounding box must not be the reason a real property can't
+    // be listed. The app shows this next to its map; /ops badges it for the
+    // operator who approves the listing. See listing-geo-policy.ts.
+    const pinProblem = checkListingPin({
+      lat: listing.lat,
+      lng: listing.lng,
+      country: listing.country,
+      region: listing.region,
+    })
+    return NextResponse.json(
+      {
+        ...listing,
+        pin_warning: pinProblem
+          ? { code: pinProblem.code, scope: pinProblem.scope, message: listingPinProblemMessage(pinProblem) }
+          : null,
+      },
+      { status: 201, headers: CORS },
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('POST /api/local/listings failed:', msg)
-    const status = isContactBlockedError(err) || /required|positive|Invalid/i.test(msg) ? 400 : 500
+    // A validator's own error is the host's input to fix, not a server fault —
+    // the message regex only ever caught the wordings that happened to match.
+    const status = isListingInputError(err) || isContactBlockedError(err) || /required|positive|Invalid/i.test(msg) ? 400 : 500
     return NextResponse.json({ error: msg }, { status, headers: CORS })
   }
 }

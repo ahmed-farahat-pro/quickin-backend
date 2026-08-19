@@ -4,7 +4,9 @@ import { listPendingListings, setListingApproval } from '@/lib/local/db'
 
 // Admin listing-moderation queue.
 //   GET  /api/local/admin/listings                       → pending listings (with ownership_doc + host email)
-//   POST /api/local/admin/listings { listing_id, action } → action: "approve" | "reject"
+//   POST /api/local/admin/listings { listing_id, action, note? } → action: "approve" | "reject"
+//        `note` is the optional reason a rejection shows the host — it is stored on
+//        the listing (listings.review_note), not just announced in a notification.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -43,7 +45,8 @@ export async function POST(req: Request) {
     if (!/^(approve|reject)$/i.test(action)) {
       return NextResponse.json({ error: 'action must be "approve" or "reject"' }, { status: 400, headers: CORS })
     }
-    const updated = await setListingApproval(listingId, /^approve$/i.test(action))
+    const approve = /^approve$/i.test(action)
+    const updated = await setListingApproval(listingId, approve, b.note ?? b.review_note ?? null)
     if (!updated) return NextResponse.json({ error: 'Listing not found' }, { status: 404, headers: CORS })
     await logStaffAction({
       staffId: gate.staff.legacy ? null : gate.staff.staffId,
@@ -51,7 +54,9 @@ export async function POST(req: Request) {
       action: 'listing_moderated',
       targetType: 'listing',
       targetId: listingId,
-      detail: { action },
+      // Whether a reason was given, not the reason itself — the audit log is read by
+      // every staff member, and the note is already on the listing.
+      detail: { action, noted: !!updated.review_note },
       ip: clientIpOf(req),
     })
     return NextResponse.json(updated, { headers: CORS })

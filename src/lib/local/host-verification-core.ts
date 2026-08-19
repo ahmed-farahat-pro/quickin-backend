@@ -162,3 +162,25 @@ export function isListingAllowed(input: ListingGateInput): boolean {
 export function revokesListingPrivileges(previous: unknown, next: unknown): boolean {
   return normalizeVerificationStatus(previous) === 'verified' && normalizeVerificationStatus(next) !== 'verified'
 }
+
+/**
+ * Must someone with this verification status upload identity documents again?
+ *
+ * A user verifies ONCE, from their profile — the same identity serves guest and
+ * host alike. The host application therefore asks for documents only when there
+ * is nothing usable on file: a 'verified' submission is already approved, and a
+ * 'pending' one is already in the reviewer's queue and will be decided together
+ * with the application. Asking either of them to photograph the same ID a second
+ * time is the redundancy this function exists to prevent.
+ *
+ * 'rejected' DOES require new documents — that decision was "these are not good
+ * enough", so re-filing the same row would put the same refused photos back in
+ * front of the reviewer.
+ *
+ * The web application form and `submitHostApplication` both read this, so what
+ * the applicant is asked for and what the server requires can never disagree.
+ */
+export function needsIdentityDocuments(status: unknown): boolean {
+  const s = normalizeVerificationStatus(status)
+  return s !== 'verified' && s !== 'pending'
+}

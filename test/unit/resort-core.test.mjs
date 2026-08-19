@@ -10,7 +10,11 @@ import {
   REGION_VALUES,
   isRegion,
   MAX_RESORT_NAME,
+  MIN_RESORT_NAME_LETTERS,
   normalizeResortName,
+  checkResortName,
+  isValidResortName,
+  validateResortName,
   resortSlug,
   editDistance,
   suggestResortMatches,
@@ -54,6 +58,72 @@ describe('normalizeResortName', () => {
   test('caps length so a paste accident cannot fill the column', () => {
     const long = 'a'.repeat(500)
     assert.equal(normalizeResortName(long).length, MAX_RESORT_NAME)
+  })
+})
+
+describe('checkResortName', () => {
+  // The bug: the create form asked only that the box was non-blank, so a host
+  // could pick "Other — not listed", type `@@@@@` and publish. The name has no
+  // slug, and a name with no slug was read downstream as "no resort chosen" —
+  // the answer was discarded on save.
+  test('refuses a name made only of symbols — the bug this rule exists for', () => {
+    for (const junk of ['@@@@@', '!!!!!', '-----', '###', '???', '...', '***']) {
+      assert.deepEqual(checkResortName(junk), { code: 'letters' }, `"${junk}" must be refused`)
+    }
+  })
+
+  test('refuses a name made only of digits, in either numeral system', () => {
+    assert.deepEqual(checkResortName('12345'), { code: 'letters' })
+    assert.deepEqual(checkResortName('٠١٢٣'), { code: 'letters' })
+    assert.deepEqual(checkResortName('90 90 90'), { code: 'letters' })
+  })
+
+  test('refuses invisible characters, which survive a trim and render as nothing', () => {
+    assert.deepEqual(checkResortName('\u200b\u200b'), { code: 'required' })
+    assert.deepEqual(checkResortName('\ufeff \u00ad'), { code: 'required' })
+  })
+
+  test('says `required` for blank, before it says anything about letters', () => {
+    assert.deepEqual(checkResortName(''), { code: 'required' })
+    assert.deepEqual(checkResortName('   '), { code: 'required' })
+    assert.deepEqual(checkResortName(null), { code: 'required' })
+    assert.deepEqual(checkResortName(42), { code: 'required' }, 'non-strings are not coerced')
+  })
+
+  test('says `letters` before `tooShort` — the fix for `@@@@@` is words, not a sixth @', () => {
+    assert.deepEqual(checkResortName('@'), { code: 'letters' })
+    assert.deepEqual(checkResortName('A'), { code: 'tooShort' })
+  })
+
+  // The half that matters more: a rule that turns away a real compound is the
+  // worse failure — the host's only alternative is to leave the resort blank.
+  test('accepts the names hosts actually type', () => {
+    for (const name of [
+      'Marassi',
+      'Hacienda Bay',
+      'Marina D\'Or',
+      'Marassi (North)',
+      'Sa7el Chalet',        // franco-arabic writes real words with numerals
+      'La Vista 7',
+      '90 Avenue',
+      'هاسيندا باي',          // Arabic — the catalog is Egypt-first
+      'Il Monte Galala',
+    ]) {
+      assert.equal(checkResortName(name), null, `"${name}" must be accepted`)
+      assert.equal(isValidResortName(name), true)
+    }
+  })
+
+  test('MIN_RESORT_NAME_LETTERS is the floor, counted in any script', () => {
+    assert.equal(MIN_RESORT_NAME_LETTERS, 2)
+    assert.deepEqual(checkResortName('م'), { code: 'tooShort' })
+    assert.equal(checkResortName('م ج'), null, 'two letters, split by a space, still counts')
+  })
+
+  test('validateResortName turns a problem into the sentence the API returns', () => {
+    assert.match(validateResortName('@@@@@'), /symbols or numbers/)
+    assert.match(validateResortName(''), /resort or compound name/)
+    assert.equal(validateResortName('Marassi'), null)
   })
 })
 

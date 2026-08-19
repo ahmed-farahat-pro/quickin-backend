@@ -30,18 +30,118 @@ export function isRegion(value: unknown): value is Region {
  *  enough that a paste accident can't fill the column. */
 export const MAX_RESORT_NAME = 120
 
+// Invisible characters people paste in without meaning to: the soft hyphen, the
+// Mongolian vowel separator, the zero-width spaces and bidi marks, the BOM. They
+// survive a `.trim()` and render as nothing, so a name made only of them would
+// otherwise read as non-empty — strip them before anything else looks.
+const INVISIBLE = /[\u00AD\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/gu
+
+// A letter in any script — `\p{L}` covers Arabic, Latin, Cyrillic and the CJK
+// ideographs alike, which is the whole point of using it over /[A-Za-z]/.
+const HAS_LETTER = /\p{L}/u
+
 /**
- * Clean a host-typed resort name for DISPLAY: collapse whitespace, trim, cap length.
- * Returns null for anything blank, which is how "the host left it empty" is
- * represented everywhere downstream.
+ * Clean a host-typed resort name for DISPLAY: drop invisibles, collapse
+ * whitespace, trim, cap length. Returns null for anything blank, which is how
+ * "the host left it empty" is represented everywhere downstream.
  *
  * This preserves the host's capitalisation and punctuation on purpose — the raw
  * text is shown to guests as typed until an admin approves a canonical spelling.
  */
 export function normalizeResortName(input: unknown): string | null {
   if (typeof input !== 'string') return null
-  const cleaned = input.replace(/\s+/g, ' ').trim().slice(0, MAX_RESORT_NAME)
+  const cleaned = input.replace(INVISIBLE, '').replace(/\s+/g, ' ').trim().slice(0, MAX_RESORT_NAME)
   return cleaned.length > 0 ? cleaned : null
+}
+
+// ---------------------------------------------------------------------------
+// The "Other — not listed" name rule — what may be typed into the free-text box
+// ---------------------------------------------------------------------------
+// The forms asked only that the box was non-blank, so `@@@@@` and `!!!!!` were
+// accepted and the listing submitted. Worse than an ugly catalog entry: a name
+// with no alphanumerics slugs to '' (see resortSlug), and the write path reads a
+// slug-less name as "no resort chosen" — the host's answer was thrown away, the
+// listing missed every resort filter, and nothing queued for the /ops catalog.
+// That is the same silent discard `isResortNameMissing` was written to stop, one
+// step further along.
+//
+// The rule that does the work is `letters`: a compound name must contain letters.
+// Not "must be Latin", not "must not contain punctuation" — `Marassi (North)`,
+// `Sa7el Chalet` and `هاسيندا باي` are all real names a host may type. What it
+// refuses is a name with no letters at all: `@@@@@`, `!!!!!`, `12345`, `-----`.
+//
+// Deliberately the same shape as checkListingTitle in listing-title-policy.ts —
+// same problem, same answer, so a reader who knows one knows the other.
+
+/** Enough letters to be a name. `A5` is a villa number, not a compound. */
+export const MIN_RESORT_NAME_LETTERS = 2
+
+/**
+ * Why a typed resort name was refused. Structured like `ListingTitleProblem`, and
+ * for the same reason: the API echoes the code so a client can localize the reason
+ * without re-deciding it.
+ */
+export type ResortNameProblemCode = 'required' | 'letters' | 'tooShort'
+
+export interface ResortNameProblem {
+  code: ResortNameProblemCode
+}
+
+/** How many letters the name actually contains, in any script. */
+function resortNameLetterCount(name: string): number {
+  let count = 0
+  for (const ch of name) {
+    if (HAS_LETTER.test(ch)) count++
+  }
+  return count
+}
+
+/**
+ * Decide a host-typed resort name. Returns the first problem, or null when it is
+ * acceptable.
+ *
+ * Order matters: `letters` is checked before `tooShort` so `@@@@@` is told the
+ * thing that is actually wrong with it ("write it in words") rather than being
+ * sent back to add a sixth `@`.
+ *
+ * Only ever applied to text the host TYPED. A resort picked from the dropdown is
+ * a catalog row that has already been through /ops, and "no resort at all" is a
+ * legitimate answer — neither goes anywhere near this.
+ */
+export function checkResortName(input: unknown): ResortNameProblem | null {
+  const value = normalizeResortName(input)
+  if (!value) return { code: 'required' }
+
+  const letters = resortNameLetterCount(value)
+  if (letters === 0) return { code: 'letters' }
+  if (letters < MIN_RESORT_NAME_LETTERS) return { code: 'tooShort' }
+  return null
+}
+
+/** True when `checkResortName` has nothing to say — the gate on a submit button. */
+export function isValidResortName(input: unknown): boolean {
+  return checkResortName(input) === null
+}
+
+/**
+ * The plain-English sentence the API returns as `error`. Clients that localize
+ * read the problem code instead; this is what every other caller renders.
+ */
+export function resortNameProblemMessage(problem: ResortNameProblem): string {
+  switch (problem.code) {
+    case 'required':
+      return 'Please type the resort or compound name'
+    case 'letters':
+      return 'Please write the resort or compound name in words — it can’t be only symbols or numbers'
+    case 'tooShort':
+      return `A resort or compound name needs at least ${MIN_RESORT_NAME_LETTERS} letters`
+  }
+}
+
+/** One-shot: the message to show, or null when the name is acceptable. */
+export function validateResortName(input: unknown): string | null {
+  const problem = checkResortName(input)
+  return problem ? resortNameProblemMessage(problem) : null
 }
 
 /**

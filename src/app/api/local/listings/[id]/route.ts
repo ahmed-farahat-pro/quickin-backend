@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getListingById, updateListingDetails, isListingInputError, type ListingPatch } from '@/lib/local/db'
+import { checkListingPin, listingPinProblemMessage } from '@/lib/local/listing-geo-policy'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // GET   /api/local/listings/:id → a single listing (no Supabase).
@@ -117,7 +118,23 @@ export async function PATCH(
     if (!updated) {
       return NextResponse.json({ error: 'Only the listing host can edit this listing' }, { status: 403, headers: CORS })
     }
-    return NextResponse.json(updated, { headers: CORS })
+    // Same non-blocking pin check the create route answers with — a pin can be
+    // dragged into the wrong country from the editor too. See listing-geo-policy.ts.
+    const pinProblem = checkListingPin({
+      lat: updated.lat,
+      lng: updated.lng,
+      country: updated.country,
+      region: updated.region,
+    })
+    return NextResponse.json(
+      {
+        ...updated,
+        pin_warning: pinProblem
+          ? { code: pinProblem.code, scope: pinProblem.scope, message: listingPinProblemMessage(pinProblem) }
+          : null,
+      },
+      { headers: CORS },
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('PATCH /api/local/listings/[id] failed:', msg)

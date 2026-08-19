@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { getUserFromRequest, getFullProfile, updateProfile } from '@/lib/local/auth'
 import { isContactBlockedError } from '@/lib/local/contentguard'
 import { canonicalDocumentNumber } from '@/lib/local/id-change-core'
+import { checkName, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
 
 // Profile of the signed-in user.
 //   GET   /api/local/profile           → { id, email, full_name, role, age, id_document, phone, … }
@@ -76,9 +77,38 @@ export async function PATCH(req: Request) {
       }
     }
 
+    // A name is checked here, not only at signup. Signup has refused `12345`
+    // since name-policy.ts landed, but this endpoint took whatever string arrived
+    // — so a guest could sign up as `Layla` and rename themselves to `0100` a
+    // minute later, on the very screen the apps call Edit profile. The name is
+    // what a host reads next to a booking request and what an operator matches
+    // against an ID document, so the rule has to hold on every door that sets it.
+    //
+    // A body with no name at all is left alone: `updateProfile` writes with
+    // COALESCE, so null means "leave the column". Both apps save the avatar
+    // through this same endpoint, and a save carrying no name must not be
+    // refused for not carrying one — only a name actually submitted is judged.
+    // Both spellings are read because both are in the wild (`fullName` from
+    // older Android builds), and a non-string counts as absent, as it always did.
+    const rawName =
+      typeof b.full_name === 'string' ? b.full_name : typeof b.fullName === 'string' ? b.fullName : null
+    let fullName: string | null = null
+    if (rawName !== null) {
+      const name = normalizeName(rawName)
+      const nameProblem = checkName(name)
+      if (nameProblem) {
+        return NextResponse.json(
+          { error: nameProblemMessage(nameProblem), field: 'full_name', nameProblem },
+          { status: 400, headers: CORS },
+        )
+      }
+      // Stored normalized, so one name is one name wherever it is read.
+      fullName = name
+    }
+
     const ageRaw = b.age ?? b.Age
     const updated = await updateProfile(user.id, {
-      fullName: typeof b.full_name === 'string' ? b.full_name : typeof b.fullName === 'string' ? b.fullName : null,
+      fullName,
       age: ageRaw === '' || ageRaw == null ? null : Number(ageRaw),
       phone: b.phone ?? null,
       bio: typeof b.bio === 'string' ? b.bio : null,

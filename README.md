@@ -20,6 +20,8 @@ npm run dev        # API at http://localhost:4000
 | --- | --- | --- |
 | GET  | `/api/local/listings` | All published listings. Filters: `?location=&guests=&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD`. `?sort=` is `recommended` (default) \| `price_asc` \| `price_desc` \| `newest`; **`recommended` ranks by rating + completed bookings** — see Search ranking below |
 | GET  | `/api/local/listings/[id]` | One listing by UUID (404 if missing) |
+| POST | `/api/local/listings` | Create a listing (approved + identity-verified host). The response is the listing plus **`pin_warning`** — `null`, or `{code, scope, message}` when the map pin falls outside the `country` / `region` the host chose. It is a **warning**: the listing is created either way. A lat/lng outside ±90/±180 is a different matter and answers **400** |
+| PATCH | `/api/local/listings/[id]` | The host edits their listing. Carries the same **`pin_warning`** field, for the same reason — a pin can be dragged into the wrong country from the editor too |
 | GET  | `/api/local/profile/id-change` | The signed-in user's ID number and the state of any request to change it → `{ current, request, can_request }` |
 | POST | `/api/local/profile/id-change` | File a change request: `{ requested_value, doc_type, front, back?, reason? }`. **`front` is required** — without a document the reviewer has nothing to check the number against. Resubmitting replaces a request still awaiting review |
 | DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
@@ -61,6 +63,15 @@ place those two facts are combined; every refusal carries a `code`
 (`not_host` | `verification_missing` | `verification_pending` | `verification_rejected`)
 that web, iOS and Android switch on to pick a call to action. Clients must never parse the
 message — the wording is server-owned so all three say the same thing.
+
+The same module exports `needsIdentityDocuments(status)` — whether someone with that
+verification status still has to upload documents (`verified` and `pending` do not;
+`rejected` and "no submission" do). Nothing in **this** project reads it: the mobile apply
+endpoint has never collected ID, and mobile users verify through
+`POST /api/local/verification`. It lives here because the file is byte-identical across
+both projects, and it is the rule the **web** application form and the web
+`submitHostApplication` both run so that a guest who already verified from their profile is
+not asked to photograph the same ID again to become a host.
 
 The gate bites in three places:
 
@@ -128,6 +139,20 @@ name arrives in `fields.full_name` like the other per-field messages, with the c
 through `NameRules` (the host form and sign-up share it), Android in
 `HostApplyScreen.kt`, which shows the reason under the field and keeps Submit disabled
 until the name has letters.
+
+**`PATCH /api/local/profile` applies it too**, and until now it did not — which made
+every gate above a front door with an open window beside it. Signup refused `12345`,
+then Edit profile in both apps took it without a word, because this route passed
+`full_name` straight to `updateProfile`. Anyone could sign up as `Layla` and be `0100`
+a minute later. The name is now normalized and checked here before anything is written,
+and a refusal answers 400 with `error`, `field: 'full_name'` and the `nameProblem` code,
+the same shape `/host/apply` uses. A request that omits `full_name` is untouched
+(`COALESCE` leaves the column alone) — it is only a name actually submitted that is
+judged, so an avatar-only save still works (the check is inline in the route, like
+the sibling `users/[id]` route on the web — `name-policy.ts` stays import-free so
+`node --test` can load it). One consequence worth knowing: sending
+`full_name: ""` used to blank the column silently and is now a `required` 400.
+`PATCH /api/local/users/[id]` on the web has enforced the same rule since it was added.
 
 ### The platform commission
 
@@ -305,6 +330,182 @@ rather than failing on submit; the mobile apps have no such checklist yet and wi
 show the sentence from `error` instead. And **existing weak passwords keep working** —
 nothing rehashes or expires them; the rules apply the next time one is set.
 
+## A compound name has to be a name
+
+`POST /api/local/listings` (and the `PATCH`) take the resort a chalet sits in as
+**either** `resort_id` — a row picked from the catalog — **or** `resort_name`, the
+free text a host types under the apps' *Other — not listed* option. The typed name
+was only ever checked for being non-blank, so `@@@@@`, `!!!!!` and `12345` were
+accepted and the listing created. Worse than an ugly catalog entry: a name with no
+alphanumerics slugs to `''`, and `resolveResortSelection` reads a slug-less name as
+*no resort chosen* — the host's answer was thrown away on save, the listing missed
+every resort filter, and nothing queued for the /ops catalog.
+
+**`checkResortName` in `src/lib/local/resort-core.ts`** decides now, next to the
+normalizer and the slug it protects. `assertResortName` in `db.ts` runs it on both
+doors — `createListing` and `updateListingDetails` — and throws `ListingInputError`,
+so the routes answer **400** with the reason. `resolveResortSelection` re-checks as a
+storage backstop, so a caller that forgets can't dirty the catalog.
+
+The rule: the name must contain **letters** (`\p{L}`, so Arabic counts), at least two
+of them. Deliberately **not** "no punctuation" and **not** "Latin only" — `Marassi
+(North)`, `Sa7el Chalet`, `90 Avenue` and `هاسيندا باي` are all names a host really
+types, and a rule that turns one of those away leaves the resort blank, which is the
+failure it was meant to prevent. `letters` is reported before `tooShort`, so `@@@@@`
+hears "write it in words" rather than "add another `@`". A resort **picked** from the
+catalog and *nothing typed at all* both pass straight through: they are real answers,
+not oversights.
+
+A name with letters but **no** slug — anything in a non-Latin script — is now **kept**
+as free text rather than dropped. It has no match key, so it can't auto-link to a
+catalog row and can't queue (`resort_submissions` is keyed on the slug), but it is
+stored, returned to the apps as typed, and visible to an admin in the /ops
+unassigned-names sweep.
+
+`resort-core.ts` is byte-identical to the web project's copy — the same rule runs on
+the web host forms, which localize the problem code. `scripts/check-resort-core-parity.mjs`
+fails if they drift; `test/unit/resort-core.test.mjs` covers the rule in both
+directions.
+
+## The map pin has to be where the listing says it is
+
+A listing states its place twice: in words (`location`, `country`, the curated
+`region` chip, the resort) and as a **map pin** (`lat`/`lng`) the host drops. Nothing
+compared the two. A host could choose Egypt → North Coast → Porto, pin the map in
+**Germany**, and the listing saved without a murmur — then every surface that draws a
+listing on a map put that Egyptian chalet in Bavaria. `createListing` here wrote
+`input.lat ?? null` straight into the column, so it did not even bound the value: a
+latitude of `999` was stored, on a path where the `PATCH` (`assertCoord`) had always
+refused it.
+
+**`checkListingPin` in `src/lib/local/listing-geo-policy.ts`** answers the question
+now, from **bounding boxes** — one per country the host form offers, one per curated
+area (North Coast, Ain Sokhna, El Gouna, Cairo). Not a polygon and not a
+reverse-geocode: a reverse-geocode is a rate-limited network call on every pin drag,
+offline on mobile and fuzzy to compare against free text, while a box is explainable
+to the operator who has to act on it. The boxes are padded outward, because a chalet
+pinned a few hundred metres offshore is not an error.
+
+It **warns, it does not refuse.** `POST` and `PATCH` answer with `pin_warning`
+(`{code, scope, message}` — `outsideCountry` \| `outsideRegion` \| `outOfRange`) and
+create/save the listing regardless: a box drawn in a source file must never be the
+reason a real property can't be listed. The web host forms render the same verdict
+under their map in the host's own language, and **/ops badges a listing whose pin was
+ignored** ("Pin outside Egypt") on the card the operator approves from. Nothing about
+the mismatch is stored — it is derived from `lat`/`lng`/`country`/`region` at read
+time, so there is no column to migrate and no flag that goes stale when a host fixes
+their pin.
+
+The one hard refusal: a coordinate outside ±90/±180 is not a pin at all, and
+`assertCoord` now runs on **both** doors — `createListing` as well as
+`updateListingDetails` — answering **400**.
+
+`listing-geo-policy.ts` is byte-identical to the web project's copy;
+`scripts/check-listing-geo-policy-parity.mjs` fails if they drift (`npm run check`
+runs it), and `test/unit/listing-geo-policy.test.mjs` is the same suite in both — it
+pins the reported bug (Egypt + North Coast + a Berlin pin), every curated area
+against every other, Morocco's negative longitudes, and the silence the module keeps
+when it cannot honestly judge (no pin, a country or region it has no box for).
+`mobile/ios/Sources/ListingGeoPolicy.swift` and
+`mobile/android/app/src/main/java/com/quickin/app/ListingGeoPolicy.kt` are the Swift
+and Kotlin translations the two apps warn with — same numbers, same boxes, updated by
+hand. Nothing guards those two, so the boxes are the contract between all four files.
+
+## A listing title has to be a title
+
+`createListing` asked for a non-empty string, so `12345`, `2024`, `٠١٢٣٤` and
+`@@@@@` cleared it and were published as the listing's **name** — the line on the
+explore card, the search result, the booking request the host reads, every push that
+names the stay. A field that only checks for emptiness is not checking anything, and
+the title is the one field a guest sees before anything else.
+
+**`checkListingTitle` in `src/lib/local/listing-title-policy.ts`** decides now, on
+both doors: `createListing` and the `title` branch of the edit patch, through one
+`assertListingTitle` helper so the two can never disagree. The rule that does the
+work is **letters**: a title must contain at least `MIN_TITLE_LETTERS` (3) letters in
+*any* script. Not "must be Latin" and not "no punctuation" — `Nile-view flat (2BR)`,
+`Sa7el chalet` (Franco-Arabic spells real words with numerals) and
+`شقة بإطلالة على النيل` are all real titles, and a rule that turned one of them away
+would be the worse failure. What it refuses is a title with **no letters at all**.
+Invisible characters (zero-width spaces, bidi marks, the BOM) are stripped and
+whitespace runs collapsed before anything looks, so a title made only of them reads
+as empty rather than as non-empty. An over-long title (over `MAX_TITLE_LENGTH`, 200
+**code points**, so an emoji counts once) is now **refused** on the edit door instead
+of being silently truncated by the `.slice(0, 200)` that used to stand there.
+
+The answer is **400** with the sentence the host has to act on — "Please describe
+your listing in words — a title can't be only symbols or numbers" — chosen by problem
+code (`required` \| `letters` \| `tooShort` \| `tooLong`), with `letters` checked
+before `tooShort` so `@@@@@` is told what is actually wrong with it rather than being
+sent back to add a sixth `@`.
+
+`listing-title-policy.ts` is byte-identical to the web project's copy;
+`scripts/check-listing-title-policy-parity.mjs` fails if they drift (`npm run check`
+runs it). That parity is the whole point here: both repos write titles into the
+**same** `listings` table — this one for the iOS and Android apps, the web one for
+`/host/new`, the host edit form and the dashboard wizard — so a rule living in only
+one of them means `12345` is refused on the website and published from the phone,
+into the same grid. `test/unit/listing-title-policy.test.mjs` is the same suite in
+both: that digit-only, symbol-only and Arabic-Indic-digit titles are refused, that
+the Franco-Arabic and Arabic titles above still get in, that invisibles do not pass
+for content, and that the code chosen for each refusal is the one the host can act on.
+
+## A listing has to say enough to be a listing
+
+`createListing` required a **title and a price. That was all.** Every other column
+went in as whatever arrived, or `null` — so a listing reached the `listings` table
+with no description, no address, no curated area, no map pin and not one photo, from
+either door onto this database. The result is a listing a guest cannot **read** (no
+description), cannot **find** (no region to filter by), cannot **see** (no photos)
+and cannot **place** (no pin, so it is missing from the map the whole browse
+experience is built on). Both mobile wizards had already reached half of that
+conclusion on their own — each required the area and the pin, neither required a
+description or a photo — which is the worst number of clients to nearly agree.
+
+**`src/lib/local/listing-completeness-policy.ts`** decides now, on both doors:
+
+| Door | What it does |
+| --- | --- |
+| `createListing` | Judges the **whole** listing — a description (at least `MIN_DESCRIPTION_LETTERS`, 20), an address, an area, a map pin, a property type and at least `MIN_LISTING_PHOTOS` (1) photo. Throws `ListingInputError`, so the create route answers **400** with the sentence the host has to act on |
+| `updateListingDetails` | Judges only the fields the **patch touches** (`checkListingEdit`). Clearing a field is touching it, so a listing cannot be created complete and then emptied out |
+| `deleteListingImage` | Refuses to remove the **last** photo. Counted after the delete, inside the transaction, so the `ROLLBACK` puts it back. Without this the photo rule is bypassable one image at a time — which is exactly how the mobile apps remove them |
+
+The floors count **letters**, not characters, for the same reason
+`listing-title-policy.ts` counts them: `....................` is twenty characters and
+no description at all. `letters` is reported before `tooShort`, so a box of symbols
+hears the real problem instead of being told to add a twenty-first one.
+
+The edit door is deliberately narrower than the create door, because a patch is
+partial by design: the iOS app re-submits a proof of ownership with
+`PATCH { ownership_doc }` and nothing else, and its edit screen never sends `images`
+at all. Re-running the create check on the merged row would refuse both, and would
+hold a host's price change hostage to a description their listing never had. The
+two-column rules are merged before judging, so patching `lat` alone is still judged as
+a pin against the stored `lng`, and swapping the region on a listing that names a
+resort is still judged as an area.
+
+The **resort is not required**, and a resort **answers the area requirement on its
+own** — a standalone villa belongs to no compound, and `resolveResortSelection`
+already derives the region from a chosen resort, so demanding the region separately
+would refuse a listing that names its compound and then fill the region in a line
+later.
+
+This is a completeness rule, not a quality one: whether the description is any *good*
+is what the `/ops` review is for, and every new listing still lands there as
+`pending`.
+
+`listing-completeness-policy.ts` is byte-identical to the web project's copy;
+`scripts/check-listing-completeness-policy-parity.mjs` fails if they drift (`npm run
+check` runs it). That parity is the point — both repos write into the **same**
+`listings` table, so a rule living in only one of them means a listing with no photos
+is refused on the website and created from the phone, into the same explore grid.
+`test/unit/listing-completeness-policy.test.mjs` is the same suite in both: that a
+title and a price alone are refused, that each required field is caught when it alone
+is missing, that the first problem is reported in **form order**, that half a pin is
+no pin while `0,0` is a real coordinate, that a non-array `images` value is zero
+photos rather than an exemption — and, for the edit door, that clearing any required
+field is refused while a field the patch never mentions is left alone.
+
 ## Environment
 
 | Var | Required | Purpose |
@@ -351,7 +552,7 @@ Optional locally:
 | --- | --- |
 | `SMTP_*` | OTP and staff-reset codes are printed to the server console instead of emailed (the reset UI shows the code) |
 | `STAFF_AUTH_SECRET` | Falls back to a dev default — fine locally, **set it in production** |
-| `PAYMOB_*`, `FIREBASE_*` | Those features are inert |
+| `FIREBASE_*` | Push notifications are inert |
 
 ### Seeding just the schema
 
@@ -395,8 +596,9 @@ imported by a test at all**. The rule that works around it:
 
 `src/lib/local/resort-core.ts`, `payment-config-core.ts`, `contentguard.ts`,
 `moderation-core.ts`, `disputes-core.ts`, `ranking-core.ts`, `phone-core.ts`,
-`name-policy.ts`, `password-policy.ts` and `account-status-core.ts` are the working
-examples.
+`name-policy.ts`, `password-policy.ts`, `listing-geo-policy.ts`,
+`listing-title-policy.ts`, `listing-review-note-core.ts` and `account-status-core.ts`
+are the working examples.
 
 `name-policy.test.mjs` carries the signup name rule in both directions: that `12345`,
 `٠١٢٣٤`, `0100` and `-----` are refused, and — the half that matters more — that
@@ -689,6 +891,32 @@ project's audited `/api/local/admin/documents/:kind/:id`, behind the `documents`
 module. No mobile client ever read that field (iOS only writes it, on listing
 creation).
 
+### What an ownership document may be
+
+`lib/local/ownership-doc-core.ts` decides what lands in `listings.ownership_doc`:
+an image data URL, an `application/pdf` data URL whose bytes really start with
+`%PDF-` (the mime is uploader-supplied text; the magic number is not), or an
+http(s) link — capped at `OWNERSHIP_DOC_MAX_CHARS` (3.5M chars ≈ a 2.5 MB file).
+SVG is refused: `/ops` will not render it, so accepting it only ever stored a
+document no operator could open.
+
+PDF was added on 2026-08-19 for the website, where a host can pick a file — a
+deed or utility bill is *issued* as a PDF, and image-only forced them to
+photograph it off a screen. **This repo accepts PDFs but no mobile client sends
+one**: iOS and Android both use a photo picker. It is here so the two halves
+cannot disagree about a document already on file — a host who uploads a PDF deed
+on the web and then edits that listing from the app must not be refused over it.
+
+| Piece | What it does |
+| --- | --- |
+| `checkOwnershipDoc` | Returns `'missing' \| 'unsupported' \| 'too_large'` or `null`. Returns the problem instead of throwing so this repo can raise `ListingInputError` (which the routes map to 400) while the web raises a plain `Error` — both answering with the same sentence from `ownershipDocProblemMessage` |
+| `assertOwnershipDoc` (db.ts) | The edit paths: `setListingOwnershipDoc` and `updateListing`'s `ownership_doc` field. Refuses the write and tells the host why |
+| `createListing` | Deliberately does **not** refuse: an unusable document is stored as `null` and the listing still enters the moderation queue, as it always has |
+
+**Kept byte-identical with the quickin-frontend copy** — both write the same Neon
+column. `scripts/check-ownership-doc-core-parity.mjs` (wired into `npm run check`)
+fails on drift.
+
 ## Account status — blocked and removed accounts
 
 `users.account_status` (`'active' | 'blocked' | 'removed'`) is written by `/ops` in the
@@ -710,6 +938,31 @@ that shape: the apps branch on `403 && needsVerification === true` to reach the 
 screen, so adding the key would send a suspended user somewhere they can succeed and
 still be refused. `adminBroadcast` also skips non-active accounts, so a blocked user
 receives no push or email.
+
+## A rejected listing has to say why
+
+`setListingApproval` used to spend the rejection reason and then lose it: the note was
+interpolated into the host's notification body and nothing stored it. A host who missed
+that one notification was left with a red **Rejected** badge and no way to find out what
+to fix — the whole difference between rejecting a listing and deleting it.
+
+`POST /api/local/admin/listings` now takes an optional `note` (`review_note` is accepted
+too) and `setListingApproval(listingId, approve, note)` stores it on
+`listings.review_note`:
+
+| Piece | What it does |
+| --- | --- |
+| `lib/local/listing-review-note-core.ts` | `normalizeListingReviewNote` — blank, whitespace and non-string all collapse to the same `null`, so the column never fills with `''` rows that read as a reason downstream; an over-long note is truncated at `MAX_LISTING_REVIEW_NOTE_CHARS` rather than refused, because a slip of the finger must not leave a listing stuck in the queue. `listingRejectionMessage` builds the notification body from that same normalized note. **Kept byte-identical with the quickin-frontend copy** — `/ops` rejects through the web app, this API rejects for the mobile clients, and a disagreement would make the same rejection read differently depending on the door |
+| `setListingApproval` | Stores the note on reject, **NULLs it on approve** — the note describes a rejection, and a stale one under a live listing reads as a fresh complaint |
+| `REQUEUE_SET` | Clears it whenever an edit or a re-uploaded ownership document sends the listing back to `pending`, so a reason on screen always describes the *current* rejection |
+| `LISTING_COLS_HOST` | Returns `review_note`, which is how `GET /api/local/host/listings` feeds the iOS and Android host dashboards. Deliberately **not** in `LISTING_COMMON_COLS`: it is staff-authored text about the host and has no business on a guest read |
+
+The audit row records `noted: true|false`, not the text — the log is read by every staff
+member and the note already lives on the listing.
+
+The note stays **optional**: someone clearing a queue of obvious spam should not have to
+type, and forcing a reason there would only produce `.`. Every client falls back to
+generic "needs changes" copy when it is NULL.
 
 ## Database migrations
 
@@ -734,6 +987,7 @@ the list of record. Recent additions:
 | `migrate-payout-methods.mjs` | `host_payout_methods` — one row per host (`UNIQUE user_id`) holding the single destination they chose for their earnings (`bank_name`/`iban`/`account_number`/`swift_bic`/`branch` for a bank account). Also **reports** how many approved hosts have not added one. Additive, and the read path degrades to "none set" if it has not run, so it is safe to apply well ahead of the deploy. Re-running it converges a database built by the first version of the script, which had a `credit_card` method with an `expiry` — that version never reached production, so there is nothing to back-fill |
 
 | `migrate-id-change-requests.mjs` | `id_change_requests` — a user's request to change the ID number on their profile, with the document photo backing it, one open request per user (partial unique index). Behind `/ops` → ID verifications, and the only thing that writes `users.id_document` now that `PATCH /api/local/profile` refuses it. Also **reports** how many accounts already carry a self-declared number that nobody ever reviewed. Additive, and the reads degrade to an empty queue if it has not run, so it is safe to apply well ahead of the deploy |
+| `migrate-listing-review-note.mjs` | `listings.review_note` — the operator's reason for rejecting a listing, which used to exist only inside a notification body and is now shown to the host on the web dashboard, in the listing editor and on both mobile host dashboards. Nullable, no backfill: NULL means "no reason recorded", the honest answer both for an unexplained rejection (the note is optional) and for every listing rejected before the column existed. Also **reports** how many rejected listings carry no reason. **Unlike most additive columns this one must be applied BEFORE the deploy** — the host projection selects it, so a database without it fails every host read |
 | `migrate-ranking-indexes.mjs` | Two indexes for the search ranking — `reviews(listing_id) INCLUDE (rating, created_at)` and `bookings(listing_id, status, check_out)`. **Pure performance, no schema change:** the ranking is correct without it, so the usual order does not apply and it can be run before or after the deploy |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The
