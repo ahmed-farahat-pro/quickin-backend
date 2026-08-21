@@ -15,6 +15,9 @@ import {
   isHostVerificationError,
   isListingAllowed,
   normalizeDocType,
+  nationalIdForApplication,
+  checkApplicationIdentity,
+  isIdDocumentImage,
   needsIdentityDocuments,
   normalizeVerificationStatus,
   revokesListingPrivileges,
@@ -184,5 +187,138 @@ describe('needsIdentityDocuments', () => {
   test('status is read case- and whitespace-insensitively', () => {
     assert.equal(needsIdentityDocuments('  VERIFIED '), false)
     assert.equal(needsIdentityDocuments('Pending'), false)
+  })
+})
+
+describe('nationalIdForApplication', () => {
+  test('a verified number is shown, not asked for', () => {
+    // The number an admin already approved. Asking for it again invites an
+    // application that contradicts the document sitting next to it in /ops.
+    assert.deepEqual(
+      nationalIdForApplication({ status: 'verified', submittedIdNumber: '29801011234567' }),
+      { value: '29801011234567', locked: true }
+    )
+  })
+
+  test('a verified applicant whose submission carried no number still types one', () => {
+    // id_number is optional on a submission; locking an empty field would leave
+    // the applicant unable to fill in a required one.
+    assert.deepEqual(
+      nationalIdForApplication({ status: 'verified', submittedIdNumber: '   ' }),
+      { value: '', locked: false }
+    )
+  })
+
+  test('a pending or rejected submission seeds the field but never locks it', () => {
+    // Nothing is approved yet, so this is a convenience, not a decision.
+    assert.deepEqual(
+      nationalIdForApplication({ status: 'pending', submittedIdNumber: '123' }),
+      { value: '123', locked: false }
+    )
+    assert.deepEqual(
+      nationalIdForApplication({ status: 'rejected', submittedIdNumber: '123' }),
+      { value: '123', locked: false }
+    )
+  })
+
+  test('a reapply keeps what was typed last time', () => {
+    assert.deepEqual(
+      nationalIdForApplication({
+        status: 'pending',
+        submittedIdNumber: '111',
+        previousNationalId: '222',
+      }),
+      { value: '222', locked: false }
+    )
+  })
+
+  test('a verified number outranks the previous application', () => {
+    // The approved document wins over whatever a rejected application said.
+    assert.deepEqual(
+      nationalIdForApplication({
+        status: 'verified',
+        submittedIdNumber: '111',
+        previousNationalId: '222',
+      }),
+      { value: '111', locked: true }
+    )
+  })
+
+  test('nothing on file leaves an empty, editable field', () => {
+    assert.deepEqual(nationalIdForApplication({}), { value: '', locked: false })
+    assert.deepEqual(
+      nationalIdForApplication({ status: null, submittedIdNumber: null, previousNationalId: null }),
+      { value: '', locked: false }
+    )
+  })
+
+  test('values are trimmed and the status read case-insensitively', () => {
+    assert.deepEqual(
+      nationalIdForApplication({ status: ' VERIFIED ', submittedIdNumber: '  123  ' }),
+      { value: '123', locked: true }
+    )
+  })
+})
+
+describe('checkApplicationIdentity — no application without a document to review', () => {
+  const photo = 'data:image/jpeg;base64,AAAA'
+  const complete = { docType: 'national_id', idFront: photo, idBack: photo }
+
+  test('a first-time applicant must send both sides and a document type', () => {
+    const fields = checkApplicationIdentity({ verificationStatus: 'unverified' })
+    assert.deepEqual(Object.keys(fields).sort(), ['doc_type', 'id_front', 'id_back'].sort())
+  })
+
+  test('a complete submission passes', () => {
+    assert.deepEqual(checkApplicationIdentity({ verificationStatus: 'unverified', ...complete }), {})
+  })
+
+  test('each missing side is reported on its own field', () => {
+    assert.deepEqual(
+      Object.keys(checkApplicationIdentity({ verificationStatus: 'unverified', docType: 'passport', idFront: photo })),
+      ['id_back']
+    )
+    assert.deepEqual(
+      Object.keys(checkApplicationIdentity({ verificationStatus: 'unverified', docType: 'passport', idBack: photo })),
+      ['id_front']
+    )
+  })
+
+  test('an unknown document type is named as such, not silently filed', () => {
+    const fields = checkApplicationIdentity({ verificationStatus: 'rejected', ...complete, docType: 'drivers_licence' })
+    assert.deepEqual(Object.keys(fields), ['doc_type'])
+    assert.match(fields.doc_type, /Unknown document type/)
+  })
+
+  test('a rejected submission must be replaced — the refused photos are not enough', () => {
+    assert.deepEqual(
+      Object.keys(checkApplicationIdentity({ verificationStatus: 'rejected' })).sort(),
+      ['doc_type', 'id_back', 'id_front']
+    )
+  })
+
+  test('verified and pending applicants are not asked to photograph the same ID again', () => {
+    assert.deepEqual(checkApplicationIdentity({ verificationStatus: 'verified' }), {})
+    assert.deepEqual(checkApplicationIdentity({ verificationStatus: 'pending' }), {})
+  })
+
+  test('it agrees with needsIdentityDocuments for every status', () => {
+    // The forms render from one and the servers enforce the other; if they ever
+    // disagreed, an applicant would be asked for a document that is refused, or
+    // pass a form the server then rejects.
+    for (const status of VERIFICATION_STATUSES) {
+      const asked = needsIdentityDocuments(status)
+      const demanded = Object.keys(checkApplicationIdentity({ verificationStatus: status })).length > 0
+      assert.equal(demanded, asked, status)
+    }
+  })
+
+  test('junk in the photo fields is not a photo', () => {
+    for (const junk of ['', '   ', 'yes', 'null', 'undefined', 'data:text/html,<b>', null, undefined, 42, {}]) {
+      assert.equal(isIdDocumentImage(junk), false, String(junk))
+    }
+    assert.equal(isIdDocumentImage(photo), true)
+    assert.equal(isIdDocumentImage(' https://cdn.example.com/id.jpg '), true)
+    assert.equal(isIdDocumentImage('DATA:IMAGE/PNG;base64,AAAA'), true)
   })
 })

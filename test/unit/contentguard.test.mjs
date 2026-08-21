@@ -83,6 +83,19 @@ describe('phone numbers — blocked', () => {
     ['letters, in a bio', 'Villa owner. A0101 S416 M3280. Sea view.'],
     ['letters + Arabic-Indic', 'x٠١٠y١٢٣z٤٥٦٧٨'],
     ['letters + intent, landline', 'my number is x02 y3333 z4444'],
+    // Every digit padded with a letter. The digit-only reduction above can only
+    // safely match an Egyptian mobile against a whole field, so a number written
+    // to any other plan used to survive this exact padding — the reported bypass.
+    ['padded, Egyptian mobile', '0a1b0c1d2e3f4g5h6i7j8'],
+    ['padded, ten digits', '1a2b3c4d5e6f7g8h9i0'],
+    ['padded, Saudi mobile', '05a0b1c2d3e4f5g6'],
+    ['padded, no leading zero', '9a7b1c5d0e1f2g3h4i5'],
+    ['padded, pairs of digits', '01a23b45c67d89'],
+    ['padded, eight digits', '12a34b56c78'],
+    ['padded with two-letter chunks', '0me1me0me1me2me3me4me5me6me7me8'],
+    ['padded, spaced out', 'Kareem 0 a 1 b 0 c 1 d 2 e 3 f 4 g 5 h 6 i 7 j 8'],
+    ['padded with Arabic letters', 'م0ح1م0د1ي2ن3ا4ي5ر6'],
+    ['padded, in a name', 'Ahmed0a1b0c1d2e3f4g5h6i7j8'],
   ]
   for (const [label, text] of cases) {
     test(label, () => assert.ok(containsPhoneNumber(text), `should block: ${text}`))
@@ -173,6 +186,15 @@ describe('ordinary chat — allowed', () => {
     'Built 2003, 12 rooms, 3 pools, 45 guests, 6 baths, 2 kitchens',
     'Check-in 2pm, checkout 11am. 3 nights minimum, 15% off for 7+ nights.',
     'مضيف منذ 2018، 3 شقق، 45 تقييم، 5 نجوم',
+    // Number-dense text whose digits DO sit close together. What separates these
+    // from a padded number is that a group of three or more digits (a size, a
+    // price, a year) is never padding, so it ends the run instead of extending it.
+    'Sizes: 90m2, 120m2, 150m2, 200m2 available',
+    'Villas 100m2 to 400m2, 3 to 6 bedrooms',
+    'Rooms A12 B34 in the annex',
+    'Suite 1A, 2B, 3C, 4D',
+    'Model S3 X5 Y7 Z9 available',
+    'Size 3x4 m bedroom, 2x2 m bath, 6x8 m living',
   ]
   for (const text of cases) {
     test(JSON.stringify(text).slice(0, 56), () => {

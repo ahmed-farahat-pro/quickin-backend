@@ -184,3 +184,109 @@ export function needsIdentityDocuments(status: unknown): boolean {
   const s = normalizeVerificationStatus(status)
   return s !== 'verified' && s !== 'pending'
 }
+
+/** The national-ID field of the become-a-host form, decided from the identity
+ *  we already hold. `value` is what the field starts with — never null, so a
+ *  client can bind it directly; `locked` says show it rather than ask for it. */
+export interface ApplicationNationalId {
+  value: string
+  locked: boolean
+}
+
+/**
+ * What the become-a-host form should put in its national-ID field.
+ *
+ * The companion to `needsIdentityDocuments`: that one answers "must they send
+ * the document again", this one answers "must they type the number again". Both
+ * exist for the same reason — one identity, verified once from the profile,
+ * serving guest and host alike.
+ *
+ * A **verified** submission's number is the one an admin already approved, so it
+ * is shown and locked. An application that contradicts the approved document
+ * would put the reviewer between two different numbers, and there is no way for
+ * them to tell which one the applicant meant.
+ *
+ * Anything else is a seed, not a decision: a reapply keeps what was typed last
+ * time, and failing that we offer the number from a submission still under
+ * review (or a rejected one — the photos were refused, the number the applicant
+ * gave was not). Both stay editable, because nothing about them is approved yet.
+ *
+ * Web, iOS and Android all render this same rule (`IdentityRules.swift`,
+ * `IdentityRules.kt`), so no client asks for a number another client would have
+ * filled in.
+ */
+export function nationalIdForApplication(args: {
+  /** The applicant's verification status (`users.verification_status`). */
+  status?: unknown
+  /** The number on the identity submission we hold, when it carried one. */
+  submittedIdNumber?: unknown
+  /** The number on their previous host application, when reapplying. */
+  previousNationalId?: unknown
+}): ApplicationNationalId {
+  const text = (v: unknown) => String(v ?? '').trim()
+  const submitted = text(args.submittedIdNumber)
+  if (normalizeVerificationStatus(args.status) === 'verified' && submitted) {
+    return { value: submitted, locked: true }
+  }
+  return { value: text(args.previousNationalId) || submitted, locked: false }
+}
+
+/** What an ID photo has to look like before we file it. The size cap belongs to
+ *  the DB layer (it owns the column); this is only about the shape. */
+const ID_IMAGE_RE = /^(?:data:image\/|https?:\/\/)/i
+
+/** True for a value we would store as an ID photo — an inline image or a link. */
+export function isIdDocumentImage(value: unknown): boolean {
+  return ID_IMAGE_RE.test(String(value ?? '').trim())
+}
+
+/** The identity half of a become-a-host application. */
+export interface ApplicationIdentityInput {
+  /** The applicant's verification status (their latest id_verifications row). */
+  verificationStatus: unknown
+  /** Which document was photographed — one of DOC_TYPES. */
+  docType?: unknown
+  /** FRONT photo, as a `data:image/…` URL or an https link. */
+  idFront?: unknown
+  /** BACK photo, same shapes. */
+  idBack?: unknown
+}
+
+/**
+ * What is missing from the identity half of a host application?
+ *
+ * An application asks to be trusted with other people's stays, and the reviewer
+ * decides it by reading the declared name and national ID against a photographed
+ * document. With no document there is nothing to review — an application filed
+ * without one can only be approved blind — so it must not be filed at all. This
+ * is the rule that says so, and every client and every route reads it, so no
+ * surface can accept a submission another surface would have refused.
+ *
+ * Returns an EMPTY object when nothing is wrong, INCLUDING for an applicant who
+ * already has a verified or pending submission: they verified once from their
+ * profile and that identity serves guest and host alike — see
+ * [needsIdentityDocuments], the companion rule the forms render from.
+ *
+ * Both sides are required, as the standalone verification flow has always
+ * required them: the back carries the expiry and issuing details a reviewer
+ * checks the front against.
+ *
+ * Keys match the request body (`doc_type`, `id_front`, `id_back`) so a client can
+ * map a 400's `fields` straight onto its form.
+ */
+export function checkApplicationIdentity(input: ApplicationIdentityInput): Record<string, string> {
+  const fields: Record<string, string> = {}
+  if (!needsIdentityDocuments(input.verificationStatus)) return fields
+  try {
+    normalizeDocType(input.docType)
+  } catch (e) {
+    fields.doc_type = e instanceof Error ? e.message : 'Please choose which document you are uploading'
+  }
+  if (!isIdDocumentImage(input.idFront)) {
+    fields.id_front = 'A photo of the front of your ID is required'
+  }
+  if (!isIdDocumentImage(input.idBack)) {
+    fields.id_back = 'A photo of the back of your ID is required'
+  }
+  return fields
+}

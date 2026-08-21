@@ -1,12 +1,26 @@
 import { NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/local/auth'
-import { getHostState, submitHostApplication, HOST_TYPES, type HostType } from '@/lib/local/db'
+import {
+  getHostState,
+  getVerificationStatusFromTable,
+  submitHostApplication,
+  HOST_TYPES,
+  type HostType,
+} from '@/lib/local/db'
 import { checkName, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
 import { normalizePhone } from '@/lib/local/phone-core'
+import { checkApplicationIdentity } from '@/lib/local/host-verification-core'
 
 // POST /api/local/host/apply — submit (or re-submit after a rejection) a host
 // application for admin review. It NEVER grants hosting: only an admin approval in
 // /api/local/admin/host-applications flips users.is_host.
+//
+// The ID documents are part of the application ({ doc_type, id_front, id_back }),
+// not a later step: the reviewer approves host status and identity in one
+// decision, and there is nothing to read the declared name and national ID
+// against without them. An applicant who is already verified — or whose
+// submission is already in the queue — does not send them again
+// (`checkApplicationIdentity`, the same rule the forms render from).
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -64,6 +78,23 @@ export async function POST(req: Request) {
     else if (!phone) fields.phone = 'Enter a valid phone number, like 010 1234 5678'
     if (!address) fields.address = 'Address is required'
     if (!(HOST_TYPES as readonly string[]).includes(hostType)) fields.host_type = 'Choose individual, company or brokerage'
+
+    // Identity documents. Read from the id_verifications row rather than
+    // users.verification_status, because that row is what the reviewer opens and
+    // what submitHostApplication links the application to.
+    const identity = await getVerificationStatusFromTable(me.id)
+    const docType = str(b.doc_type ?? b.docType)
+    const idFront = str(b.id_front ?? b.idFront)
+    const idBack = str(b.id_back ?? b.idBack)
+    Object.assign(
+      fields,
+      checkApplicationIdentity({
+        verificationStatus: identity.status,
+        docType,
+        idFront,
+        idBack,
+      })
+    )
     if (Object.keys(fields).length) {
       return NextResponse.json(
         nameProblem
@@ -90,6 +121,9 @@ export async function POST(req: Request) {
       host_type: hostType as HostType,
       company: company || null,
       notes: notes || null,
+      doc_type: docType || null,
+      id_front: idFront || null,
+      id_back: idBack || null,
     })
     return NextResponse.json({ ok: true, host_status: 'pending', application }, { headers: CORS })
   } catch (err) {

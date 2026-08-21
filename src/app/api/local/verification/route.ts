@@ -5,9 +5,13 @@ import { normalizeDocType } from '@/lib/local/host-verification-core'
 
 // Identity verification for the signed-in user. Writes to the shared
 // id_verifications TABLE so the web /ops admin can see mobile submissions.
-//   GET  /api/local/verification                 → { status, verified_at }
-//   POST /api/local/verification { front, back }  → upload FRONT + BACK ID photos → { status: 'pending' }
+//   GET  /api/local/verification                 → { status, verified_at, id_number }
+//   POST /api/local/verification { front, back }  → upload FRONT + BACK ID photos → { status: 'pending', … }
 // Back-compat: { doc } or { image } is treated as the FRONT only.
+// `id_number` is the number on the latest submission, sent so the apps' become-a-host
+// form can reuse an identity already on file instead of asking for the same number
+// again (nationalIdForApplication in host-verification-core). It is the caller's own
+// number and nobody else's — every read here is scoped to the bearer's user id.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',

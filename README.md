@@ -22,6 +22,8 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/listings/[id]` | One listing by UUID (404 if missing) |
 | POST | `/api/local/listings` | Create a listing (approved + identity-verified host). The response is the listing plus **`pin_warning`** — `null`, or `{code, scope, message}` when the map pin falls outside the `country` / `region` the host chose. It is a **warning**: the listing is created either way. A lat/lng outside ±90/±180 is a different matter and answers **400** |
 | PATCH | `/api/local/listings/[id]` | The host edits their listing. Carries the same **`pin_warning`** field, for the same reason — a pin can be dragged into the wrong country from the editor too |
+| GET  | `/api/local/listings/[id]/calendar` | The listing's day-by-day calendar, `?start=&end=` (**inclusive** of both ends, ≤400 days; defaults to today → +92d). `{ listing_id, currency, commission_rate, base_price, start, end, days[] }` where each day is `{ date, price, source, status }`. `source` is which rung priced the night — `custom` \| `weekend` \| `monthly` \| `base`; `status` is `available` \| `blocked` \| `booked`. **Public, but money-aware:** the listing's host gets their RAW rates plus a `guest_price` companion and the block `note`; everyone else gets only the commission-inclusive figure |
+| PUT  | `/api/local/listings/[id]/calendar` | The host prices or opens/closes a set of days: `{ dates: ["YYYY-MM-DD" \| {start,end}], price?, blocked?, note? }` → `{ updated, skipped, calendar }`. `price: <n>` pins that nightly rate, `price: null` **resets** those days to the listing's normal pricing (deletes the rows), and omitting `price` leaves prices alone; `blocked: true/false` closes or opens them. Days held by a reservation come back in **`skipped`** rather than failing the request. 401 unsigned, 403 not the host, 400 on a bad date or price |
 | GET  | `/api/local/profile/id-change` | The signed-in user's ID number and the state of any request to change it → `{ current, request, can_request }` |
 | POST | `/api/local/profile/id-change` | File a change request: `{ requested_value, doc_type, front, back?, reason? }`. **`front` is required** — without a document the reviewer has nothing to check the number against. Resubmitting replaces a request still awaiting review |
 | DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
@@ -39,7 +41,7 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/payment-config` | The Instapay destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload}` |
 | GET  | `/api/local/admin/settings/instapay` | Read the same config for editing. Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/instapay` | Update it — `{instapay_handle?, instapay_link?, instapay_qr_image?, instructions?}`. Each field is optional: omit to leave untouched, send `""` to clear. `400` on an invalid link or QR |
-| POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, company?, notes?}`. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review |
+| POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, doc_type, id_front, id_back, company?, notes?}`. **The ID documents are required** (`doc_type` + both sides, as `data:image/…` URLs) unless the applicant's identity is already `verified` or `pending`, in which case they are omitted and the application is linked to the submission on file; they are filed as a pending `id_verifications` row (`source='host_application'`) so one admin decision covers host status and identity. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review |
 | GET  | `/api/local/host/listing-gate` | May this host add a listing — `{allowed, code, message, reason}`. Same `code` the create route returns on 403, so the apps can refuse up front. `reason` only on a rejection |
 | GET  | `/api/local/host/commission` | The platform commission — `{rate, percent}` — so the add/edit-listing screens can show a host what guests will pay. Auth required (a guest holding the rate could divide out the host's raw price) |
 | GET  | `/api/local/host/payout-method` | Where QuickIn sends this host's earnings — `{payout_method, payout_ready, is_host}`. `payout_method` is `null` until they add one. Host-only; a guest gets `403 {code:'not_host'}` |
@@ -66,12 +68,34 @@ message — the wording is server-owned so all three say the same thing.
 
 The same module exports `needsIdentityDocuments(status)` — whether someone with that
 verification status still has to upload documents (`verified` and `pending` do not;
-`rejected` and "no submission" do). Nothing in **this** project reads it: the mobile apply
-endpoint has never collected ID, and mobile users verify through
-`POST /api/local/verification`. It lives here because the file is byte-identical across
-both projects, and it is the rule the **web** application form and the web
-`submitHostApplication` both run so that a guest who already verified from their profile is
-not asked to photograph the same ID again to become a host.
+`rejected` and "no submission" do) — and `checkApplicationIdentity({verificationStatus,
+docType, idFront, idBack})`, which turns that into the per-field errors an application is
+refused with. **`POST /api/local/host/apply` runs it**: the ID documents are part of the
+application, not a later step, so no application can reach the admin queue with nothing for
+the reviewer to read the declared name and national ID against. Until 2026-08-19 this
+endpoint collected no ID at all, and an app could file a complete-looking application with
+no document behind it — the hole this closes. An applicant who already has a `verified` or
+`pending` submission does not send the documents again; their application is linked to the
+row they already have. The web application form and the web `submitHostApplication` run the
+same two functions, which is why the file is byte-identical across both projects.
+
+**One identity, one number.** Its companion `nationalIdForApplication({status,
+submittedIdNumber, previousNationalId})` answers the other half of that question — what the
+become-a-host form puts in its National ID field. A `verified` submission's number is
+returned `locked` (an admin approved a document bearing it; an application carrying a
+different one leaves the reviewer holding two answers with nothing to say which is the
+person's); anything else is a seed — a reapply's own answer first, then the number on a
+submission still under review — and stays editable, because nothing about it is approved
+yet. `GET /api/local/verification` now returns `id_number` alongside `status` so iOS and
+Android can run it — their twins are `IdentityRules` (`android/.../IdentityRules.kt`, and
+`ios/Sources/TrustService.swift` beside the payload it reads). The same call tells them
+whether to show the document uploaders at all, so a verified applicant is asked neither for
+the number nor for the photos we already hold. It is the caller's own number and nobody
+else's — the read is scoped to the bearer's user id, same as the status.
+
+`POST /api/local/verification` answers with the stored row rather than a hardcoded
+`{status:'pending'}`, since the upsert `COALESCE`s the number: a resubmission that omits it
+keeps the earlier one, and the clients prefill from what is actually on file.
 
 The gate bites in three places:
 
@@ -571,6 +595,78 @@ no pin while `0,0` is a real coordinate, that a non-array `images` value is zero
 photos rather than an exemption — and, for the edit door, that clearing any required
 field is refused while a field the patch never mentions is left alone.
 
+## A night costs what the host said that night costs
+
+A listing carries one `price_per_night`, but a host does not want one price. They want
+the long weekend to cost more than the Tuesday after it, Eid to cost more than March,
+and the week nobody books to cost less than either. The **host calendar** is where they
+say so, one day at a time.
+
+The rule is a ladder, and the calendar sits on top of it:
+
+```
+listing_date_prices  →  weekend_price (Fri/Sat)  →  monthly_prices[month]  →  price_per_night
+```
+
+A day the host pinned beats every seasonal rule. That is the whole point: "this Thursday
+is a holiday, charge 6,000" has to survive a weekend rate and a month rate that both
+disagree.
+
+**"Reset to default" deletes the row; it does not write the base price.** A day pinned at
+whatever the base happened to be would look identical — right up until the host edited
+their listing's price, at which point that day would silently stop following it. The
+absence of a row is the only honest way to say "this day has no opinion of its own".
+
+**A day's price is the price of the NIGHT that starts on it.** A stay `[check_in,
+check_out)` is charged for `check_in … check_out-1`, so the checkout day is never priced.
+Aug 15 → Aug 18 is three nights, not four.
+
+The ladder is written **twice**, in `date-pricing-core.ts`: once as `resolveNightPrice()`
+for the clients' previews, and once as `sqlWithDatePrice()` for the per-night sum that
+runs inside Postgres. They must answer the same number for the same day — a client's
+preview and the server's charge disagreeing is the failure this feature invites — so the
+file is byte-identical across both repos, guarded by
+`scripts/check-date-pricing-core-parity.mjs`.
+
+Prices land on the calendar the same way they land on a listing: the host reads and edits
+their **raw** rate, and the guest figure is derived at read time by the commission markup
+and never stored (see *Platform commission* above). `GET …/calendar` decides which of the
+two it returns from the bearer token, exactly like the listing projections — so a host
+cannot accidentally be shown, and then re-save, the marked-up number.
+
+**A booked night is not editable.** `bookings.total_price` is snapshotted when the
+reservation is taken, so a later price change can never restate a stay a guest already
+agreed to — the guard is about not misleading the host, not about data safety. Days held
+by a reservation come back in `skipped` rather than failing the whole request, because a
+host dragging across a month will cross a booking routinely and refusing the edit
+outright would make the calendar unusable.
+
+Availability lives in the same calendar. `listing_blocked_dates` stores half-open
+`[start, end)` **ranges** (that is what the mobile range picker and the older
+`/availability` endpoint write), but the calendar edits single **days** — so "unblock the
+Wednesday in the middle of this week-long block" cannot be expressed as a DELETE. The
+spans that overlap what the host touched are exploded into days, changed, re-merged and
+rewritten; notes ride along per day, so splitting a *maintenance* block leaves two
+*maintenance* blocks rather than two unlabelled ones. That is `applyBlockChange()` and
+`blockRewriteWindow()`, both pure and both tested.
+
+### Known divergence: web vs backend stay totals
+
+**This predates the calendar and the calendar does not fix it.** The two projects do not
+run the same ladder below the calendar rung:
+
+| | `quickin-backend` (mobile) | `quickin-frontend` (web) |
+| --- | --- | --- |
+| Weekend rung | hardcoded Fri/Sat | the listing's `weekend_days` |
+| Monthly rung | applied | **not applied** |
+| Length-of-stay discount | applied in `createBooking` | **not applied** |
+
+So the same listing and the same dates can produce a different total depending on which
+client took the booking. The calendar rung is identical in both (that is what the parity
+guard covers), so a pinned day is charged the same either way — but a listing relying on
+`monthly_prices` or a weekly discount is not. Unifying the two is a separate change, and
+it needs a decision about which behaviour is the correct one before it is written.
+
 ## Environment
 
 | Var | Required | Purpose |
@@ -761,8 +857,23 @@ whole-field concatenation for a merely *long* run would read "built 2000, 12 roo
 looser, so it stays behind the intent check. The residual cost is real and accepted:
 a bio dense enough to put eleven digits back to back in the right order can still
 false-positive, which is why `test/unit/contentguard.test.mjs` carries number-heavy
-honest bios in its allow half. A non-Egyptian international number interleaved with
-letters is still only caught when intent is stated.
+honest bios in its allow half.
+
+**Padding that isn't an Egyptian mobile.** Matching a shape against a whole-field
+concatenation is safe only because that shape is *specific*, which left the same
+padding working on every number written to some other plan — a Saudi `05x`, a
+ten-digit international line, a landline typed without its 0. Reported against the
+Android name and bio fields; it applied to all four surfaces. `letterInterleavedDigits`
+closes it by counting a **contiguous** run instead of the whole field, so a plain
+eight-digit floor is enough: prose puts whole words between its numbers and never
+forms a run. Three things must hold together — every digit group is one or two digits
+long (a third digit is a year, a price or a size, so it *ends* the run), each group is
+at most three characters from the next, and at least three of those gaps contain a
+letter (a gap of pure punctuation is the separator collapse's job, already done).
+`0a1b0c1d2e3f4g5h6i7j8`, `05a0b1c2d3e4f5g6` and `12a34b56c78` are blocked;
+`Sizes: 90m2, 120m2, 150m2, 200m2` and `Rooms A12 B34` are not. Under stated intent
+the floor drops to six digits. A number padded in groups of *three* is still only
+caught when its concatenation matches the Egyptian shape or intent is stated.
 
 **Split across messages.** `combinesIntoContact` stitches the sender's last 16
 messages in the thread, so `010` / `1234567` / `8` is caught, as is `kareem@gmail`
@@ -1064,6 +1175,7 @@ the list of record. Recent additions:
 
 | `migrate-id-change-requests.mjs` | `id_change_requests` — a user's request to change the ID number on their profile, with the document photo backing it, one open request per user (partial unique index). Behind `/ops` → ID verifications, and the only thing that writes `users.id_document` now that `PATCH /api/local/profile` refuses it. Also **reports** how many accounts already carry a self-declared number that nobody ever reviewed. Additive, and the reads degrade to an empty queue if it has not run, so it is safe to apply well ahead of the deploy |
 | `migrate-listing-review-note.mjs` | `listings.review_note` — the operator's reason for rejecting a listing, which used to exist only inside a notification body and is now shown to the host on the web dashboard, in the listing editor and on both mobile host dashboards. Nullable, no backfill: NULL means "no reason recorded", the honest answer both for an unexplained rejection (the note is optional) and for every listing rejected before the column existed. Also **reports** how many rejected listings carry no reason. **Unlike most additive columns this one must be applied BEFORE the deploy** — the host projection selects it, so a database without it fails every host read |
+| `migrate-date-prices.mjs` | `listing_date_prices` — one row per (listing, day) holding the RAW nightly rate a host pinned on their calendar, `PRIMARY KEY (listing_id, date)` so setting a day twice is an upsert rather than a second row whose precedence would depend on row order. The **absence** of a row is what "this day follows the listing's normal pricing" means, which is why "reset to default" deletes rather than writing the base price. Additive, and the ladder falls through to weekend/month/base if it has not run — but it **must be applied before the deploy**, since the per-night stay sum joins it on every quote and booking |
 | `migrate-ranking-indexes.mjs` | Two indexes for the search ranking — `reviews(listing_id) INCLUDE (rating, created_at)` and `bookings(listing_id, status, check_out)`. **Pure performance, no schema change:** the ranking is correct without it, so the usual order does not apply and it can be run before or after the deploy |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The

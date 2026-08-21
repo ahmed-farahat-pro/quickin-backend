@@ -11,6 +11,7 @@ import { guardContent, guardSplitContent } from './moderation'
 import { INSTAPAY_KEYS, rowsToPaymentConfig } from './payment-config-core'
 import type { PaymentConfig } from './payment-config-core'
 import { rowToPayoutMethod } from './payout-method-core'
+import { needsIdentityDocuments } from './host-verification-core'
 import type { PayoutMethodRecord, PayoutMethodView } from './payout-method-core'
 import {
   COMMISSION_RATE_KEY,
@@ -20,6 +21,18 @@ import {
   roundUpToStep,
   sqlWithCommission,
 } from './commission-core'
+import {
+  DatePriceError,
+  applyBlockChange,
+  assertWithinWindow,
+  blockRewriteWindow,
+  checkDayPrice,
+  dayPriceMessage,
+  daysBetween,
+  isIsoDate,
+  sqlWithDatePrice,
+} from './date-pricing-core'
+import type { BlockSpan, DayStatus, PriceSource } from './date-pricing-core'
 import { sqlRankingOrderBy } from './ranking-core'
 import { listingRejectionMessage, normalizeListingReviewNote } from './listing-review-note-core'
 import { normalizeListingTitle, validateListingTitle } from './listing-title-policy'
@@ -195,18 +208,32 @@ export interface Booking {
 //                plus read-only guest_* companions for "guests pay X".
 
 /**
- * The host's RAW price for one night `d` of a stay, applying the seasonal
- * precedence: weekend price (Fri/Sat in Egypt) → that month's override → base.
- * Expects `l` (listings) and `d` (a generate_series date) in scope. Wrap it in
- * sqlWithCommission() for the guest-facing figure.
+ * The seasonal rungs of the ladder, below the host's calendar: weekend price
+ * (Fri/Sat in Egypt) → that month's override → base. Expects `l` (listings) and
+ * `d` (a generate_series date) in scope.
  */
-const PER_NIGHT_RAW_SQL = `
+const PER_NIGHT_SEASONAL_SQL = `
   CASE
     WHEN extract(dow from d)::int IN (5, 6) AND l.weekend_price IS NOT NULL THEN l.weekend_price
     WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$'
          THEN (l.monthly_prices ->> extract(month from d)::int::text)::numeric
     ELSE l.price_per_night
   END`
+
+/**
+ * The host's RAW price for one night `d` of a stay — the WHOLE ladder:
+ *
+ *     host calendar (listing_date_prices) → weekend → month → base
+ *
+ * A day the host pinned on their calendar beats every seasonal rule, which is
+ * the entire point of the feature: "this Thursday is Eid, charge 6,000" has to
+ * survive a weekend rate and a month rate that both disagree.
+ *
+ * Wrap it in sqlWithCommission() for the guest-facing figure. This is the SQL
+ * twin of resolveNightPrice() in date-pricing-core.ts — the two must answer the
+ * same number, or a client's preview and the server's charge would disagree.
+ */
+const PER_NIGHT_RAW_SQL = sqlWithDatePrice('d', PER_NIGHT_SEASONAL_SQL)
 
 /** Mark up every entry of the monthly_prices jsonb map, dropping junk values. */
 const MONTHLY_GUEST_SQL = `COALESCE((
@@ -470,6 +497,343 @@ export async function unblockListingDates(blockId: string, hostUserId: string): 
     [blockId, hostUserId]
   )
   return (rowCount ?? 0) > 0
+}
+
+// ---- Host calendar (per-date pricing + day-level availability) ---------------
+//
+// The calendar is the host's day-by-day view of one listing: what each night
+// costs, where that price came from, and whether the night is still sellable.
+// It reads the SAME ladder the booking charges (PER_NIGHT_RAW_SQL), so the price
+// a host sees on a day is exactly what a guest will be quoted for that night.
+
+/** One day on a listing's calendar. */
+export interface CalendarDay {
+  date: string
+  /** Nightly rate for the night starting on `date`. RAW for the host,
+   *  commission-inclusive for a public reader — same rule as LISTING_COLS. */
+  price: number
+  /** What a guest pays for this night. Host reads only; never sent publicly
+   *  (there it would just repeat `price`). */
+  guest_price?: number
+  /** Which rung of the ladder produced `price`. 'custom' = pinned by the host. */
+  source: PriceSource
+  /** Whether the host may still edit this day. */
+  status: DayStatus
+  /** The host's note on the block covering this day, when there is one. */
+  note?: string | null
+}
+
+export interface ListingCalendar {
+  listing_id: string
+  currency: string
+  commission_rate: number
+  /** listings.price_per_night, in the same raw/guest terms as `days[].price`. */
+  base_price: number
+  start: string
+  /** Inclusive — the last day in `days`, not a half-open bound. */
+  end: string
+  days: CalendarDay[]
+}
+
+/** True when the host pinned a price on the day `d`. Kept next to the projection
+ *  so `source` can never disagree with which rung PER_NIGHT_RAW_SQL took. */
+const dateOverrideExistsSql = `EXISTS (SELECT 1 FROM listing_date_prices dp WHERE dp.listing_id = l.id AND dp.date = d::date)`
+
+/** A calendar request may not ask for more than two years in one go. */
+const MAX_CALENDAR_DAYS = 400
+
+/**
+ * A listing's calendar for [start, end] INCLUSIVE.
+ *
+ * `asHost` decides the money, exactly like the listing projections: a host sees
+ * their raw prices (the numbers they type and PATCH back) plus a `guest_price`
+ * companion, and anyone else sees only the commission-inclusive figure. A public
+ * reader gets days and prices — never a booking id, never a host's block note.
+ */
+export async function getListingCalendar(
+  listingId: string,
+  start: string,
+  end: string,
+  opts: { asHost?: boolean } = {}
+): Promise<ListingCalendar | null> {
+  if (!isUuid(listingId) || !isIsoDate(start) || !isIsoDate(end)) return null
+  if (end < start) return null
+  if (daysBetween(start, end) + 1 > MAX_CALENDAR_DAYS) {
+    throw new DatePriceError(`Ask for at most ${MAX_CALENDAR_DAYS} days at a time`)
+  }
+  const asHost = opts.asHost === true
+  // `d` is the generate_series alias PER_NIGHT_RAW_SQL expects. The guest figure
+  // is marked up PER NIGHT, not on the sum, so a guest multiplying a nightly rate
+  // by the nights arrives at the subtotal we show them.
+  const priceSql = asHost ? `(${PER_NIGHT_RAW_SQL})` : sqlWithCommission(PER_NIGHT_RAW_SQL)
+  const { rows } = await pool.query(
+    `SELECT to_char(d, 'YYYY-MM-DD') AS date,
+            ${priceSql}::float8 AS price,
+            ${sqlWithCommission(PER_NIGHT_RAW_SQL)}::float8 AS guest_price,
+            CASE
+              WHEN ${dateOverrideExistsSql} THEN 'custom'
+              WHEN extract(dow from d)::int IN (5, 6) AND l.weekend_price IS NOT NULL THEN 'weekend'
+              WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$' THEN 'monthly'
+              ELSE 'base'
+            END AS source,
+            -- A booking outranks a block: if both cover the day, the host still
+            -- may not touch it, and 'booked' is the honest reason why.
+            CASE
+              WHEN EXISTS (SELECT 1 FROM bookings b
+                            WHERE b.listing_id = l.id AND b.status NOT IN ('cancelled', 'rejected')
+                              AND b.check_in <= d AND b.check_out > d) THEN 'booked'
+              WHEN EXISTS (SELECT 1 FROM listing_blocked_dates bd
+                            WHERE bd.listing_id = l.id AND bd.start_date <= d AND bd.end_date > d) THEN 'blocked'
+              ELSE 'available'
+            END AS status,
+            (SELECT bd.note FROM listing_blocked_dates bd
+              WHERE bd.listing_id = l.id AND bd.start_date <= d AND bd.end_date > d
+              ORDER BY bd.start_date DESC LIMIT 1) AS note,
+            ${asHost ? 'l.price_per_night' : sqlWithCommission('l.price_per_night')}::float8 AS base_price,
+            l.currency,
+            ${COMMISSION_RATE_SQL}::float8 AS commission_rate
+       FROM listings l,
+            generate_series($2::date, $3::date, interval '1 day') AS d
+      WHERE l.id = $1
+      ORDER BY d ASC`,
+    [listingId, start, end]
+  )
+  if (rows.length === 0) return null
+  return {
+    listing_id: listingId,
+    currency: rows[0].currency ?? 'EGP',
+    commission_rate: Number(rows[0].commission_rate),
+    base_price: Number(rows[0].base_price),
+    start,
+    end,
+    days: rows.map((r) => {
+      const day: CalendarDay = {
+        date: r.date,
+        price: Math.round(Number(r.price)),
+        source: r.source as PriceSource,
+        status: r.status as DayStatus,
+      }
+      if (asHost) {
+        day.guest_price = Math.round(Number(r.guest_price))
+        day.note = r.note ?? null
+      }
+      return day
+    }),
+  }
+}
+
+/** What one calendar edit did. `skipped` is never silent — a day the host
+ *  selected and we refused has to be reported back or they'd believe it saved. */
+export interface CalendarUpdateResult {
+  updated: number
+  skipped: { date: string; reason: 'booked' }[]
+  calendar: ListingCalendar
+}
+
+/**
+ * Apply one calendar edit to a set of days the host selected.
+ *
+ * `price`:   a number pins that rate on every day; `null` RESETS them (deletes
+ *            the rows, so they fall back to weekend/month/base); `undefined`
+ *            leaves prices alone.
+ * `blocked`: `true`/`false` closes or opens the days; `undefined` leaves
+ *            availability alone.
+ *
+ * BOOKED DAYS ARE SKIPPED, not refused. A host dragging across a month will
+ * routinely cross a reservation, and failing the whole edit would make the
+ * feature unusable; the days that were skipped come back in the result so the
+ * UI can say so. Note this is a guardrail, not data safety: bookings.total_price
+ * is snapshotted at creation, so no price edit can ever restate a live stay.
+ *
+ * Everything runs in ONE transaction — a partial calendar (prices written,
+ * blocks not) would be a state no host asked for.
+ */
+export async function updateListingCalendar(
+  listingId: string,
+  hostUserId: string,
+  dates: string[],
+  change: { price?: number | null; blocked?: boolean; note?: string | null },
+  today: string
+): Promise<CalendarUpdateResult | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+  if (dates.length === 0) throw new DatePriceError('Select at least one date')
+  assertWithinWindow(dates, today)
+
+  const setsPrice = change.price !== undefined
+  const setsBlocked = change.blocked !== undefined
+  if (!setsPrice && !setsBlocked) throw new DatePriceError('Nothing to change')
+
+  let price: number | null = null
+  if (setsPrice) {
+    const checked = checkDayPrice(change.price)
+    if (!checked.ok) throw new DatePriceError(dayPriceMessage(checked.problem))
+    price = checked.value
+  }
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const owns = await client.query(
+      `SELECT 1 FROM listings WHERE id = $1 AND host_id = $2 FOR UPDATE`,
+      [listingId, hostUserId]
+    )
+    if (!owns.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+
+    // Which of the selected days a reservation already owns. Read INSIDE the
+    // transaction and with the listing row locked, so a booking confirmed a
+    // moment ago cannot slip between the check and the write.
+    const booked = await client.query(
+      `SELECT to_char(d, 'YYYY-MM-DD') AS date
+         FROM unnest($2::date[]) AS d
+        WHERE EXISTS (SELECT 1 FROM bookings b
+                       WHERE b.listing_id = $1 AND b.status NOT IN ('cancelled', 'rejected')
+                         AND b.check_in <= d AND b.check_out > d)`,
+      [listingId, dates]
+    )
+    const bookedDays = new Set<string>(booked.rows.map((r) => r.date as string))
+    const editable = dates.filter((d) => !bookedDays.has(d))
+
+    let updated = 0
+    if (editable.length > 0 && setsPrice) {
+      if (price === null) {
+        // RESET is a delete. Writing the base price instead would pin a day that
+        // then stopped tracking the base the moment the host edited it.
+        const res = await client.query(
+          `DELETE FROM listing_date_prices WHERE listing_id = $1 AND date = ANY($2::date[])`,
+          [listingId, editable]
+        )
+        updated = res.rowCount ?? 0
+      } else {
+        const res = await client.query(
+          `INSERT INTO listing_date_prices (listing_id, date, price)
+           SELECT $1, d, $3::numeric FROM unnest($2::date[]) AS d
+           ON CONFLICT (listing_id, date)
+             DO UPDATE SET price = EXCLUDED.price, updated_at = now()`,
+          [listingId, editable, price]
+        )
+        updated = res.rowCount ?? 0
+      }
+    }
+
+    if (editable.length > 0 && setsBlocked) {
+      await rewriteBlocks(client, listingId, editable, change.blocked === true, change.note ?? null)
+      if (!setsPrice) updated = editable.length
+    }
+
+    await client.query('COMMIT')
+    const calendar = await getListingCalendar(listingId, dates[0], dates[dates.length - 1], { asHost: true })
+    return {
+      updated,
+      skipped: [...bookedDays].sort().map((date) => ({ date, reason: 'booked' as const })),
+      // getListingCalendar can only be null for a listing that vanished between
+      // the commit and the read; the edit still happened, so report an empty one.
+      calendar: calendar ?? {
+        listing_id: listingId, currency: 'EGP', commission_rate: 0, base_price: 0,
+        start: dates[0], end: dates[dates.length - 1], days: [],
+      },
+    }
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+/**
+ * Block or unblock individual days inside a range-based table.
+ *
+ * listing_blocked_dates stores half-open [start_date, end_date) SPANS, so
+ * "unblock the Wednesday in the middle of this week-long block" cannot be
+ * expressed as a DELETE. We explode every span that overlaps what the host
+ * touched into days, apply the change, re-merge, and rewrite that window —
+ * which is exactly what applyBlockChange() does, and why it is a pure function
+ * with its own tests.
+ */
+async function rewriteBlocks(
+  client: PoolClient,
+  listingId: string,
+  dates: string[],
+  blocked: boolean,
+  note: string | null
+): Promise<void> {
+  // Any span that could be affected. Widened past the selection because a span
+  // extends beyond the day the host clicked.
+  const existing = await client.query(
+    `SELECT id::text AS id,
+            to_char(start_date, 'YYYY-MM-DD') AS start,
+            to_char(end_date, 'YYYY-MM-DD') AS "end",
+            note
+       FROM listing_blocked_dates
+      WHERE listing_id = $1
+        AND start_date <= ($3::date + interval '1 day') AND end_date > $2::date
+      FOR UPDATE`,
+    [listingId, dates[0], dates[dates.length - 1]]
+  )
+  const spans = existing.rows as BlockSpan[]
+  const window = blockRewriteWindow(spans, dates)
+  if (!window) return
+
+  const next = applyBlockChange(spans, dates, blocked, note)
+  // Replace only the spans we just accounted for. Rewriting the whole listing
+  // would drop blocks the host set far outside the window they were editing.
+  if (spans.length > 0) {
+    await client.query(
+      `DELETE FROM listing_blocked_dates WHERE id = ANY($1::uuid[])`,
+      [spans.map((s) => s.id)]
+    )
+  }
+  const fresh = next.filter((s) => s.start <= window.to && s.end > window.from)
+  for (const span of fresh) {
+    await client.query(
+      `INSERT INTO listing_blocked_dates (listing_id, start_date, end_date, note) VALUES ($1, $2, $3, $4)`,
+      [listingId, span.start, span.end, span.note ?? null]
+    )
+  }
+}
+
+/** Whether `userId` owns `listingId`. Decides which money a calendar read
+ *  returns — the host's raw prices or the guest-facing marked-up ones. */
+export async function isListingHost(listingId: string, userId: string | null | undefined): Promise<boolean> {
+  if (!isUuid(listingId) || !userId || !isUuid(userId)) return false
+  const { rowCount } = await pool.query(
+    `SELECT 1 FROM listings WHERE id = $1 AND host_id = $2`,
+    [listingId, userId]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/** The host's pinned prices for a listing, as { 'YYYY-MM-DD': raw nightly }.
+ *  Feeds the clients' local preview so it agrees with the server's charge. */
+export async function getListingDatePrices(
+  listingId: string,
+  start: string,
+  end: string
+): Promise<Record<string, number>> {
+  if (!isUuid(listingId) || !isIsoDate(start) || !isIsoDate(end)) return {}
+  const { rows } = await pool.query(
+    `SELECT to_char(date, 'YYYY-MM-DD') AS date, price::float8 AS price
+       FROM listing_date_prices
+      WHERE listing_id = $1 AND date >= $2::date AND date <= $3::date`,
+    [listingId, start, end]
+  )
+  const out: Record<string, number> = {}
+  for (const r of rows) out[r.date as string] = Number(r.price)
+  return out
+}
+
+/** How many days a host has pinned from today onwards — the "N custom prices"
+ *  badge on the listing card, and the signal that the calendar is in use. */
+export async function countUpcomingDatePrices(listingId: string): Promise<number> {
+  if (!isUuid(listingId)) return 0
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS n FROM listing_date_prices WHERE listing_id = $1 AND date >= CURRENT_DATE`,
+    [listingId]
+  )
+  return Number(rows[0]?.n ?? 0)
 }
 
 // ---- Bookings ---------------------------------------------------------------
@@ -835,11 +1199,20 @@ export interface StayQuote {
   nightlyAvg: number
   currency: string
   hasSeasonalPricing: boolean
+  /** Every night of the stay, priced and labelled — what the booking summary
+   *  itemises. Commission-inclusive, like every other figure here. The nights
+   *  are [checkIn, checkOut), so the checkout day is absent: a guest is never
+   *  charged for the morning they leave. */
+  nights_breakdown: { date: string; price: number; source: PriceSource }[]
+  /** True when at least one night was pinned on the host's calendar. Clients use
+   *  it to decide whether the per-night list is worth showing at all. */
+  hasCustomNights: boolean
 }
 
-/** Authoritative price for a date range — honors weekend + monthly pricing and
- *  the length-of-stay discount (same maths the booking uses). Lets clients show
- *  the exact total for the chosen dates without duplicating the logic.
+/** Authoritative price for a date range — honors the host's calendar, weekend +
+ *  monthly pricing and the length-of-stay discount (same maths the booking
+ *  uses). Lets clients show the exact total for the chosen dates without
+ *  duplicating the logic.
  *
  *  GUEST-FACING and PUBLIC: every figure includes the platform commission and
  *  the host's raw price is never returned. Each night is marked up and rounded
@@ -847,24 +1220,42 @@ export interface StayQuote {
  *  number of nights and arrive at the subtotal we show them. */
 export async function getStayQuote(listingId: string, checkIn: string, checkOut: string): Promise<StayQuote | null> {
   if (!isUuid(listingId) || !isDate(checkIn) || !isDate(checkOut) || checkOut <= checkIn) return null
+  // One row per NIGHT rather than one aggregate row: the summary has to itemise
+  // "Aug 16 · 3,850 EGP" per night, and re-deriving that client-side is exactly
+  // the duplication this endpoint exists to prevent. The subtotal is then summed
+  // from the same rows the guest is shown, so the list always adds up to it.
   const { rows } = await pool.query(
-    `SELECT
-       ($2::date - $1::date) AS nights,
-       (SELECT COALESCE(sum(${sqlWithCommission(PER_NIGHT_RAW_SQL)}), 0)
-        FROM generate_series($1::date, $2::date - interval '1 day', interval '1 day') d)::float8 AS subtotal,
-       (CASE WHEN ($2::date - $1::date) >= 28 THEN COALESCE(l.monthly_discount, 0)
-             WHEN ($2::date - $1::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
-             ELSE 0 END)::int AS discount_percent,
-       (l.weekend_price IS NOT NULL OR l.monthly_prices <> '{}'::jsonb) AS has_seasonal,
-       l.currency
-     FROM listings l WHERE l.id = $3`,
-    [checkIn, checkOut, listingId]
+    `SELECT to_char(d, 'YYYY-MM-DD') AS date,
+            ${sqlWithCommission(PER_NIGHT_RAW_SQL)}::float8 AS price,
+            CASE
+              WHEN ${dateOverrideExistsSql} THEN 'custom'
+              WHEN extract(dow from d)::int IN (5, 6) AND l.weekend_price IS NOT NULL THEN 'weekend'
+              WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$' THEN 'monthly'
+              ELSE 'base'
+            END AS source,
+            (CASE WHEN ($3::date - $2::date) >= 28 THEN COALESCE(l.monthly_discount, 0)
+                  WHEN ($3::date - $2::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
+                  ELSE 0 END)::int AS discount_percent,
+            (l.weekend_price IS NOT NULL OR l.monthly_prices <> '{}'::jsonb) AS has_seasonal,
+            l.currency
+       FROM listings l,
+            generate_series($2::date, $3::date - interval '1 day', interval '1 day') AS d
+      WHERE l.id = $1
+      ORDER BY d ASC`,
+    [listingId, checkIn, checkOut]
   )
   const r = rows[0]
   if (!r) return null
-  const nights = Number(r.nights)
-  // Already a sum of multiples of 10 — Math.round only sheds the float8 dust.
-  const subtotal = Math.round(Number(r.subtotal))
+  const breakdown = rows.map((row) => ({
+    date: row.date as string,
+    price: Math.round(Number(row.price)),
+    source: row.source as PriceSource,
+  }))
+  const nights = breakdown.length
+  // Each night is already a multiple of 10 (marked up and rounded individually),
+  // so this sum needs no further rounding — and it ties out against the list the
+  // guest can see, which a separately-computed aggregate would not guarantee.
+  const subtotal = breakdown.reduce((sum, n) => sum + n.price, 0)
   const discountPercent = Number(r.discount_percent)
   // The discount reintroduces a fraction, so land the total back on a multiple
   // of 10. Rounding UP here matches every other guest-facing figure.
@@ -876,7 +1267,11 @@ export async function getStayQuote(listingId: string, checkIn: string, checkOut:
     total,
     nightlyAvg: nights > 0 ? Math.round(subtotal / nights) : subtotal,
     currency: r.currency ?? 'EGP',
-    hasSeasonalPricing: Boolean(r.has_seasonal),
+    // The host's calendar counts as seasonal pricing: a stay whose nights differ
+    // from each other must not be summarised as "price × nights".
+    hasSeasonalPricing: Boolean(r.has_seasonal) || breakdown.some((n) => n.source === 'custom'),
+    nights_breakdown: breakdown,
+    hasCustomNights: breakdown.some((n) => n.source === 'custom'),
   }
 }
 
@@ -2539,7 +2934,16 @@ export async function getHostApplication(userId: string): Promise<HostApplicatio
 
 /** Submit (or re-submit after a rejection) an application: upserts on the
  *  UNIQUE (user_id) constraint, back to 'pending' with the old review cleared.
- *  Does NOT touch users.is_host. Callers validate the fields first. */
+ *  Does NOT touch users.is_host. Callers validate the fields first.
+ *
+ *  The identity documents ride along and are filed as the applicant's pending
+ *  id_verifications row, linked through host_applications.verification_id, so
+ *  ONE admin decision covers both host status and identity — and so no
+ *  application reaches the queue with nothing for the reviewer to read the
+ *  declared name and national ID against. An applicant who already has a
+ *  verified or pending submission is linked to it instead of photographing the
+ *  same document twice (`needsIdentityDocuments`); the route enforces the same
+ *  rule up front so the applicant gets per-field messages. */
 export async function submitHostApplication(
   userId: string,
   f: {
@@ -2550,6 +2954,11 @@ export async function submitHostApplication(
     host_type: HostType
     company?: string | null
     notes?: string | null
+    /** national_id | passport | residence_permit — which document was photographed. */
+    doc_type?: string | null
+    /** FRONT / BACK photos as `data:image/…` URLs (or https links). */
+    id_front?: string | null
+    id_back?: string | null
   }
 ): Promise<HostApplication | null> {
   if (!isUuid(userId)) throw new Error('Invalid user')
@@ -2569,6 +2978,31 @@ export async function submitHostApplication(
       vals
     )
   }
+  // File the identity documents and link them to the application, so approving
+  // the application can approve the identity in the same decision. Re-reading
+  // the status here rather than trusting the caller keeps the two writes
+  // consistent even if a route ever forgets the check.
+  const identity = await getVerificationStatusFromTable(userId)
+  if (needsIdentityDocuments(identity.status) && f.id_front) {
+    await submitVerificationImages({
+      userId,
+      front: f.id_front,
+      back: f.id_back ?? null,
+      idNumber: f.national_id,
+      fullName: f.full_name,
+      docType: f.doc_type ?? null,
+      source: 'host_application',
+    })
+  }
+  // Whether we just filed it or it was already on file, the application points at
+  // the submission the reviewer should open.
+  await pool.query(
+    `UPDATE host_applications
+        SET verification_id = (SELECT v.id FROM id_verifications v
+                                WHERE v.user_id = $1 ORDER BY v.submitted_at DESC LIMIT 1)
+      WHERE user_id = $1`,
+    [userId]
+  )
   // Persist the host type + company on the user (same as the web) so listings can
   // show a "Company"/"Brokerage" badge once the application is approved.
   await pool.query(`UPDATE users SET host_type = $2, company = $3 WHERE id = $1`, [userId, f.host_type, company])
@@ -2679,6 +3113,11 @@ export type VerificationTableStatus = 'unverified' | 'pending' | 'verified' | 'r
 export interface VerificationTableState {
   status: VerificationTableStatus
   verified_at: string | null
+  /** The number on that submission, when it carried one. Sent to the signed-in
+   *  user's own client so the become-a-host form can reuse an identity already
+   *  on file instead of asking for the same number a second time — the rule is
+   *  `nationalIdForApplication` in host-verification-core. */
+  id_number: string | null
 }
 
 /** Submit FRONT (+ optional BACK) ID photos for review → upserts the user's
@@ -2695,8 +3134,12 @@ export async function submitVerificationImages(args: {
   /** Which document this is. Required on new submissions (the reviewer checks
    *  the photo against the declared type); null only on rows predating it. */
   docType?: string | null
+  /** Where the submission came from — 'manual' (the profile's verify card) or
+   *  'host_application' (filed with a become-a-host application). /ops shows it,
+   *  and it is the same vocabulary the web writes. */
+  source?: 'manual' | 'host_application'
 }): Promise<VerificationTableState> {
-  const { userId, front, back = null, idNumber = null, fullName = null, docType = null } = args
+  const { userId, front, back = null, idNumber = null, fullName = null, docType = null, source = 'manual' } = args
   if (!isUuid(userId)) throw new Error('Invalid user')
   const f = String(front ?? '').trim()
   if (!/^data:image\//i.test(f) && !/^https?:\/\//i.test(f)) {
@@ -2720,16 +3163,16 @@ export async function submitVerificationImages(args: {
               id_number = COALESCE($4, id_number),
               full_name = COALESCE($5, full_name),
               doc_type = COALESCE($6, doc_type),
-              source = 'manual', status = 'pending',
+              source = $7, status = 'pending',
               submitted_at = now(), reviewed_at = NULL, reviewed_by = NULL, notes = NULL
         WHERE id = $1`,
-      [existing.rows[0].id, f, b, idNumber, fullName, docType]
+      [existing.rows[0].id, f, b, idNumber, fullName, docType, source]
     )
   } else {
     await pool.query(
       `INSERT INTO id_verifications (user_id, image_data, back_image_data, id_number, full_name, doc_type, source, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'manual', 'pending')`,
-      [userId, f, b, idNumber, fullName, docType]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
+      [userId, f, b, idNumber, fullName, docType, source]
     )
   }
   // A resubmission must clear a previous rejection on the user row, or the gate
@@ -2739,7 +3182,11 @@ export async function submitVerificationImages(args: {
       WHERE id = $1 AND COALESCE(verification_status, 'unverified') <> 'verified'`,
     [userId]
   )
-  return { status: 'pending', verified_at: null }
+  // Read the row back rather than asserting `{ status: 'pending' }`: the upsert
+  // COALESCEs the number, so what we just stored is not always what was sent
+  // (a resubmission that omits it keeps the earlier one), and the clients now
+  // prefill the host application from this value.
+  return getVerificationStatusFromTable(userId)
 }
 
 /** The reviewer's note on the user's latest ID submission, or null.
@@ -2757,9 +3204,9 @@ export async function getVerificationNote(userId: string): Promise<string | null
  *  id_verifications row. Defaults to 'unverified' when no row exists.
  *  verified_at is the review timestamp once status is 'verified'. */
 export async function getVerificationStatusFromTable(userId: string): Promise<VerificationTableState> {
-  if (!isUuid(userId)) return { status: 'unverified', verified_at: null }
+  if (!isUuid(userId)) return { status: 'unverified', verified_at: null, id_number: null }
   const { rows } = await pool.query(
-    `SELECT status,
+    `SELECT status, id_number,
             CASE WHEN status = 'verified'
                  THEN to_char(reviewed_at, 'YYYY-MM-DD"T"HH24:MI:SS') END AS verified_at
        FROM id_verifications
@@ -2769,10 +3216,11 @@ export async function getVerificationStatusFromTable(userId: string): Promise<Ve
     [userId]
   )
   const r = rows[0]
-  if (!r) return { status: 'unverified', verified_at: null }
+  if (!r) return { status: 'unverified', verified_at: null, id_number: null }
   return {
     status: (r.status as VerificationTableStatus) ?? 'unverified',
     verified_at: r.verified_at ?? null,
+    id_number: (r.id_number as string | null)?.trim() || null,
   }
 }
 

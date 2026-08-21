@@ -10,7 +10,7 @@
 // the evasions people actually reach for are covered:
 //
 //   • separators              010 123 45 67 · 010-123-4567 · (010)/123 · 0_1_0
-//   • letters as separators   A0101 S416 M3280 · 0101x416x3280
+//   • letters as separators   A0101 S416 M3280 · 0101x416x3280 · 0a1b0c1d2e3f4g5h6
 //   • Arabic-Indic digits     ٠١٠١٢٣٤٥٦٧٨ and Eastern ۰۱۰
 //   • fullwidth / enclosed    ０１０１２３４５６７８ · ⓪①⓪ · 0️⃣1️⃣0️⃣
 //   • invisible characters    zero-width space, soft hyphen, RTL/LTR marks
@@ -200,6 +200,64 @@ function longestDigitRun(s: string): number {
   return max
 }
 
+/**
+ * The longest run of digits that arrive in ONES AND TWOS with letters wedged
+ * between them — "0a1b0c1d2e3f4g5h6i7j8". Returns its digit count, or 0.
+ *
+ * That padding defeats every other detector here: each digit run is length one,
+ * so no run threshold fires, and a letter is not punctuation, so
+ * `collapseDigitSeparators` deliberately won't bridge it. Reducing the whole
+ * text to its digits does see it, but only a shape as specific as an Egyptian
+ * mobile can safely be matched against a whole-text concatenation — anything
+ * looser reads "Built 2003, 12 rooms, 45 guests" as a phone number. A number
+ * written to any other plan (a Saudi 05x, a ten-digit international line, a
+ * landline) therefore walked straight through.
+ *
+ * A contiguous run is safe to count on its own, because three things have to
+ * hold at once and honest text never has all three:
+ *   • every digit group is one or two digits long — a third digit is a year, a
+ *     price or a size, so it ends the run rather than extending it. This is
+ *     what keeps "90m2, 120m2, 150m2, 200m2" out.
+ *   • each group is at most `MAX_GAP` characters from the next — prose puts
+ *     whole words between its numbers ("3 pools, 2 floors"), which breaks the
+ *     run before it can grow.
+ *   • at least `MIN_LETTER_JOINS` of those gaps contain a letter — a gap of
+ *     pure punctuation is `collapseDigitSeparators`'s job, already done above.
+ */
+function letterInterleavedDigits(s: string): number {
+  const MAX_GAP = 3 // "0 a 1" — a longer separator is prose, not padding
+  const MAX_GROUP = 2
+  const MIN_LETTER_JOINS = 3
+  const HAS_LETTER = /\p{L}/u
+
+  let best = 0
+  let digits = 0
+  let joins = 0
+  let prevEnd = -1 // end of the previous group, or -1 when no run is open
+  const flush = () => {
+    if (joins >= MIN_LETTER_JOINS && digits > best) best = digits
+    digits = 0
+    joins = 0
+  }
+
+  const group = /\d+/g
+  let m: RegExpExecArray | null
+  while ((m = group.exec(s)) !== null) {
+    if (m[0].length > MAX_GROUP) {
+      flush()
+      prevEnd = -1
+      continue
+    }
+    const gap = prevEnd < 0 ? null : s.slice(prevEnd, m.index)
+    if (gap === null || gap.length > MAX_GAP) flush()
+    else if (HAS_LETTER.test(gap)) joins += 1
+    digits += m[0].length
+    prevEnd = m.index + m[0].length
+  }
+  flush()
+  return best
+}
+
 /** True if `text` appears to contain a phone number (after de-obfuscation). */
 export function containsPhoneNumber(text: string): boolean {
   if (!text) return false
@@ -223,6 +281,14 @@ export function containsPhoneNumber(text: string): boolean {
   // This also covers digits scattered through a sentence ("my number: 010, then
   // 1234, then 5678"), which is why no intent check gates it any more.
   if (/01[0125]\d{8}/.test(digitsOnly(norm))) return true
+  // The same padding used on a number that ISN'T an Egyptian mobile — a Saudi
+  // 05x, a ten-digit international line, a landline written without its 0. The
+  // shape check above can't see those, and loosening it to a bare length would
+  // have to match against the whole text. A contiguous letter-interleaved run
+  // is safe to count instead: honest prose separates its numbers with whole
+  // words, which never join into one run. Eight digits is the same floor a
+  // plain run has to clear.
+  if (letterInterleavedDigits(norm) >= 8) return true
   if (!CONTACT_HINT.test(norm)) return false
   // From here on the sender has said they're handing over contact details, so a
   // weaker signal is enough.
@@ -231,6 +297,8 @@ export function containsPhoneNumber(text: string): boolean {
   // the intent check, because 0[23] plus eight digits is a much likelier
   // accident in a number-heavy listing than a mobile prefix is.
   if (/0[23]\d{8}/.test(digitsOnly(norm))) return true
+  // Six padded digits, for the short numbers the 8-digit floor above misses.
+  if (letterInterleavedDigits(norm) >= 6) return true
   // An all-letter number written out in lookalikes ("my number is OIO IZ34567").
   if (longestDigitRun(collapseDigitSeparators(normalizeForPhone(text, true))) >= 8) return true
   return false
