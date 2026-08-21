@@ -10,13 +10,13 @@ import {
   normalizeQrImage,
 } from '@/lib/local/payment-config-core'
 
-// Admin-controlled Instapay destination.
+// Admin-controlled Instapay destination (World 1 — cookie auth, non-Supabase).
 //   GET /api/local/admin/settings/instapay
 //     → { instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload }
 //   PUT /api/local/admin/settings/instapay
 //     {instapay_handle?, instructions?, instapay_link?, instapay_qr_image?}
 // Every field is optional — an omitted key is left untouched, an empty string
-// clears it. Requires a staff session holding the 'payments' module.
+// clears it. Requires a staff session with the 'payments' module.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -38,7 +38,11 @@ export async function OPTIONS() {
 export async function GET(req: Request) {
   const gate = await requireStaff(req, 'payments')
   if ('error' in gate) return gate.error
-  return NextResponse.json(await getPaymentConfig(), { headers: CORS })
+  try {
+    return NextResponse.json(await getPaymentConfig(), { headers: CORS })
+  } catch (err) {
+    return NextResponse.json({ error: 'Failed to load', detail: String(err) }, { status: 500, headers: CORS })
+  }
 }
 
 export async function PUT(req: Request) {
@@ -65,6 +69,8 @@ export async function PUT(req: Request) {
     }
 
     for (const [key, value] of updates) await setSetting(key, value, actor)
+    // This changes the account guests are told to pay. It was previously the single
+    // most consequential unaudited action in the system.
     await logStaffAction({
       staffId: gate.staff.legacy ? null : gate.staff.staffId,
       staffEmail: gate.staff.email,

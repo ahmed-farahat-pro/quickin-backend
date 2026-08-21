@@ -3,9 +3,15 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PKPass } from 'passkit-generator'
 import { getBookingById } from '@/lib/local/db'
+import { getUserFromRequest } from '@/lib/local/auth'
 
 // Signed Apple Wallet pass for a confirmed reservation.
 //   GET     /api/wallet/pass/:bookingId  → application/vnd.apple.pkpass (a signed .pkpass)
+//
+// The pass embeds the reservation code — the credential that resolves /stay/<code> —
+// so this route is authenticated to the same guest/host/admin rule the sibling
+// booking routes use. It previously had no auth at all, which made any booking id a
+// bearer token for that stay's pass.
 //   OPTIONS /api/wallet/pass/:bookingId  → CORS preflight
 //
 // Signing material lives in the backend .env (gitignored), read at runtime:
@@ -101,9 +107,19 @@ export async function GET(req: Request, ctx: { params: Promise<{ bookingId: stri
 
   try {
     const { bookingId } = await ctx.params
+    const user = await getUserFromRequest(req)
+    if (!user) {
+      return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
+    }
     const booking = await getBookingById(bookingId)
     if (!booking) {
       return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
+    }
+    // Same rule as GET /api/local/bookings/:id — the guest on the reservation, the
+    // host being stayed with, or an operator. Checked AFTER the 404 so this never
+    // reveals whether an id exists to someone who cannot see it either way.
+    if (booking.user_id !== user.id && booking.host_id !== user.id && user.role !== 'admin') {
+      return NextResponse.json({ error: 'Not allowed' }, { status: 403, headers: CORS })
     }
     // No pass for an unconfirmed booking: the QR on the pass is the reservation
     // code, and a code only exists once the stay is confirmed. Never fall back to

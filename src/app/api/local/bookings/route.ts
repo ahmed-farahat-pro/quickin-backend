@@ -64,7 +64,10 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: 'That screenshot is too large (max ~3.5MB)' }, { status: 400, headers: CORS })
       }
     }
-    let booking = await createBooking({ listingId, userId: user.id, checkIn, checkOut, guests })
+    let booking = await createBooking({
+      listingId, userId: user.id, checkIn, checkOut, guests,
+      adults: body.adults, children: body.children, infants: body.infants, pets: body.pets,
+    })
     if (proof != null) {
       const withProof = await submitPaymentProof(booking.id, user.id, String(proof), body.payment_method || 'instapay')
       if (withProof) booking = withProof

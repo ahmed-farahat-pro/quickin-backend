@@ -1,5 +1,9 @@
 // Guards the one thing that MUST agree between the two repos: the staff module
-// catalog. quickin-backend and quickin-frontend each carry their own copy of
+// catalog. The web no longer has a staff.ts — it holds only the CATALOG, split out
+// into src/lib/local/staff-modules.ts so the console can name a module without
+// importing session code that talks to a database it no longer has. The two copies
+// can still drift, so this guard still earns its place.
+// quickin-backend and quickin-frontend each carry their own copy of
 // src/lib/local/staff.ts (they share a Neon DB but cannot import each other), and
 // staff_permissions.module rows are written by one and read by the other — so a
 // drifted key means a moderator silently loses, or silently gains, a module.
@@ -12,7 +16,7 @@ import { createHash } from 'node:crypto'
 
 const FILES = {
   backend: new URL('../src/lib/local/staff.ts', import.meta.url),
-  frontend: new URL('../../../quickin-frontend/src/lib/local/staff.ts', import.meta.url),
+  frontend: new URL('../../../quickin-frontend/src/lib/local/staff-modules.ts', import.meta.url),
 }
 
 // Pull out just the STAFF_MODULES array literal, then strip comments and all

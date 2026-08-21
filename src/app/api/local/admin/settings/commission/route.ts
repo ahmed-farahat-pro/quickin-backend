@@ -1,39 +1,26 @@
 import { NextResponse } from 'next/server'
-import { getCommissionConfig, setCommissionRate } from '@/lib/local/db'
+import { getCommissionConfig, getCommissionImpact, setCommissionRate } from '@/lib/local/db'
 import { requireStaff, staffActor, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import { isCommissionError, rateFromPercent } from '@/lib/local/commission-core'
 
 // The platform commission — the percentage added on top of every host's raw
 // price to produce the price a guest sees and pays.
-//   GET /api/local/admin/settings/commission → { rate, percent, updated_at, updated_by }
+//   GET /api/local/admin/settings/commission
+//     → { rate, percent, updated_at, updated_by, impact: { listings, services } }
 //   PUT /api/local/admin/settings/commission  { percent }   (e.g. 12.5)
 //
 // Changing this REPRICES every listing and service immediately, because guest
 // prices are derived at read time. It does NOT touch bookings that already
 // exist: each one snapshots the rate it was taken at (bookings.commission_rate).
-// Requires a staff session holding the 'pricing' module.
+// Requires a staff session with the 'pricing' module.
 export const dynamic = 'force-dynamic'
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Cache-Control': 'no-store',
-}
-
-export async function OPTIONS() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,PUT,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    },
-  })
-}
+const CORS = { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }
 
 export async function GET(req: Request) {
   const gate = await requireStaff(req, 'pricing')
   if ('error' in gate) return gate.error
-  return NextResponse.json(await getCommissionConfig(), { headers: CORS })
+  const [config, impact] = await Promise.all([getCommissionConfig(), getCommissionImpact()])
+  return NextResponse.json({ ...config, impact }, { headers: CORS })
 }
 
 export async function PUT(req: Request) {
@@ -55,7 +42,8 @@ export async function PUT(req: Request) {
       detail: { from_percent: previous.percent, to_percent: config.percent },
       ip: clientIpOf(req),
     })
-    return NextResponse.json(config, { headers: CORS })
+    const impact = await getCommissionImpact()
+    return NextResponse.json({ ...config, impact }, { headers: CORS })
   } catch (err) {
     if (isCommissionError(err)) {
       return NextResponse.json({ error: err.message }, { status: 400, headers: CORS })

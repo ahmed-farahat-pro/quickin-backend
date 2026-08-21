@@ -650,22 +650,35 @@ rewritten; notes ride along per day, so splitting a *maintenance* block leaves t
 *maintenance* blocks rather than two unlabelled ones. That is `applyBlockChange()` and
 `blockRewriteWindow()`, both pure and both tested.
 
-### Known divergence: web vs backend stay totals
+### Resolved: the web vs backend stay totals
 
-**This predates the calendar and the calendar does not fix it.** The two projects do not
-run the same ladder below the calendar rung:
+**Fixed 21 Aug 2026.** The two projects used to run different ladders below the calendar
+rung, so the same listing and the same dates produced a different total depending on
+which client took the booking:
 
-| | `quickin-backend` (mobile) | `quickin-frontend` (web) |
-| --- | --- | --- |
-| Weekend rung | hardcoded Fri/Sat | the listing's `weekend_days` |
-| Monthly rung | applied | **not applied** |
-| Length-of-stay discount | applied in `createBooking` | **not applied** |
+| | was `quickin-backend` | was `quickin-frontend` | now (both) |
+| --- | --- | --- | --- |
+| Weekend rung | hardcoded Fri/Sat | the listing's `weekend_days`, skipped when NULL | `weekend_days`, defaulting to Fri/Sat |
+| Monthly rung | applied | **not applied** | applied |
+| Length-of-stay discount | applied in `createBooking` | **not applied** | applied |
 
-So the same listing and the same dates can produce a different total depending on which
-client took the booking. The calendar rung is identical in both (that is what the parity
-guard covers), so a pinned day is charged the same either way — but a listing relying on
-`monthly_prices` or a weekly discount is not. Unifying the two is a separate change, and
-it needs a decision about which behaviour is the correct one before it is written.
+The tiebreak was not a matter of taste. `resolveNightPrice()` in `date-pricing-core.ts`
+is byte-identical in both repos and is what the CLIENTS use to preview a price — so it
+was already the agreed spec, and **both** SQL ladders had drifted from it in different
+directions. Each server was charging something the guest had not been quoted.
+
+All three rungs now come from `date-pricing-core.ts`, which the parity guard covers:
+
+- `perNightSeasonalSql(dateExpr, alias)` — weekend → month → base, the SQL twin of
+  `resolveNightPrice`.
+- `stayDiscountFactorSql(checkIn, checkOut, alias)` and its twin `stayDiscountPercent()`
+  — `weekly_discount` from 7 nights, `monthly_discount` from 28, whichever applies
+  (they never compound), clamped at 100% so a stay total can never go negative.
+
+`npm run check` proves the file is identical across the repos; it cannot prove the SQL
+and TypeScript rungs inside it agree with each other. **`scripts/_verify-night-price.mjs`
+does** — it runs both against a real database over weekend/monthly/NULL/empty-array
+cases. Run it after touching either rung.
 
 ## Environment
 
@@ -1126,6 +1139,163 @@ screen, so adding the key would send a suspended user somewhere they can succeed
 still be refused. `adminBroadcast` also skips non-active accounts, so a blocked user
 receives no push or email.
 
+## One email, several rows — the credentials pick the account
+
+`scripts/migrate-split-accounts.mjs` dropped the unique constraint on `users.email` and
+keyed uniqueness on **`(lower(email), role)`** instead, so an address may legitimately
+own more than one row on the shared Neon DB. The split-account model itself was later
+abandoned (signup now creates one unified `role = 'user'` account), but **the index and
+the duplicate rows created under it are still there**, so "the user with this email" is
+ambiguous and every sign-in path has to say what it means.
+
+The rule: **verify the password against every row for the address, and let the match
+decide** — never pick a row first and check the password against only that one.
+
+That ordering was a real production bug, and an unusually confusing one. Both projects
+picked first and verified second, and they picked *differently* — this API with
+`ORDER BY (role = 'user') DESC LIMIT 1`, the web with an unordered `rows[0]`. For an
+address whose password sat on the row this API did not pick, **the same email and
+password signed in on the web and came back `401 Invalid email or password` on iOS and
+Android**, with nothing in either log to explain the asymmetry. Users read that as "the
+app is broken" or "the apps use a different database"; they do not.
+
+- `src/lib/local/login-row-core.ts` — `pickLoginRow`, `blockedRowAmong`,
+  `LOGIN_ROW_ORDER_SQL`. No imports, so `node --test` can load it. **Byte-identical to
+  the web copy**, enforced by `scripts/check-login-row-core-parity.mjs` (in `npm run
+  check`) — if the copies drift, the cross-client asymmetry silently returns.
+- `getUserRowsByEmail(email)` in `src/lib/local/auth.ts` returns all rows in
+  `LOGIN_ROW_ORDER_SQL` order — a **total** order (`role='user'`, then `created_at`,
+  then `id`), so a tie never falls back to physical row order.
+- `pickLoginRow` returns the canonical row when nothing matches, so the wrong-password
+  branch and its 401 are unchanged. It must never turn "wrong password" into "no such
+  user", which would leak which addresses are registered.
+- **A block is enforced across all rows.** `/ops` suspends one row by id, so
+  `blockedRowAmong(rows)` refuses the address if *any* row is blocked or removed —
+  otherwise a suspended person signs in through a sibling row that was never blocked.
+
+`getUserRowByEmail` (single row, `LIMIT 1`) is still fine for lookups that only need an
+identity. It is **not** fine for deciding a sign-in. Tests: `test/unit/login-row-core.test.mjs`.
+
+The lasting fix is to merge the duplicates and restore uniqueness on `lower(email)` —
+see **Database migrations → `dedupe-user-emails.mjs`**. Until that runs, this rule is
+what keeps the web and the apps agreeing.
+
+## What a guest gets back when they cancel
+
+Refund maths lives in `src/lib/local/cancellation-core.ts`, shared byte-identically with
+the web and guarded by `scripts/check-cancellation-core-parity.mjs`. It exists because
+the two projects disagreed and both answers were live: for a stay 6 days out this API
+refunded **100% of the host's raw price** while the web refunded **50% of what the guest
+paid**. Same booking, same day, two numbers — decided by which app the guest opened.
+
+Three things to know:
+
+1. **One flat ladder, on purpose.** 7+ days before check-in refunds 100%, 1–6 days
+   refunds 50%, the day of check-in or later refunds nothing. `listings.cancellation_policy`
+   still exists, hosts still set it, and `createBooking` still snapshots it onto every
+   booking — nothing reads it yet. That is deliberate: when the per-listing
+   flexible/moderate/strict ladder is agreed with the business, switching it on is a
+   change to `refundPercentForDays` plus a read of the snapshot, **not a migration and
+   not a backfill**, because the data has been recorded the whole time.
+2. **The refund is a share of what the GUEST PAID**, commission included — so callers
+   must pass a commission-inclusive total, which in SQL is
+   `sqlWithCommission('b.total_price', BOOKING_RATE_SQL)`. Refunding the host's raw
+   price quietly kept the platform's commission on a stay that never happened and handed
+   the guest less than the percentage they were shown.
+3. **`isCancellable` blocks the double refund.** A retried cancel would otherwise write a
+   second `refund_amount` over the first.
+
+`getCancellationQuote` and `cancelBooking` both take **`(userId, bookingId)`** — in both
+projects. They used to disagree on the order, and since both are strings a swapped call
+compiles cleanly and silently returns nothing.
+
+## Timestamps are serialised as real UTC
+
+Every `to_char(...)` that renders a timestamp for a client goes through
+`col AT TIME ZONE 'UTC'` and ends in a literal `Z`. Both parts matter, and the codebase
+previously had neither consistently:
+
+```sql
+to_char(b.paid_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS paid_at
+```
+
+`to_char` on a `timestamptz` renders in the **session** time zone. Without the
+conversion, a server sitting in `Africa/Cairo` produced `2026-08-21T04:18:29` for an
+instant whose real UTC value was `01:18:29` — and the web then appended a `Z` to exactly
+that string, asserting UTC for a time that was three hours off. Omitting the `Z` instead
+is not a fix either: clients parse a bare timestamp as **device-local**, so it only looked
+right to a viewer who happened to share the database's zone.
+
+Converting explicitly makes the output independent of how any server is configured. All
+74 timestamp columns are `timestamptz`, so the conversion is always safe. When adding a
+column, follow the same shape.
+
+## What makes a booking refusable
+
+`createBooking` is the one place a reservation can be stopped, so every rule lives there
+rather than in the route. The two projects had each written half the list and neither
+enforced the other's half — a booking the app refused, the browser took, and vice versa.
+
+Refused when:
+
+- the dates are malformed, check-out is not after check-in, or **check-in is in the past**;
+- the listing does not exist, **is not published**, or its **host is blocked or removed** —
+  search already hides those, but a booking can arrive with a listing id from a deep link
+  or a stale client, and without the check "hide their listings" would only hide them;
+- **adults + children exceeds `max_guests`** (infants and pets are recorded but do not
+  count toward the headcount);
+- the window overlaps a live booking — `status NOT IN ('cancelled', 'rejected')`, since a
+  rejected booking must not hold dates hostage — **or a range in `listing_blocked_dates`**,
+  a day the host blocked on their calendar even though no booking exists for it.
+
+`bookings` stores `adults`/`children`/`infants`/`pets` alongside `guests`, so a reservation
+carries the same breakdown whichever client took it.
+
+## /ops — the staff console
+
+**This project now owns the whole `/ops` API.** It was ported from quickin-frontend on
+21 Aug 2026 as the first real step of collapsing the two backends into one: the web keeps
+the 21 `/ops` PAGES, and reaches this API instead of holding its own database client.
+
+What moved: **43 routes** (`api/local/admin/*`, `api/local/staff/*`, `auth/change-password`,
+`cron/staff-cleanup`, `api/local/app-links`, `api/local/wishlists`), the db functions
+behind them, and 9 modules — `analytics`, `analytics-core`, `overview-trends-core`,
+`activity-core`, `user-admin-core`, `document-core`, `payment-flow-core`, `staff-email`
+and `xlsx` (which brings the `write-excel-file` dependency; any route importing it must
+declare `export const runtime = 'nodejs'`).
+
+Of the 11 admin routes this project already had, the **7 that the web also had were
+replaced** by the web's versions — nothing called this project's copies (the mobile apps
+never did, this project serves no console, and the only references in the tree were
+comments), while the web's are the live console. The other **4 are backend-only and were
+kept**: `admin/[entity]/[id]`, `admin/notify`, `admin/overview` and `admin/promos` have no
+web counterpart, so replacing the directory wholesale would have silently dropped them.
+
+Two things did NOT move, deliberately:
+
+- **`local/xmig8` and `local/xmig9`** are one-shot, key-gated migration endpoints that
+  exist only because Vercel has no shell. They are marked REMOVE-after-run and belong to
+  the web's deploy history. This project runs the equivalent `scripts/migrate-*.mjs`
+  instead. Confirm both have been applied to Neon before the web's copies are deleted.
+- **`reviewHostApplication`** was a genuinely drifted pair, and the /ops version won: it
+  keys on the APPLICATION id rather than the user id, and records the deciding operator.
+  The audit log and the console both depend on that actor; the old signature had none.
+
+`scripts/_verify-ops-port.mjs` calls all 22 ported read paths against a real database, so
+a bad SQL port fails there rather than in the console:
+
+```
+DATABASE_URL=postgresql://localhost:5432/quickin_local \
+  node --import ./scripts/_ts-resolve-hook.mjs scripts/_verify-ops-port.mjs
+```
+
+The `--import` hook is what lets a plain script load `src/lib/local/*.ts` despite their
+extension-less relative imports; see README → Testing for why those exist.
+
+**Before the web is cut over**, `STAFF_AUTH_SECRET` must be set to the SAME value on both
+Vercel projects. It is currently unset on both, so each falls back to its own
+`AUTH_SECRET` — and a `qk_staff` cookie signed by one will not verify on the other.
+
 ## A rejected listing has to say why
 
 `setListingApproval` used to spend the rejection reason and then lose it: the note was
@@ -1176,6 +1346,7 @@ the list of record. Recent additions:
 | `migrate-id-change-requests.mjs` | `id_change_requests` — a user's request to change the ID number on their profile, with the document photo backing it, one open request per user (partial unique index). Behind `/ops` → ID verifications, and the only thing that writes `users.id_document` now that `PATCH /api/local/profile` refuses it. Also **reports** how many accounts already carry a self-declared number that nobody ever reviewed. Additive, and the reads degrade to an empty queue if it has not run, so it is safe to apply well ahead of the deploy |
 | `migrate-listing-review-note.mjs` | `listings.review_note` — the operator's reason for rejecting a listing, which used to exist only inside a notification body and is now shown to the host on the web dashboard, in the listing editor and on both mobile host dashboards. Nullable, no backfill: NULL means "no reason recorded", the honest answer both for an unexplained rejection (the note is optional) and for every listing rejected before the column existed. Also **reports** how many rejected listings carry no reason. **Unlike most additive columns this one must be applied BEFORE the deploy** — the host projection selects it, so a database without it fails every host read |
 | `migrate-date-prices.mjs` | `listing_date_prices` — one row per (listing, day) holding the RAW nightly rate a host pinned on their calendar, `PRIMARY KEY (listing_id, date)` so setting a day twice is an upsert rather than a second row whose precedence would depend on row order. The **absence** of a row is what "this day follows the listing's normal pricing" means, which is why "reset to default" deletes rather than writing the base price. Additive, and the ladder falls through to weekend/month/base if it has not run — but it **must be applied before the deploy**, since the per-night stay sum joins it on every quote and booking |
+| `dedupe-user-emails.mjs` | **Data repair, not a schema change — and the only script here that is destructive, so it reports by default and writes nothing without `--apply`.** Merges `users` rows that share an email (legal since `migrate-split-accounts.mjs` keyed uniqueness on `(lower(email), role)`), re-pointing every referencing row onto one keeper — referencing tables are read from the catalog, not hardcoded, so a table added later is not orphaned. The keeper is the row with the most linked data, then verified/active/has-a-password, then oldest. It **warns** when a discarded row holds a different password: login currently accepts either, so after the merge only the keeper's works. `--restore-unique` then re-creates `UNIQUE (lower(email))` and drops `users_email_role_uidx` — refused while any duplicate remains. Run the report against Neon before deciding anything |
 | `migrate-ranking-indexes.mjs` | Two indexes for the search ranking — `reviews(listing_id) INCLUDE (rating, created_at)` and `bookings(listing_id, status, check_out)`. **Pure performance, no schema change:** the ranking is correct without it, so the usual order does not apply and it can be run before or after the deploy |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The

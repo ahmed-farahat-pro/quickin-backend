@@ -29,7 +29,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
     const { id } = await ctx.params
     const user = await getUserFromRequest(req)
     if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    const quote = await getCancellationQuote(id, user.id)
+    const quote = await getCancellationQuote(user.id, id)
     if (!quote) return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
     return NextResponse.json(quote, { headers: CORS })
   } catch (err) {
@@ -42,7 +42,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const { id } = await ctx.params
     const user = await getUserFromRequest(req)
     if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    const result = await cancelBooking(id, user.id)
+    const result = await cancelBooking(user.id, id)
     if (!result) {
       return NextResponse.json(
         { error: 'This reservation can’t be cancelled (not yours, or already cancelled/completed).' },

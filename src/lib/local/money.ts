@@ -105,7 +105,7 @@ export async function getGuestReceipts(userId: string): Promise<GuestReceipt[]> 
             COALESCE(b.payment_method, 'card') AS method,
             b.promo_code,
             COALESCE(b.promo_discount, 0)::float8 AS promo_discount,
-            to_char(b.paid_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS paid_at
+            to_char(b.paid_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS paid_at
        FROM bookings b JOIN listings l ON l.id = b.listing_id
       WHERE b.user_id = $1 AND COALESCE(b.payment_status, 'unpaid') = 'paid'
       ORDER BY b.paid_at DESC NULLS LAST`,
@@ -177,7 +177,7 @@ export async function getHostEarnings(hostId: string): Promise<HostEarnings> {
             ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS gross,
             b.total_price::float8 AS net,
             (b.check_out < now()) AS stay_over,
-            to_char(b.paid_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS paid_at
+            to_char(b.paid_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS paid_at
        FROM bookings b JOIN listings l ON l.id = b.listing_id
       WHERE l.host_id = $1 AND COALESCE(b.payment_status, 'unpaid') = 'paid' AND b.status <> 'cancelled'
       ORDER BY b.paid_at DESC NULLS LAST`,

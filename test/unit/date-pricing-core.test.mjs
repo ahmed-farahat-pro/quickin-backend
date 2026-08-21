@@ -39,6 +39,7 @@ import {
   blockRewriteWindow,
   expandBlocks,
   mergeBlockedDays,
+  stayDiscountPercent, WEEKLY_DISCOUNT_MIN_NIGHTS, MONTHLY_DISCOUNT_MIN_NIGHTS,
 } from '../../src/lib/local/date-pricing-core.ts'
 
 // The brief's own worked example, used as the end-to-end assertion below.
@@ -554,5 +555,42 @@ describe('blockRewriteWindow', () => {
   test('nothing selected is nothing to do', () => {
     assert.equal(blockRewriteWindow([MAINTENANCE], []), null)
     assert.equal(blockRewriteWindow([MAINTENANCE], ['nope']), null)
+  })
+})
+
+describe('stayDiscountPercent — the length-of-stay discount', () => {
+  test('short stays get nothing', () => {
+    assert.equal(stayDiscountPercent(1, 10, 25), 0)
+    assert.equal(stayDiscountPercent(6, 10, 25), 0)
+  })
+
+  test('the weekly rate starts at exactly 7 nights', () => {
+    assert.equal(WEEKLY_DISCOUNT_MIN_NIGHTS, 7)
+    assert.equal(stayDiscountPercent(7, 10, 25), 10)
+    assert.equal(stayDiscountPercent(27, 10, 25), 10)
+  })
+
+  test('the monthly rate takes over at exactly 28 nights and does NOT compound', () => {
+    // 25, not 35 — the longer discount supersedes the weekly one rather than
+    // stacking with it.
+    assert.equal(MONTHLY_DISCOUNT_MIN_NIGHTS, 28)
+    assert.equal(stayDiscountPercent(28, 10, 25), 25)
+  })
+
+  test('a missing rate for the bracket means no discount', () => {
+    // A host who set only a monthly rate gives nothing away on a 10-night stay.
+    assert.equal(stayDiscountPercent(10, null, 25), 0)
+    assert.equal(stayDiscountPercent(30, 10, null), 0)
+  })
+
+  test('a discount over 100% is clamped, never inverted', () => {
+    // Otherwise the stay total goes negative and the platform pays the guest.
+    assert.equal(stayDiscountPercent(30, 0, 150), 100)
+  })
+
+  test('nonsense inputs discount nothing rather than producing NaN', () => {
+    assert.equal(stayDiscountPercent(0, 10, 25), 0)
+    assert.equal(stayDiscountPercent(NaN, 10, 25), 0)
+    assert.equal(stayDiscountPercent(10, undefined, undefined), 0)
   })
 })

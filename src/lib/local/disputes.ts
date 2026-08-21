@@ -54,9 +54,9 @@ export interface Dispute {
 const DISPUTE_COLS = `
   d.id, d.booking_id, d.guest_id, d.category, d.description,
   COALESCE(d.photos, '{}') AS photos, d.status, d.resolution,
-  to_char(d.created_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
-  to_char(d.updated_at,  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
-  to_char(d.resolved_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS resolved_at`
+  to_char(d.created_at AT TIME ZONE 'UTC',  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+  to_char(d.updated_at AT TIME ZONE 'UTC',  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
+  to_char(d.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS resolved_at`
 
 /**
  * File a dispute against a booking.
@@ -166,7 +166,7 @@ export async function listDisputeEvents(disputeId: string): Promise<DisputeEvent
   if (!isUuid(disputeId)) return []
   const { rows } = await pool.query(
     `SELECT id, from_status, to_status, note, actor, actor_name,
-            to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
        FROM dispute_events WHERE dispute_id = $1
       -- Qualified on purpose: the SELECT above aliases to_char(created_at, …)
       -- AS created_at, and Postgres resolves a BARE identifier in ORDER BY to the
@@ -257,5 +257,108 @@ export async function applyDisputeTransition(args: {
     throw err
   } finally {
     client.release()
+  }
+}
+
+
+// ---- /ops additions, ported from quickin-frontend 21 Aug 2026 ----
+
+/** One row in the /ops queue: a dispute plus who and what it's about. */
+export interface AdminDisputeRow extends Dispute {
+  guest_name: string | null
+  guest_email: string
+  listing_title: string | null
+  listing_id: string | null
+  host_id: string | null
+  host_name: string | null
+  reservation_code: string | null
+  check_in: string | null
+  check_out: string | null
+  /** So the queue can show "3 days" without a second query. */
+  event_count: number
+}
+
+/** One dispute for /ops, regardless of whose it is. */
+export async function adminGetDispute(disputeId: string): Promise<AdminDisputeRow | null> {
+  if (!isUuid(disputeId)) return null
+  const { rows } = await pool.query(
+    `SELECT ${DISPUTE_COLS},
+            gu.full_name AS guest_name, gu.email AS guest_email,
+            l.id AS listing_id, l.title AS listing_title,
+            l.host_id, hu.full_name AS host_name,
+            NULLIF(b.reservation_code, '') AS reservation_code,
+            to_char(b.check_in,  'YYYY-MM-DD') AS check_in,
+            to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            (SELECT COUNT(*) FROM dispute_events e WHERE e.dispute_id = d.id)::int AS event_count
+       FROM disputes d
+       JOIN bookings b ON b.id = d.booking_id
+       LEFT JOIN users gu ON gu.id = d.guest_id
+       LEFT JOIN listings l ON l.id = b.listing_id
+       LEFT JOIN users hu ON hu.id = l.host_id
+      WHERE d.id = $1`,
+    [disputeId],
+  )
+  return (rows[0] as AdminDisputeRow | undefined) ?? null
+}
+
+/**
+ * The queue. `open` and `in_review` are the working list; `all` keeps resolved
+ * and closed visible, which is what makes a repeat pattern on one listing
+ * recognisable months later.
+ */
+export async function adminListDisputes(status = 'needs_action'): Promise<AdminDisputeRow[]> {
+  const single = ['open', 'in_review', 'resolved', 'closed'].includes(status)
+  const where = single
+    ? 'WHERE d.status = $1'
+    : status === 'all'
+      ? ''
+      : "WHERE d.status IN ('open','in_review')"
+  const { rows } = await pool.query(
+    `SELECT ${DISPUTE_COLS},
+            gu.full_name AS guest_name, gu.email AS guest_email,
+            l.id AS listing_id, l.title AS listing_title,
+            l.host_id, hu.full_name AS host_name,
+            NULLIF(b.reservation_code, '') AS reservation_code,
+            to_char(b.check_in,  'YYYY-MM-DD') AS check_in,
+            to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            (SELECT COUNT(*) FROM dispute_events e WHERE e.dispute_id = d.id)::int AS event_count
+       FROM disputes d
+       JOIN bookings b ON b.id = d.booking_id
+       LEFT JOIN users gu ON gu.id = d.guest_id
+       LEFT JOIN listings l ON l.id = b.listing_id
+       LEFT JOIN users hu ON hu.id = l.host_id
+      ${where}
+      ORDER BY d.created_at DESC
+      LIMIT 300`,
+    single ? [status] : [],
+  )
+  return rows as AdminDisputeRow[]
+}
+
+/** How many disputes still need someone — the Alerts count. Zero when the table
+ *  doesn't exist yet, so an un-migrated database shows a calm console rather
+ *  than a broken dashboard. */
+export async function countOpenDisputes(): Promise<number> {
+  try {
+    const { rows } = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM disputes WHERE status IN ('open','in_review')`,
+    )
+    return Number(rows[0]?.n ?? 0)
+  } catch {
+    return 0
+  }
+}
+
+/** When the oldest still-open dispute arrived, so the alert can say "3 days".
+ *  Null when the table doesn't exist yet — see countOpenDisputes. */
+export async function oldestOpenDisputeAt(): Promise<string | null> {
+  try {
+    const { rows } = await pool.query(
+      `SELECT to_char((MIN(created_at)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS t
+         FROM disputes WHERE status IN ('open','in_review')`,
+    )
+    return (rows[0]?.t as string | null) ?? null
+  } catch {
+    return null
   }
 }

@@ -631,3 +631,92 @@ export function chunkWindows(from: string, to: string, size: number): { start: s
   }
   return out
 }
+
+// ---- Length-of-stay discount -------------------------------------------------
+//
+// A host can discount longer stays: `listings.weekly_discount` applies from 7 nights,
+// `listings.monthly_discount` from 28. They are whole percentages off the summed
+// nightly total, and only ONE applies — the monthly rate supersedes the weekly one
+// rather than compounding with it.
+//
+// This lives here, shared and guarded, because it did not: quickin-backend applied the
+// discount inside createBooking and the web did not apply it at all, so a 10-night stay
+// on a listing with weekly_discount = 10 cost 10% less booked from the app than from
+// the browser. Same listing, same dates, two prices.
+
+/** Nights from which `weekly_discount` starts applying. */
+export const WEEKLY_DISCOUNT_MIN_NIGHTS = 7
+/** Nights from which `monthly_discount` takes over from the weekly one. */
+export const MONTHLY_DISCOUNT_MIN_NIGHTS = 28
+
+/**
+ * The discount percentage for a stay of `nights`, given the listing's two rates.
+ * The TypeScript twin of stayDiscountFactorSql below — both must answer the same,
+ * which is what the unit tests assert.
+ */
+export function stayDiscountPercent(
+  nights: number,
+  weeklyDiscount: number | null | undefined,
+  monthlyDiscount: number | null | undefined,
+): number {
+  const n = Number(nights)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  const pick = n >= MONTHLY_DISCOUNT_MIN_NIGHTS ? monthlyDiscount
+    : n >= WEEKLY_DISCOUNT_MIN_NIGHTS ? weeklyDiscount
+    : 0
+  const pct = Number(pick)
+  if (!Number.isFinite(pct) || pct <= 0) return 0
+  // A discount over 100% would invert the price and pay the guest to stay.
+  return Math.min(pct, 100)
+}
+
+/**
+ * The same rule as SQL: a multiplier to apply to the summed nightly total.
+ * `checkInExpr`/`checkOutExpr` are SQL date expressions (typically the bound
+ * parameters `$3` and `$4`); `listingAlias` is the aliased `listings` row.
+ */
+export function stayDiscountFactorSql(
+  checkInExpr: string,
+  checkOutExpr: string,
+  listingAlias = 'l',
+): string {
+  const nights = `((${checkOutExpr})::date - (${checkInExpr})::date)`
+  return `(1 - (LEAST(GREATEST(CASE
+      WHEN ${nights} >= ${MONTHLY_DISCOUNT_MIN_NIGHTS} THEN COALESCE(${listingAlias}.monthly_discount, 0)
+      WHEN ${nights} >= ${WEEKLY_DISCOUNT_MIN_NIGHTS}  THEN COALESCE(${listingAlias}.weekly_discount, 0)
+      ELSE 0 END, 0), 100))::numeric / 100)`
+}
+
+/**
+ * The seasonal rungs of the nightly ladder, as SQL: weekend rate, then that month's
+ * rate, then the base price. `sqlWithDatePrice` puts the host's pinned calendar day
+ * above all of it.
+ *
+ * The SQL twin of resolveNightPrice() above, and it exists because the twins had
+ * silently come apart. Each project had written its own CASE and each was wrong in a
+ * different direction: quickin-backend hardcoded Friday/Saturday and so ignored a host
+ * who had set `weekend_days`, while the web honoured `weekend_days` but had no monthly
+ * rung at all and skipped the weekend rate entirely when `weekend_days` was NULL. Since
+ * resolveNightPrice is what the clients use to PREVIEW a price, both servers were
+ * charging something the guest had not been quoted — differently.
+ *
+ * Keep this and resolveNightPrice in step: they must answer the same number for the
+ * same day, and `npm run check` only proves this file matches across repos, not that
+ * the two rungs below match each other.
+ */
+export function perNightSeasonalSql(dateExpr: string, listingAlias = 'l'): string {
+  const l = listingAlias
+  const month = `EXTRACT(MONTH FROM (${dateExpr}))::int::text`
+  // NULLIF('{}') so an empty array falls back to the default rather than matching
+  // nothing — mirrors `weekendDays.length > 0` in resolveNightPrice.
+  const weekendDays = `COALESCE(NULLIF(${l}.weekend_days, '{}'), ARRAY[${DEFAULT_WEEKEND_DAYS.join(', ')}])`
+  return `
+  CASE
+    WHEN ${l}.weekend_price IS NOT NULL
+         AND EXTRACT(DOW FROM (${dateExpr}))::int = ANY(${weekendDays})
+      THEN ${l}.weekend_price
+    WHEN (${l}.monthly_prices ->> ${month}) ~ '^[0-9.]+$'
+      THEN (${l}.monthly_prices ->> ${month})::numeric
+    ELSE ${l}.price_per_night
+  END`
+}

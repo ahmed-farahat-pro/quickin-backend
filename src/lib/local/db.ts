@@ -1,4 +1,23 @@
 import { pool } from './pool'
+import { buildUserListWhere, hidesListings, orderBySql } from './user-admin-core'
+import type { UserListFilter, AccountStatus } from './user-admin-core'
+import { normalizeStatus } from './user-admin-core'
+import { countOpenDisputes, oldestOpenDisputeAt } from './disputes'
+import { countFlaggedUsers, oldestFlaggedAt } from './moderation'
+import { countPendingIdChanges, oldestPendingIdChangeAt } from './id-changes'
+import { idChangeColumnFor, idColumnFor, statusForAction } from './document-core'
+import { canPay, outcomeFor, PaymentProofError } from './payment-flow-core'
+import type { PaymentReviewAction } from './payment-flow-core'
+import { branchLimit, wantsKind } from './activity-core'
+import type { ActivityFilter, AuditFilter } from './activity-core'
+import { PAID_SQL } from './analytics-core'
+import { buildSeries, bucketsFor, METRICS, publicMetrics, RANGES, windowFor } from './overview-trends-core'
+import type { MetricId, MetricSpec, RangeId, SeriesPoint, TrendPayload } from './overview-trends-core'
+import type { DocumentKind, VerificationAction, VerificationFilter } from './document-core'
+
+import {
+  refundPercentForDays, refundAmountFor, isCancellable, FLAT_POLICY_LABEL,
+} from './cancellation-core'
 import { resolveResortSelection } from './resorts'
 import { normalizeResortName, validateResortName } from './resort-core'
 import type { PoolClient } from 'pg'
@@ -11,7 +30,7 @@ import { guardContent, guardSplitContent } from './moderation'
 import { INSTAPAY_KEYS, rowsToPaymentConfig } from './payment-config-core'
 import type { PaymentConfig } from './payment-config-core'
 import { rowToPayoutMethod } from './payout-method-core'
-import { needsIdentityDocuments } from './host-verification-core'
+import { needsIdentityDocuments, normalizeVerificationStatus, revokesListingPrivileges } from './host-verification-core'
 import type { PayoutMethodRecord, PayoutMethodView } from './payout-method-core'
 import {
   COMMISSION_RATE_KEY,
@@ -20,7 +39,7 @@ import {
   rateToStored,
   roundUpToStep,
   sqlWithCommission,
-} from './commission-core'
+  bookingCommissionSql } from './commission-core'
 import {
   DatePriceError,
   applyBlockChange,
@@ -31,6 +50,8 @@ import {
   daysBetween,
   isIsoDate,
   sqlWithDatePrice,
+  stayDiscountFactorSql,
+  perNightSeasonalSql,
 } from './date-pricing-core'
 import type { BlockSpan, DayStatus, PriceSource } from './date-pricing-core'
 import { sqlRankingOrderBy } from './ranking-core'
@@ -212,13 +233,7 @@ export interface Booking {
  * (Fri/Sat in Egypt) → that month's override → base. Expects `l` (listings) and
  * `d` (a generate_series date) in scope.
  */
-const PER_NIGHT_SEASONAL_SQL = `
-  CASE
-    WHEN extract(dow from d)::int IN (5, 6) AND l.weekend_price IS NOT NULL THEN l.weekend_price
-    WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$'
-         THEN (l.monthly_prices ->> extract(month from d)::int::text)::numeric
-    ELSE l.price_per_night
-  END`
+const PER_NIGHT_SEASONAL_SQL = perNightSeasonalSql('d')
 
 /**
  * The host's RAW price for one night `d` of a stay — the WHOLE ladder:
@@ -269,7 +284,7 @@ const LISTING_COMMON_COLS = `
   l.host_id, (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
   COALESCE((SELECT u.verification_status = 'verified' FROM users u WHERE u.id = l.host_id), false) AS host_verified,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
-  to_char(l.created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+  to_char(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
   COALESCE(l.amenities, '{}') AS amenities,
   COALESCE((SELECT round(avg(rv.rating)::numeric, 2) FROM reviews rv WHERE rv.listing_id = l.id), 0)::float8 AS rating,
   COALESCE((SELECT count(*) FROM reviews rv WHERE rv.listing_id = l.id), 0)::int AS review_count,
@@ -421,7 +436,14 @@ export async function getRegionCounts(): Promise<{ region: string; count: number
 export async function getListingById(id: string, opts: { asHost?: boolean } = {}): Promise<Listing | null> {
   if (!isUuid(id)) return null
   const cols = opts.asHost ? LISTING_COLS_HOST : LISTING_COLS
-  const { rows } = await pool.query(`SELECT ${cols} FROM listings l WHERE l.id = $1`, [id])
+  // Joined host identity: the listing page shows who the guest would be staying
+  // with, and without this every client had to make a second call for it.
+  const { rows } = await pool.query(
+    `SELECT ${cols}, l.host_id, u.full_name AS host_name, u.avatar_url AS host_avatar,
+            u.host_type AS host_type, u.company AS host_company
+       FROM listings l LEFT JOIN users u ON u.id = l.host_id WHERE l.id = $1`,
+    [id]
+  )
   return (rows[0] as Listing) ?? null
 }
 
@@ -859,16 +881,16 @@ const BOOKING_COLS = `
   ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS total_price,
   b.status,
   COALESCE(b.payment_status, 'unpaid') AS payment_status,
-  to_char(b.paid_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS paid_at,
+  to_char(b.paid_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS paid_at,
   b.payment_method,
   -- Latest transfer-screenshot submission for this booking (metadata only — the
   -- base64 image itself is fetched on demand via getBookingProof to keep lists light).
   (SELECT pp.status FROM payment_proofs pp WHERE pp.booking_id = b.id ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_proof_status,
-  (SELECT to_char(pp.submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') FROM payment_proofs pp WHERE pp.booking_id = b.id ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_submitted_at,
+  (SELECT to_char(pp.submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') FROM payment_proofs pp WHERE pp.booking_id = b.id ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_submitted_at,
   (SELECT pp.reject_reason FROM payment_proofs pp WHERE pp.booking_id = b.id ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_reject_reason,
   b.host_notes,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
-  to_char(b.cancelled_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS cancelled_at,
+  to_char(b.cancelled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS cancelled_at,
   b.cancelled_by, b.cancelled_by_role, b.cancellation_policy AS booked_cancellation_policy,
   b.commission_rate,
   b.refund_percent,
@@ -885,6 +907,12 @@ export interface CreateBookingInput {
   checkIn: string
   checkOut: string
   guests: number
+  /** Adults + children are the headcount checked against max_guests. Infants and
+   *  pets are recorded but do not count toward it. */
+  adults?: number
+  children?: number
+  infants?: number
+  pets?: number
 }
 
 /**
@@ -907,12 +935,47 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
   const { listingId, userId, checkIn, checkOut, guests } = input
   if (!isUuid(listingId) || !isUuid(userId)) throw new Error('Invalid id')
   if (!isDate(checkIn) || !isDate(checkOut)) throw new Error('Invalid dates (use YYYY-MM-DD)')
+  // No bookings that start in the past. ISO dates compare correctly as strings.
+  const today = new Date().toISOString().slice(0, 10)
+  if (checkIn < today) throw new Error('Check-in cannot be in the past')
   if (checkOut <= checkIn) throw new Error('Check-out must be after check-in')
-  const g = Math.max(1, Math.floor(Number(guests) || 1))
+  const nn = (v: unknown) => Math.max(0, Math.floor(Number(v) || 0))
+  // Adults + children = the headcount. Infants and pets don't count toward it.
+  const adults = Math.max(1, nn(input.adults ?? guests))
+  const children = nn(input.children)
+  const infants = nn(input.infants)
+  const pets = nn(input.pets)
+  const g = Math.max(1, adults + children)
 
+  // Load the listing (for max_guests / host) and enforce capacity. Search already
+  // hides unpublished listings, but a booking can arrive with a listing id straight
+  // from a deep link or a stale client, so the same rules are enforced here: an
+  // unpublished listing and a blocked/removed host are both unbookable. Without
+  // this, "hide their listings" would only hide them.
+  const { rows: lrows } = await pool.query(
+    `SELECT l.max_guests, COALESCE(l.is_published, false) AS is_published,
+            COALESCE(hu.account_status, 'active') AS host_status
+       FROM listings l LEFT JOIN users hu ON hu.id = l.host_id
+      WHERE l.id = $1`,
+    [listingId]
+  )
+  const listing = lrows[0] as
+    | { max_guests: number | null; is_published: boolean; host_status: string }
+    | undefined
+  if (!listing) throw new Error('Could not create booking (listing not found)')
+  if (!listing.is_published || listing.host_status !== 'active') {
+    throw new Error('This listing is not available for booking')
+  }
+  if (listing.max_guests != null && g > listing.max_guests) {
+    throw new Error('Exceeds the maximum guests for this listing')
+  }
+
+  // A rejected booking must not hold dates hostage — only cancelled and rejected are
+  // excluded. listing_blocked_dates is part of the same question: a day the host
+  // blocked on their calendar is unavailable even though no booking exists for it.
   const clash = await pool.query(
     `SELECT 1 FROM bookings
-       WHERE listing_id = $1 AND status <> 'cancelled'
+       WHERE listing_id = $1 AND status NOT IN ('cancelled', 'rejected')
          AND check_in < $2 AND check_out > $3
      UNION ALL
      SELECT 1 FROM listing_blocked_dates
@@ -932,9 +995,10 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
        -- both are editable after the fact (the listing's policy by its host, the
        -- rate by an admin), and a report must reflect what was in force when the
        -- booking was taken. See migrate-analytics.mjs.
-       INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests, total_price, status,
+       INSERT INTO bookings (listing_id, user_id, check_in, check_out, guests,
+                             adults, children, infants, pets, total_price, status,
                              cancellation_policy, commission_rate)
-       SELECT $1, $2, $3, $4, $5,
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9,
          -- total_price is the host's RAW stay total — what the host is owed and
          -- what payout/earnings read directly. The guest's figure is derived as
          -- total_price × (1 + commission_rate) using the rate snapshotted below,
@@ -942,11 +1006,9 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
          round(
            (SELECT COALESCE(sum(${PER_NIGHT_RAW_SQL}), 0)
             FROM generate_series($3::date, $4::date - interval '1 day', interval '1 day') AS d)
-           -- Length-of-stay discount on the whole stay.
-           * (1 - (CASE
-               WHEN ($4::date - $3::date) >= 28 THEN COALESCE(l.monthly_discount, 0)
-               WHEN ($4::date - $3::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
-               ELSE 0 END)::numeric / 100)
+           -- Length-of-stay discount on the whole stay. Shared with the web via
+           -- date-pricing-core so both projects price a long stay the same.
+           * ${stayDiscountFactorSql('$3', '$4')}
          ),
          'pending',
          COALESCE(l.cancellation_policy, 'moderate'),
@@ -955,7 +1017,7 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
        RETURNING *
      )
      SELECT ${BOOKING_COLS} FROM ins b JOIN listings l ON l.id = b.listing_id`,
-    [listingId, userId, checkIn, checkOut, g]
+    [listingId, userId, checkIn, checkOut, g, adults, children, infants, pets]
   )
   if (!rows[0]) throw new Error('Could not create booking (listing not found)')
   const booking = rows[0] as Booking
@@ -1076,29 +1138,42 @@ function daysUntil(dateStr: string): number {
 }
 
 /** What the guest would get back if they cancelled now (no mutation). */
-export async function getCancellationQuote(bookingId: string, userId: string): Promise<CancellationQuote | null> {
-  if (!isUuid(bookingId) || !isUuid(userId)) return null
+/** The one row both the quote and the cancel need: what the guest PAID, how far out
+ *  the stay is, and whether it can still be cancelled. Keyed on (booking, guest) so a
+ *  stranger's booking id resolves to nothing rather than to someone else's refund. */
+async function loadCancelable(userId: string, bookingId: string) {
   const { rows } = await pool.query(
-    `SELECT b.user_id, b.total_price::float8 AS total, b.status,
-            to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
-            COALESCE(l.cancellation_policy, 'moderate') AS policy, l.currency
+    // Commission-inclusive on purpose: a refund is a percentage of what the GUEST
+    // paid, not of the host's raw price. See cancellation-core -> refundAmountFor.
+    `SELECT b.status, ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS total,
+            COALESCE(l.currency, 'EGP') AS currency,
+            (b.check_in - CURRENT_DATE)::int AS days_until
        FROM bookings b JOIN listings l ON l.id = b.listing_id
-      WHERE b.id = $1`,
-    [bookingId]
+      WHERE b.id = $1 AND b.user_id = $2`,
+    [bookingId, userId]
   )
-  const b = rows[0]
-  if (!b || b.user_id !== userId) return null
-  const policy = normalizePolicy(b.policy)
-  const days = daysUntil(b.check_in)
-  const refundPercent = refundPercentFor(policy, days)
-  const total = Number(b.total) || 0
+  return rows[0] as { status: string; total: number; currency: string; days_until: number } | undefined
+}
+
+/** Argument order is (userId, bookingId) in BOTH projects. They used to disagree, and
+ *  since both are strings a swapped call compiles cleanly and silently returns null. */
+export async function getCancellationQuote(
+  userId: string,
+  bookingId: string
+): Promise<CancellationQuote | null> {
+  if (!isUuid(bookingId) || !isUuid(userId)) return null
+  const b = await loadCancelable(userId, bookingId)
+  if (!b) return null
+  // An already-cancelled booking owes nothing further — the guard against a retried
+  // request refunding twice.
+  const refundPercent = isCancellable(b.status) ? refundPercentForDays(b.days_until) : 0
   return {
-    policy,
-    daysUntilCheckIn: days,
+    policy: FLAT_POLICY_LABEL,
+    daysUntilCheckIn: b.days_until,
     refundPercent,
-    refundAmount: Math.round((total * refundPercent) / 100),
-    total,
-    currency: b.currency ?? 'EGP',
+    refundAmount: refundAmountFor(b.total, refundPercent),
+    total: b.total,
+    currency: b.currency,
   }
 }
 
@@ -1107,10 +1182,10 @@ export async function getCancellationQuote(bookingId: string, userId: string): P
  *  Returns the updated booking + the quote, or null if it isn't the guest's /
  *  can't be cancelled. */
 export async function cancelBooking(
-  bookingId: string,
-  userId: string
+  userId: string,
+  bookingId: string
 ): Promise<{ booking: Booking; quote: CancellationQuote } | null> {
-  const quote = await getCancellationQuote(bookingId, userId)
+  const quote = await getCancellationQuote(userId, bookingId)
   if (!quote) return null
   const { rows } = await pool.query(
     `WITH upd AS (
@@ -1459,7 +1534,9 @@ export class ListingInputError extends Error {
 /** Was this thrown by one of the listing validators above? (`name` is checked too
  *  so it still works if the module is instantiated twice in a bundle.) A blocked
  *  contact detail counts: it is the host's input to fix, not a server fault. */
-export function isListingInputError(err: unknown): boolean {
+export function isListingInputError(err: unknown): err is Error {
+  // A blocked contact detail counts: it is the host's input to fix, not a
+  // server fault, so the route answers 400 with the guard's wording.
   if (isContactBlockedError(err)) return true
   return err instanceof ListingInputError || (err instanceof Error && err.name === 'ListingInputError')
 }
@@ -2558,7 +2635,7 @@ export interface CommissionConfig {
 /** The live commission rate and who last changed it (the /ops/pricing screen). */
 export async function getCommissionConfig(): Promise<CommissionConfig> {
   const { rows } = await pool.query(
-    `SELECT value, to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS updated_at, updated_by
+    `SELECT value, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at, updated_by
        FROM app_settings WHERE key = $1`,
     [COMMISSION_RATE_KEY]
   )
@@ -2685,7 +2762,7 @@ export async function getBookingProof(
   if (!allowed) return null
   const { rows } = await pool.query(
     `SELECT image_data, method, status,
-            to_char(submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS submitted_at,
+            to_char(submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS submitted_at,
             reject_reason, dispute_note, amount::float8 AS amount
        FROM payment_proofs WHERE booking_id = $1 ORDER BY payment_proofs.submitted_at DESC LIMIT 1`,
     [bookingId]
@@ -2757,8 +2834,8 @@ export async function adminListDisputes(): Promise<DisputeRow[]> {
             (SELECT email     FROM users u WHERE u.id = b.user_id) AS guest_email,
             l.host_id, b.total_price::float8 AS total_price,
             pp.reject_reason, pp.dispute_note,
-            to_char(pp.submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS submitted_at,
-            to_char(pp.disputed_at,  'YYYY-MM-DD"T"HH24:MI:SS') AS disputed_at
+            to_char(pp.submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS submitted_at,
+            to_char(pp.disputed_at AT TIME ZONE 'UTC',  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS disputed_at
        FROM payment_proofs pp
        JOIN bookings b ON b.id = pp.booking_id
        JOIN listings l ON l.id = b.listing_id
@@ -2866,8 +2943,8 @@ export interface HostApplication {
 // persisted on users.host_type at apply time and read back through the join.
 const HOST_APP_COLS = `a.id, a.user_id, a.full_name, a.national_id, a.phone, a.address, a.company,
             u.host_type, a.notes, a.status,
-            to_char(a.submitted_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS submitted_at,
-            to_char(a.reviewed_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS reviewed_at,
+            to_char(a.submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS submitted_at,
+            to_char(a.reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS reviewed_at,
             a.review_note`
 
 /** Legacy rule: is_host = true ALWAYS means approved, even with no application
@@ -3022,36 +3099,67 @@ export async function listHostApplications(status = 'pending'): Promise<HostAppl
   return rows as HostApplication[]
 }
 
-/** Admin decision, keyed by the APPLICANT (like admin/verifications). Approve
- *  flips users.is_host AND stamps the application in ONE transaction; reject only
- *  stamps the application. Both notify the applicant. */
-export async function reviewHostApplication(
-  userId: string,
-  action: 'approve' | 'reject',
-  note: string | null
-): Promise<HostApplication | null> {
-  if (!isUuid(userId)) return null
-  const approve = action === 'approve'
+// NOTE: this is the /ops version, adopted 21 Aug 2026. It keys on the APPLICATION
+// id (not the user id) and records the deciding operator, which the audit log and
+// the console both depend on. The previous signature took no actor.
+/** Admin decision on a host application. Approve → set users.is_host + notify; reject → notify.
+ *  The application row and the users flip are one transaction so an approval can never
+ *  half-land (approved application, still not a host). The notification is sent after
+ *  the commit — it must never roll a decision back. */
+export async function reviewHostApplication(appId: string, action: 'approve' | 'reject', note: string | null, actor: string): Promise<void> {
+  if (!isUuid(appId)) throw new Error('Invalid application')
+  const status = action === 'approve' ? 'approved' : 'rejected'
   const client = await pool.connect()
+  let uid = ''
+  let verifiedIdentity = false
   try {
     await client.query('BEGIN')
     const { rows } = await client.query(
-      `UPDATE host_applications
-          SET status = $2, reviewed_at = now(), reviewed_by = 'admin', review_note = $3
-        WHERE user_id = $1 RETURNING id`,
-      [userId, approve ? 'approved' : 'rejected', note]
+      // `actor` is staff:<uuid>; this used to be the literal 'admin', which threw
+      // away who actually made the call.
+      `UPDATE host_applications SET status=$2, reviewed_at=now(), reviewed_by=$4, review_note=$3
+        WHERE id=$1 RETURNING user_id`,
+      [appId, status, note, actor]
     )
-    if (!rows[0]) {
-      await client.query('ROLLBACK')
-      return null
-    }
-    if (approve) {
-      // The applicant's host_type was stored on the user when they applied (legacy
-      // rows default to 'individual'). role='host' keeps the backend's own flag in sync.
-      await client.query(
-        `UPDATE users SET is_host = true, role = 'host', host_type = COALESCE(host_type, 'individual') WHERE id = $1`,
-        [userId]
+    uid = rows[0]?.user_id ?? ''
+    if (!uid) throw new Error('Application not found')
+    if (action === 'approve') {
+      await client.query(`UPDATE users SET is_host = true WHERE id = $1`, [uid])
+      // Keep the legacy `role` flag in sync so the mobile backend (which reads role)
+      // also recognizes this host. The column is absent on a frontend-only dev DB, so
+      // it runs behind a SAVEPOINT: a missing column must not abort the approval.
+      try {
+        await client.query('SAVEPOINT role_sync')
+        await client.query(`UPDATE users SET role = 'host' WHERE id = $1`, [uid])
+      } catch {
+        await client.query('ROLLBACK TO SAVEPOINT role_sync') /* role column not present */
+      }
+      // ONE decision approves both facts: the applicant becomes a host AND their
+      // identity documents — submitted with the application and linked by
+      // verification_id — are marked verified. Without this an approved host
+      // would still be blocked by the listing gate with nothing left to do.
+      const linked = await client.query(
+        `SELECT verification_id FROM host_applications WHERE id = $1`,
+        [appId],
       )
+      const verifId = linked.rows[0]?.verification_id ?? null
+      if (verifId) {
+        await client.query(
+          `UPDATE id_verifications
+              SET status = 'verified', reviewed_at = now(), reviewed_by = $2, notes = $3
+            WHERE id = $1`,
+          [verifId, actor, note],
+        )
+        await client.query(
+          `UPDATE users SET verification_status = 'verified', verified_at = now() WHERE id = $1`,
+          [uid],
+        )
+        verifiedIdentity = true
+      }
+    } else {
+      // Rejecting the application leaves the ID submission alone: it may be a
+      // perfectly good document and the applicant may reapply. Rejecting the
+      // identity is a separate decision in Verifications.
     }
     await client.query('COMMIT')
   } catch (e) {
@@ -3060,23 +3168,23 @@ export async function reviewHostApplication(
   } finally {
     client.release()
   }
-  // Notify after the commit (best-effort, like the listing/verification flows).
-  await createNotification(userId, {
-    type: 'host',
-    title: approve ? 'You are now a host!' : 'Host application update',
-    body: approve
-      ? 'Your host application was approved — you can now list your space and accept guests.'
-      : note
-        ? `Your application needs attention: ${note}`
-        : 'Your host application was not approved this time.',
-    link: approve ? '/host' : '/account',
-  })
-  await sendPush(userId, {
-    title: approve ? 'You are now a host 🎉' : 'Host application update',
-    body: approve ? 'Your application was approved — start listing your space.' : 'Tap to see what needs attention.',
-    link: approve ? '/host' : '/account',
-  })
-  return getHostApplication(userId)
+  if (action === 'approve') {
+    await createNotification(uid, {
+      type: 'host',
+      title: 'You are now a host!',
+      body: verifiedIdentity
+        ? 'Your host application and identity documents were approved — you can now list your space and accept guests.'
+        : 'Your host application was approved. Verify your identity to start publishing listings.',
+      link: verifiedIdentity ? '/host' : '/verify-id',
+    })
+  } else {
+    await createNotification(uid, {
+      type: 'host',
+      title: 'Host application update',
+      body: note ? `Your application needs attention: ${note}` : 'Your host application was not approved this time.',
+      link: '/account',
+    })
+  }
 }
 
 // ---- The host listing gate ---------------------------------------------------
@@ -3113,6 +3221,11 @@ export type VerificationTableStatus = 'unverified' | 'pending' | 'verified' | 'r
 export interface VerificationTableState {
   status: VerificationTableStatus
   verified_at: string | null
+  /** Which document was filed, and the reviewer's note when one was left. The web's
+   *  become-a-host form shows both — it used to read them from its own copy of this
+   *  query, so leaving them out here would blank the screen rather than fail loudly. */
+  doc_type: string | null
+  notes: string | null
   /** The number on that submission, when it carried one. Sent to the signed-in
    *  user's own client so the become-a-host form can reuse an identity already
    *  on file instead of asking for the same number a second time — the rule is
@@ -3204,11 +3317,11 @@ export async function getVerificationNote(userId: string): Promise<string | null
  *  id_verifications row. Defaults to 'unverified' when no row exists.
  *  verified_at is the review timestamp once status is 'verified'. */
 export async function getVerificationStatusFromTable(userId: string): Promise<VerificationTableState> {
-  if (!isUuid(userId)) return { status: 'unverified', verified_at: null, id_number: null }
+  if (!isUuid(userId)) return { status: 'unverified', verified_at: null, id_number: null, doc_type: null, notes: null }
   const { rows } = await pool.query(
     `SELECT status, id_number,
             CASE WHEN status = 'verified'
-                 THEN to_char(reviewed_at, 'YYYY-MM-DD"T"HH24:MI:SS') END AS verified_at
+                 THEN to_char(reviewed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') END AS verified_at, doc_type, notes
        FROM id_verifications
       WHERE user_id = $1
       ORDER BY submitted_at DESC
@@ -3216,11 +3329,13 @@ export async function getVerificationStatusFromTable(userId: string): Promise<Ve
     [userId]
   )
   const r = rows[0]
-  if (!r) return { status: 'unverified', verified_at: null, id_number: null }
+  if (!r) return { status: 'unverified', verified_at: null, id_number: null, doc_type: null, notes: null }
   return {
     status: (r.status as VerificationTableStatus) ?? 'unverified',
     verified_at: r.verified_at ?? null,
     id_number: (r.id_number as string | null)?.trim() || null,
+    doc_type: (r.doc_type as string | null) ?? null,
+    notes: (r.notes as string | null) ?? null,
   }
 }
 
@@ -3366,7 +3481,7 @@ export async function listConversations(userId: string): Promise<ConversationSum
             (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS listing_image,
             CASE WHEN c.guest_id = $1 THEN hu.full_name ELSE gu.full_name END AS other_name,
             (SELECT m.body FROM chat_messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
-            to_char(c.last_message_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last_message_at,
+            to_char(c.last_message_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last_message_at,
             (c.host_id = $1) AS is_host
        FROM conversations c
        LEFT JOIN listings l ON l.id = c.listing_id
@@ -3395,7 +3510,7 @@ export async function listChatMessages(userId: string, conversationId: string): 
   const convo = await conversationForUser(userId, conversationId)
   if (!convo) throw new Error('Conversation not found')
   const { rows } = await pool.query(
-    `SELECT id, sender_id, body, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+    `SELECT id, sender_id, body, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
        FROM chat_messages WHERE conversation_id = $1 ORDER BY chat_messages.created_at ASC LIMIT 500`,
     [conversationId]
   )
@@ -3422,7 +3537,7 @@ export async function postChatMessage(userId: string, conversationId: string, ra
     `WITH ins AS (
        INSERT INTO chat_messages (conversation_id, sender_id, body) VALUES ($1, $2, $3) RETURNING *
      ), upd AS ( UPDATE conversations SET last_message_at = now() WHERE id = $1 )
-     SELECT id, sender_id, body, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at FROM ins`,
+     SELECT id, sender_id, body, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at FROM ins`,
     [conversationId, userId, body]
   )
   const other = convo.guest_id === userId ? convo.host_id : convo.guest_id
@@ -3528,4 +3643,2016 @@ export async function deletePayoutMethod(userId: string): Promise<boolean> {
   if (!isUuid(userId)) return false
   const { rowCount } = await pool.query(`DELETE FROM host_payout_methods WHERE user_id = $1`, [userId])
   return (rowCount ?? 0) > 0
+}
+
+// ============================================================================
+// /ops — the staff console
+//
+// Ported from quickin-frontend on 21 Aug 2026, consolidating both projects'
+// API onto this one. The web keeps the /ops PAGES and reaches these through
+// the API instead of its own database client. See README -> /ops.
+// ============================================================================
+
+/** Admin: manually mark a user's email as verified (when OTP email can't reach them). */
+export async function adminActivateUser(id: string): Promise<void> {
+  if (!isUuid(id)) throw new Error('Invalid user')
+  await pool.query(`UPDATE users SET email_verified = true WHERE id = $1`, [id])
+  await createNotification(id, { type: 'account', title: 'Account activated', body: 'Your email was verified by our team — you can use your account normally now.', link: '/account' })
+}
+
+/** Delete a listing (FK cascades remove its images / bookings / reviews). */
+export async function adminDeleteListing(id: string): Promise<void> {
+  if (!isUuid(id)) throw new Error('Invalid listing')
+  await pool.query(`DELETE FROM listings WHERE id = $1`, [id])
+}
+
+/** Self-service account deletion ONLY — the App Store 5.1.1(v) / Google Play route
+ *  at /api/local/account. **Not** an admin action: /ops blocks and removes instead
+ *  (adminSetAccountStatus), which is reversible and keeps booking and payment
+ *  history for disputes. Most child rows cascade, but listings.host_id has no
+ *  ON DELETE CASCADE, so their listings are removed first (which cascades to those
+ *  listings' images / bookings / reviews). Transactional. */
+export async function adminDeleteUser(id: string): Promise<void> {
+  if (!isUuid(id)) throw new Error('Invalid user')
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(`DELETE FROM listings WHERE host_id = $1`, [id])
+    await client.query(`DELETE FROM users WHERE id = $1`, [id])
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+/** D2 — everything the /ops user profile renders, in one round of queries.
+ *  Returns null for an unknown or non-uuid id so the route can 404. */
+export async function adminGetUserDetail(id: string): Promise<AdminUserDetail | null> {
+  if (!isUuid(id)) return null
+  const { rows: urows } = await pool.query(
+    `SELECT ${ADMIN_USER_COLS},
+            u.phone, u.country, u.bio, u.avatar_url, u.role, u.host_type, u.company, u.referral_code
+       FROM users u WHERE u.id = $1`,
+    [id],
+  )
+  const user = urows[0] as AdminUserDetail['user'] | undefined
+  if (!user) return null
+
+  const [listings, bookings, payments, conversations, verifications, applications, stats] = await Promise.all([
+    pool.query(
+      `SELECT l.id, l.title, COALESCE(l.is_published, false) AS is_published,
+              COALESCE(l.approval_status, 'approved') AS approval_status,
+              COALESCE(l.unpublished_by_admin, false) AS unpublished_by_admin,
+              COALESCE(l.price_per_night, 0)::float8 AS price_per_night,
+              COALESCE(l.currency, 'USD') AS currency,
+              to_char(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+              (SELECT COUNT(*) FROM bookings b WHERE b.listing_id = l.id)::int AS booking_count
+         FROM listings l WHERE l.host_id = $1 ORDER BY l.created_at DESC LIMIT 200`,
+      [id],
+    ),
+    pool.query(
+      `SELECT b.id, b.reservation_code, b.listing_id, l.title AS listing_title,
+              b.status, COALESCE(b.payment_status, 'unpaid') AS payment_status,
+              COALESCE(b.total_price, 0)::float8 AS total_price,
+              COALESCE(l.currency, 'USD') AS currency,
+              to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+              to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+              to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+         FROM bookings b LEFT JOIN listings l ON l.id = b.listing_id
+        WHERE b.user_id = $1 ORDER BY b.created_at DESC LIMIT 200`,
+      [id],
+    ),
+    // Payment proofs have no direct user FK — they hang off the booking.
+    pool.query(
+      `SELECT pp.id, pp.booking_id, b.reservation_code, l.title AS listing_title,
+              COALESCE(pp.amount, b.total_price, 0)::float8 AS amount,
+              pp.status, pp.reject_reason,
+              to_char(pp.submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS submitted_at,
+              to_char(pp.reviewed_at AT TIME ZONE 'UTC',  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS reviewed_at
+         FROM payment_proofs pp
+         JOIN bookings b ON b.id = pp.booking_id
+         LEFT JOIN listings l ON l.id = b.listing_id
+        WHERE b.user_id = $1 ORDER BY pp.submitted_at DESC LIMIT 200`,
+      [id],
+    ),
+    adminListUserConversations(id),
+    pool.query(
+      `SELECT id, status, notes,
+              to_char(submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS submitted_at,
+              to_char(reviewed_at AT TIME ZONE 'UTC',  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS reviewed_at,
+              (image_data IS NOT NULL) AS has_document
+         FROM id_verifications WHERE user_id = $1 ORDER BY id_verifications.submitted_at DESC LIMIT 20`,
+      [id],
+    ),
+    pool.query(
+      `SELECT id, status, COALESCE(review_note, notes) AS notes,
+              to_char(submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS submitted_at,
+              to_char(reviewed_at AT TIME ZONE 'UTC',  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS reviewed_at,
+              (national_id IS NOT NULL) AS has_document
+         FROM host_applications WHERE user_id = $1 ORDER BY host_applications.submitted_at DESC LIMIT 20`,
+      [id],
+    ),
+    pool.query(
+      `SELECT COALESCE((SELECT SUM(b.total_price) FROM bookings b
+                         WHERE b.user_id = $1 AND COALESCE(b.payment_status,'unpaid') = 'paid'), 0)::float8 AS gross_paid,
+              COALESCE((SELECT SUM(b.check_out - b.check_in) FROM bookings b
+                         WHERE b.user_id = $1 AND b.status <> 'cancelled'), 0)::int AS nights_booked,
+              (SELECT COUNT(*) FROM messages m WHERE m.sender_id = $1)::int AS mobile_message_count,
+              (SELECT COUNT(*) FROM reports r WHERE r.target_type = 'user' AND r.target_id = $1)::int AS report_count`,
+      [id],
+    ),
+  ])
+
+  const documents: AdminUserDocument[] = [
+    ...verifications.rows.map((r) => ({ ...(r as Omit<AdminUserDocument, 'kind'>), kind: 'id_verification' as const })),
+    ...applications.rows.map((r) => ({ ...(r as Omit<AdminUserDocument, 'kind'>), kind: 'host_application' as const })),
+  ]
+
+  return {
+    user,
+    listings: listings.rows as AdminUserListing[],
+    bookings: bookings.rows as AdminUserBooking[],
+    payments: payments.rows as AdminUserPayment[],
+    conversations,
+    documents,
+    stats: stats.rows[0] as AdminUserDetail['stats'],
+  }
+}
+
+/** Newest-first bookings (LIMIT 300) with guest + listing details. */
+export async function adminListBookings(): Promise<AdminBookingRow[]> {
+  const { rows } = await pool.query(
+    `SELECT b.id,
+            NULLIF(b.reservation_code, '') AS reservation_code,
+            b.status,
+            CASE WHEN b.paid_at IS NULL THEN 'unpaid' ELSE 'paid' END AS payment_status,
+            -- What the guest owes; host_payout is the host's raw share of it, and
+            -- commission is the gap between them — the platform's margin on this
+            -- one booking, priced at the rate it was taken at.
+            ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS total_price,
+            b.total_price::float8 AS host_payout,
+            ${COMMISSION_AMOUNT_SQL}::float8 AS commission,
+            ${BOOKING_RATE_SQL}::float8 AS commission_rate,
+            COALESCE(l.currency, 'USD') AS currency,
+            to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+            to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            gu.full_name AS guest_name, gu.email AS guest_email,
+            l.title AS listing_title,
+            to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+       FROM bookings b
+       LEFT JOIN listings l ON l.id = b.listing_id
+       LEFT JOIN users gu ON gu.id = b.user_id
+      ORDER BY b.created_at DESC
+      LIMIT 300`
+  )
+  return rows as AdminBookingRow[]
+}
+
+/** Newest-first listings (LIMIT 300) with host name, booking count and a primary image. */
+export async function adminListListings(): Promise<AdminListingRow[]> {
+  const { rows } = await pool.query(
+    `SELECT l.id, l.title, l.location, COALESCE(l.currency, 'USD') AS currency,
+            -- Staff see both: the price guests are quoted, and the host's own.
+            ${sqlWithCommission('l.price_per_night')}::float8 AS price_per_night,
+            l.price_per_night::float8 AS host_price_per_night,
+            l.is_published,
+            COALESCE(l.approval_status, 'approved') AS approval_status,
+            (l.ownership_doc IS NOT NULL AND l.ownership_doc <> '') AS has_ownership_doc,
+            l.host_id, u.full_name AS host_name, l.region,
+            -- Location fields the console cross-checks against the map pin.
+            l.country, l.lat::float8 AS lat, l.lng::float8 AS lng,
+            -- The approval flow needs to know whether the resort is a catalog entry
+            -- or free text the host typed via "Other" (which needs review).
+            l.resort_id, l.resort_name,
+            COALESCE(r.name, l.resort_name) AS resort,
+            to_char(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+            (SELECT COUNT(*) FROM bookings b WHERE b.listing_id = l.id)::int AS booking_count,
+            (SELECT li.url FROM listing_images li WHERE li.listing_id = l.id
+              ORDER BY li."order" LIMIT 1) AS image
+       FROM listings l
+       LEFT JOIN users u ON u.id = l.host_id
+       LEFT JOIN resorts r ON r.id = l.resort_id
+      ORDER BY l.created_at DESC
+      LIMIT 300`
+  )
+  return rows as AdminListingRow[]
+}
+
+/** Pending bookings awaiting host (or admin) approval. Newest-first. */
+export async function adminListPendingBookings(): Promise<AdminPendingBookingRow[]> {
+  const { rows } = await pool.query(
+    `SELECT b.id,
+            NULLIF(b.reservation_code, '') AS reservation_code,
+            b.status,
+            CASE WHEN b.paid_at IS NULL THEN 'unpaid' ELSE 'paid' END AS payment_status,
+            b.total_price::float8 AS total_price,
+            COALESCE(l.currency, 'USD') AS currency,
+            to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+            to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            b.guests,
+            gu.full_name AS guest_name, gu.email AS guest_email,
+            l.title AS listing_title, l.location AS listing_location,
+            hu.full_name AS host_name, hu.email AS host_email, l.host_id,
+            (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image,
+            to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+       FROM bookings b
+       LEFT JOIN listings l ON l.id = b.listing_id
+       LEFT JOIN users gu ON gu.id = b.user_id
+       LEFT JOIN users hu ON hu.id = l.host_id
+      WHERE b.status = 'pending'
+      ORDER BY b.created_at DESC
+      LIMIT 200`
+  )
+  return rows as AdminPendingBookingRow[]
+}
+
+/**
+ * Transfer screenshots waiting for a decision.
+ *
+ * This queue did not exist. `adminListDisputes` is hard-filtered to
+ * `pp.status = 'disputed'`, and the only path that could approve a FRESH proof —
+ * hostReviewPayment — was guarded by `b.status = 'pending'`, while a guest can only
+ * pay once the booking is 'confirmed'. So a screenshot submitted through the normal
+ * flow had no reviewer at all and sat in 'submitted' indefinitely.
+ *
+ * Latest proof per booking only, so a superseded submission doesn't queue twice.
+ */
+export async function adminListPendingProofs(): Promise<PendingProofRow[]> {
+  const { rows } = await pool.query(
+    `SELECT b.id AS booking_id, b.reservation_code, l.title,
+            b.user_id AS guest_id,
+            (SELECT full_name FROM users u WHERE u.id = b.user_id) AS guest_name,
+            (SELECT email     FROM users u WHERE u.id = b.user_id) AS guest_email,
+            l.host_id,
+            -- Commission-inclusive on BOTH: the reviewer compares these against
+            -- the sum on a guest's Instapay screenshot, and the guest transferred
+            -- the marked-up total. Showing the raw price here would make every
+            -- correct payment look like an overpayment.
+            ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS total_price,
+            COALESCE(pp.amount, ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)})::float8 AS amount,
+            pp.method,
+            to_char(pp.submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS submitted_at,
+            to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+            to_char(b.check_out, 'YYYY-MM-DD') AS check_out
+       FROM payment_proofs pp
+       JOIN bookings b ON b.id = pp.booking_id
+       JOIN listings l ON l.id = b.listing_id
+      WHERE pp.status = 'submitted'
+        AND pp.id = (SELECT id FROM payment_proofs p2 WHERE p2.booking_id = pp.booking_id ORDER BY p2.submitted_at DESC LIMIT 1)
+      ORDER BY pp.submitted_at ASC`
+  )
+  return rows as PendingProofRow[]
+}
+
+/**
+ * The abuse-report queue (F4).
+ *
+ * Ported from the backend's trust.ts, which has had this logic — and a full triage API
+ * — since the trust work landed. /ops lives in this project and had neither, so the
+ * `reports` staff module gated a route the console could never reach and no filed
+ * report had ever been seen by anyone.
+ *
+ * The target is resolved to a label here rather than in the UI so a moderator can tell
+ * what they're looking at without opening three tabs.
+ */
+export async function adminListReports(status = 'open'): Promise<AdminReport[]> {
+  const filterable = status === 'open' || status === 'resolved' || status === 'dismissed'
+  const { rows } = await pool.query(
+    `SELECT r.id, r.reporter_id, u.full_name AS reporter_name, u.email AS reporter_email,
+            r.target_type, r.target_id, r.reason, r.details, r.status,
+            to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+            to_char(r.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS resolved_at,
+            CASE r.target_type
+              WHEN 'user'    THEN (SELECT COALESCE(NULLIF(tu.full_name, ''), tu.email) FROM users tu WHERE tu.id = r.target_id)
+              WHEN 'listing' THEN (SELECT tl.title FROM listings tl WHERE tl.id = r.target_id)
+              WHEN 'review'  THEN (SELECT left(COALESCE(tr.comment, ''), 80) FROM reviews tr WHERE tr.id = r.target_id)
+            END AS target_label
+       FROM reports r LEFT JOIN users u ON u.id = r.reporter_id
+      ${filterable ? 'WHERE r.status = $1' : ''}
+      ORDER BY r.created_at DESC
+      LIMIT 300`,
+    filterable ? [status] : [],
+  )
+  return rows as AdminReport[]
+}
+
+/** Read a thread's message bodies for /ops. Returns null unless the conversation is
+ *  one THIS user belongs to — so an operator can't page through arbitrary threads by
+ *  guessing ids; they have to come in via a profile. The route logs every call. */
+export async function adminReadConversation(
+  userId: string,
+  conversationId: string,
+): Promise<{ conversation: AdminUserConversation; messages: AdminThreadMessage[] } | null> {
+  if (!isUuid(userId) || !isUuid(conversationId)) return null
+  const conversation = (await adminListUserConversations(userId)).find((c) => c.id === conversationId)
+  if (!conversation) return null
+  const { rows } = await pool.query(
+    `SELECT m.id, m.sender_id, u.full_name AS sender_name, m.body,
+            to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+       FROM chat_messages m LEFT JOIN users u ON u.id = m.sender_id
+      WHERE m.conversation_id = $1 ORDER BY m.created_at ASC LIMIT 500`,
+    [conversationId],
+  )
+  return { conversation, messages: rows as AdminThreadMessage[] }
+}
+
+/**
+ * One document's stored value, looked up THROUGH its subject.
+ *
+ * Returns null for a missing row, a missing column value, and a non-uuid id alike —
+ * the route collapses all three to an identical 404 so an operator can't tell "no
+ * such user" from "that user has no selfie on file".
+ *
+ * `column` comes from `idColumnFor`, a closed map that is unit-tested to contain only
+ * bare identifiers — nothing user-supplied is ever interpolated here.
+ */
+export async function adminReadDocument(
+  kind: DocumentKind,
+  id: string,
+): Promise<{ value: string; subjectId: string } | null> {
+  if (!isUuid(id)) return null
+  if (kind === 'ownership') {
+    const { rows } = await pool.query(
+      `SELECT ownership_doc AS value, host_id AS subject_id FROM listings WHERE id = $1`,
+      [id],
+    )
+    const row = rows[0] as { value: string | null; subject_id: string | null } | undefined
+    if (!row?.value) return null
+    // The listing is the subject for audit purposes, so its own id is the target.
+    return { value: row.value, subjectId: id }
+  }
+  const changeColumn = idChangeColumnFor(kind)
+  if (changeColumn) {
+    const { rows } = await pool.query(
+      `SELECT ${changeColumn} AS value, user_id AS subject_id FROM id_change_requests WHERE id = $1`,
+      [id],
+    )
+    const row = rows[0] as { value: string | null; subject_id: string } | undefined
+    if (!row?.value) return null
+    // The user is the subject, same as a verification — so "everything ever opened
+    // about this person" stays one lookup whichever queue the document came from.
+    return { value: row.value, subjectId: row.subject_id }
+  }
+  const column = idColumnFor(kind)
+  if (!column) return null
+  const { rows } = await pool.query(
+    `SELECT ${column} AS value, user_id AS subject_id FROM id_verifications WHERE id = $1`,
+    [id],
+  )
+  const row = rows[0] as { value: string | null; subject_id: string } | undefined
+  if (!row?.value) return null
+  return { value: row.value, subjectId: row.subject_id }
+}
+
+/**
+ * Take a profile photo down (/ops → user → Remove photo).
+ *
+ * A photo goes live the moment it is picked, on the web and in both apps — there
+ * is no review queue in front of it, and there shouldn't be: nobody would wait an
+ * hour to have a face on their profile. What a photo needs instead is a way DOWN,
+ * because it is the one field on a profile that no filter can read. `contentguard`
+ * catches a phone number typed into a name or a bio; a phone number written on a
+ * piece of paper and photographed is invisible to it, and so is everything else a
+ * photo can be. So the answer to a reported photo is a moderator with one button,
+ * and this is that button.
+ *
+ * Returns null for an unknown id — the route 404s on it — and `removed: false`
+ * when the account exists but had no photo, so the console can say so rather than
+ * claim to have taken down nothing.
+ */
+export async function adminRemoveUserAvatar(
+  userId: string,
+): Promise<{ removed: boolean; email: string } | null> {
+  if (!isUuid(userId)) return null
+  // The self-join reads the row as it was BEFORE this statement, which is how one
+  // query can both clear the photo and report whether there was one to clear — a
+  // read followed by a write would race a second moderator clicking the same
+  // button, and report "removed" twice for one photo.
+  const { rows } = await pool.query(
+    `UPDATE users u SET avatar_url = NULL
+       FROM users prev
+      WHERE u.id = $1 AND prev.id = u.id
+      RETURNING u.email, (prev.avatar_url IS NOT NULL) AS had_photo`,
+    [userId],
+  )
+  const row = rows[0] as { email: string; had_photo: boolean } | undefined
+  if (!row) return null
+  return { removed: !!row.had_photo, email: row.email }
+}
+
+/** Resolve or dismiss a report. Returns false when the id doesn't exist. */
+export async function adminResolveReport(
+  reportId: string,
+  status: 'resolved' | 'dismissed',
+): Promise<boolean> {
+  if (!isUuid(reportId)) return false
+  const { rowCount } = await pool.query(
+    `UPDATE reports SET status = $2, resolved_at = now() WHERE id = $1`,
+    [reportId, status],
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/**
+ * An admin accepts or rejects a transfer screenshot.
+ *
+ * Note what rejecting does NOT do: it leaves `bookings.status` alone. The old host
+ * review flipped the whole booking to 'rejected' on a bad screenshot, cancelling a
+ * real reservation over an unreadable photo. Here the booking stays confirmed and the
+ * guest can upload a clearer one — `canPay` treats a rejected payment as payable.
+ *
+ * Transactional so the proof row and the booking can never disagree about the outcome.
+ */
+export async function adminReviewProof(
+  bookingId: string,
+  action: PaymentReviewAction,
+  reason: string | null,
+  actor: string,
+): Promise<{ guestId: string; title: string | null } | null> {
+  if (!isUuid(bookingId)) throw new Error('Invalid booking')
+  const out = outcomeFor(action)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query(
+      `SELECT b.user_id, l.title FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE b.id = $1`,
+      [bookingId],
+    )
+    const row = rows[0] as { user_id: string; title: string | null } | undefined
+    if (!row) { await client.query('ROLLBACK'); return null }
+
+    await client.query(
+      `UPDATE bookings SET payment_status = $2,
+              paid_at = CASE WHEN $3 THEN COALESCE(paid_at, now()) ELSE paid_at END
+        WHERE id = $1`,
+      [bookingId, out.paymentState, out.markPaid],
+    )
+    // Only the latest proof — an older superseded one keeps its own history.
+    await client.query(
+      `UPDATE payment_proofs SET status = $2, reviewed_by = $3, reviewed_at = now(),
+              reject_reason = $4
+        WHERE id = (SELECT id FROM payment_proofs WHERE booking_id = $1 ORDER BY submitted_at DESC LIMIT 1)`,
+      [bookingId, out.proofStatus, actor, reason],
+    )
+    await client.query('COMMIT')
+
+    await createNotification(row.user_id, {
+      type: 'payment',
+      title: action === 'accept' ? 'Payment confirmed' : 'We could not confirm your transfer',
+      body: action === 'accept'
+        ? `Your booking for ${row.title ?? 'your stay'} is fully confirmed.`
+        : (reason
+            ? `${row.title ?? 'Your stay'} — ${reason}. You can upload another screenshot.`
+            : `${row.title ?? 'Your stay'} — please upload a clearer screenshot of the transfer.`),
+      link: '/reservations',
+    })
+    return { guestId: row.user_id, title: row.title }
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+/** D1 — the /ops users directory: search, filter, sort and page through every
+ *  account with their verification status, listing and booking counts.
+ *
+ *  `total` is the post-filter count, taken from the same query via COUNT(*) OVER ()
+ *  so pagination needs no second round trip. Replaces the old unfiltered
+ *  `adminListUsers()`, whose hardcoded LIMIT 300 silently hid older accounts. */
+export async function adminSearchUsers(
+  filter: UserListFilter,
+): Promise<{ users: AdminUserRow[]; total: number }> {
+  const { where, params } = buildUserListWhere(filter)
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+  // ORDER BY comes from a whitelist (orderBySql), never from raw input.
+  const { rows } = await pool.query(
+    `SELECT ${ADMIN_USER_COLS}, COUNT(*) OVER ()::int AS total_count
+       FROM users u
+       ${whereSql}
+      ORDER BY ${orderBySql(filter.sort)}
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, filter.limit, filter.offset],
+  )
+  // total_count rides on every row; strip it so callers get a clean AdminUserRow.
+  const users = rows.map(({ total_count: _total, ...rest }) => rest) as AdminUserRow[]
+  let total = rows.length ? Number((rows[0] as { total_count: number }).total_count) : 0
+  // An empty page past the end carries no row to read the window count from, so
+  // "0 of 0" would be reported for a non-empty table. Only then pay for a COUNT.
+  if (!rows.length && filter.offset > 0) {
+    const { rows: c } = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM users u ${whereSql}`,
+      params,
+    )
+    total = Number((c[0] as { total: number })?.total ?? 0)
+  }
+  return { users, total }
+}
+
+/**
+ * The one writer of `users.account_status`, for all four transitions.
+ *
+ * Blocking or removing hides the account's published listings and flags them
+ * `unpublished_by_admin`; returning to active republishes EXACTLY those, so a
+ * listing the host had taken down themselves stays down. Transactional, with the
+ * user row locked, so status and listing visibility can never disagree.
+ *
+ * Refuses to touch a `role='admin'` row: staff.ts's legacy-admin fallback resolves
+ * such a user through getUserFromRequest, so blocking one would lock the legacy
+ * operator out of /ops entirely.
+ *
+ * History lives in staff_audit_log (written by the route); the status_changed_*
+ * columns hold just the latest transition for cheap display.
+ */
+export async function adminSetAccountStatus(
+  id: string,
+  next: AccountStatus,
+  opts: { reason?: string | null; actor: string },
+): Promise<{ previous: AccountStatus; email: string; listingsChanged: number }> {
+  if (!isUuid(id)) throw new Error('Invalid user')
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query(
+      `SELECT email, role, COALESCE(account_status, 'active') AS account_status
+         FROM users WHERE id = $1 FOR UPDATE`,
+      [id],
+    )
+    const row = rows[0] as { email: string; role: string | null; account_status: string } | undefined
+    if (!row) throw new Error('User not found')
+    if (String(row.role ?? '').toLowerCase() === 'admin') {
+      throw new Error('Cannot change the status of an admin account')
+    }
+    const previous = normalizeStatus(row.account_status)
+
+    await client.query(
+      `UPDATE users
+          SET account_status = $2, status_reason = $3,
+              status_changed_at = now(), status_changed_by = $4
+        WHERE id = $1`,
+      [id, next, opts.reason ?? null, opts.actor],
+    )
+
+    let listingsChanged = 0
+    if (hidesListings(next) && !hidesListings(previous)) {
+      // Only currently-published listings are touched, so pending/rejected ones are
+      // never flagged and can't be published by a later restore.
+      const hid = await client.query(
+        `UPDATE listings SET is_published = false, unpublished_by_admin = true
+          WHERE host_id = $1 AND is_published = true`,
+        [id],
+      )
+      listingsChanged = hid.rowCount ?? 0
+    } else if (!hidesListings(next) && hidesListings(previous)) {
+      const shown = await client.query(
+        // Not the ones verification took down — those come back only when the
+        // host is verified again.
+        `UPDATE listings SET is_published = true, unpublished_by_admin = false
+          WHERE host_id = $1 AND unpublished_by_admin = true
+            AND COALESCE(unpublished_by_verification, false) = false
+            AND COALESCE(approval_status, 'approved') = 'approved'`,
+        [id],
+      )
+      listingsChanged = shown.rowCount ?? 0
+      // A listing rejected while the account was down stays hidden, but must not
+      // stay flagged — otherwise a future restore would resurrect it.
+      await client.query(
+        `UPDATE listings SET unpublished_by_admin = false
+          WHERE host_id = $1 AND unpublished_by_admin = true`,
+        [id],
+      )
+    }
+
+    await client.query('COMMIT')
+    return { previous, email: row.email, listingsChanged }
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+/** Admin drives a reservation's lifecycle (pending → confirmed → completed, or
+ *  rejected/cancelled). Issues the reservation code on confirm/complete. */
+export async function adminSetBookingStatus(
+  bookingId: string,
+  status: string,
+): Promise<{ updated: boolean; status: string }> {
+  if (!/^[0-9a-fA-F-]{36}$/.test(bookingId)) throw new Error('Invalid id')
+  if (!(BOOKING_STATUSES as readonly string[]).includes(status)) throw new Error('Invalid status')
+  const { rows } = await pool.query(
+    `UPDATE bookings b SET status = $2,
+            reservation_code = CASE WHEN $2 IN ('confirmed', 'completed')
+                                    THEN COALESCE(b.reservation_code, $3)
+                                    ELSE b.reservation_code END
+       FROM listings l
+      WHERE b.id = $1 AND l.id = b.listing_id
+      RETURNING b.user_id, l.title`,
+    [bookingId, status, genReservationCode()]
+  )
+  const row = rows[0]
+  if (row) {
+    const completed = status === 'completed'
+    await createNotification(row.user_id, {
+      type: 'booking',
+      title: completed ? 'Your stay is complete' : `Reservation ${status}`,
+      body: completed
+        ? `How was ${row.title}? Tap to leave a review.`
+        : `Your reservation for ${row.title} is now ${status}.`,
+      link: `/reservation/${bookingId}`,
+    })
+  }
+  return { updated: rows.length > 0, status }
+}
+
+/** Admin: directly set (or clear) a user's host role. Unified account — a host is
+ *  also a guest, so this only flips `is_host` (and keeps the legacy `role` in sync
+ *  for the mobile backend). Notifies the user when they gain hosting. Note: the
+ *  mobile apps cache is_host at login and only re-read it on a fresh sign-in, so a
+ *  user promoted here sees host surfaces after signing out and back in. */
+export async function adminSetHost(id: string, makeHost: boolean): Promise<void> {
+  if (!isUuid(id)) throw new Error('Invalid user')
+  await pool.query(`UPDATE users SET is_host = $2 WHERE id = $1`, [id, makeHost])
+  // Legacy role column: absent on some dev DBs, so best-effort.
+  try { await pool.query(`UPDATE users SET role = $2 WHERE id = $1`, [id, makeHost ? 'host' : 'guest']) } catch { /* role column not present */ }
+  if (makeHost) {
+    await createNotification(id, { type: 'host', title: 'You are now a host!', body: 'Your account was upgraded to host — sign out and back in to start listing your space.', link: '/host' })
+  }
+}
+
+/**
+ * Admin moderation decision on a pending listing. Approving flips approval_status
+ * to 'approved' AND publishes it (so it appears in search); rejecting sets
+ * 'rejected' and keeps it unpublished. Either way the host gets a notification —
+ * which surfaces on both web and mobile (shared notifications table). Mirrors
+ * reviewHostApplication.
+ */
+export async function adminSetListingApproval(
+  id: string,
+  action: 'approve' | 'reject',
+  note?: string | null,
+): Promise<void> {
+  if (!isUuid(id)) throw new Error('Invalid listing')
+  // Going live is the moment that matters: a listing can outlive the verification
+  // that allowed it to be created, so publishing re-checks the host rather than
+  // trusting the create-time gate. The backend project's setListingApproval has
+  // always done this; /ops — where approvals actually happen — did not, which
+  // meant the one path an operator uses could publish an unverified host.
+  if (action === 'approve') {
+    const { rows: hostRows } = await pool.query(
+      `SELECT COALESCE(u.verification_status, 'unverified') AS status
+         FROM listings l JOIN users u ON u.id = l.host_id
+        WHERE l.id = $1`,
+      [id],
+    )
+    const hostStatus = hostRows[0]?.status as string | undefined
+    if (hostStatus && hostStatus !== 'verified') {
+      throw new ListingInputError(
+        `This host is not identity-verified (${hostStatus}). Approve their ID in Verifications first — ` +
+        `a listing must not go live before its host is verified.`,
+      )
+    }
+  }
+  const status = action === 'approve' ? 'approved' : 'rejected'
+  // The note is stored, not just announced. It used to exist only inside the
+  // notification body below, so a host who missed that one notification saw a
+  // "Rejected" badge and had no way to learn what to fix — /host and the listing
+  // editor now read `review_note` back. Approving clears it: the note describes a
+  // rejection, and a stale one under a live listing reads as a fresh complaint.
+  const reviewNote = action === 'reject' ? normalizeListingReviewNote(note) : null
+  const { rows } = await pool.query(
+    `UPDATE listings SET approval_status = $2, is_published = $3, review_note = $4 WHERE id = $1
+     RETURNING host_id, title`,
+    [id, status, action === 'approve', reviewNote],
+  )
+  const row = rows[0] as { host_id: string | null; title: string | null } | undefined
+  if (!row) throw new Error('Listing not found')
+  if (!row.host_id) return
+  const title = row.title || 'Your listing'
+  if (action === 'approve') {
+    await createNotification(row.host_id, {
+      type: 'listing',
+      title: 'Listing approved 🎉',
+      body: `"${title}" was approved and is now live — guests can find and book it.`,
+      link: '/host',
+    })
+  } else {
+    await createNotification(row.host_id, {
+      type: 'listing',
+      title: 'Listing needs changes',
+      body: // Composed from the SAME normalized note that was just stored, so the
+      // notification and the reason on /host can never word it differently.
+      listingRejectionMessage(title, reviewNote),
+      link: '/host',
+    })
+  }
+}
+
+/** Publish / unpublish a listing.
+ *  Publishing clears `unpublished_by_admin` — once an operator puts a listing back
+ *  up by hand it is no longer "hidden by a block", so a later account restore must
+ *  not claim it. Unpublishing deliberately does NOT set the flag: that would make a
+ *  manual takedown get auto-republished when the host is unblocked. */
+export async function adminSetListingPublished(id: string, published: boolean): Promise<void> {
+  if (!isUuid(id)) throw new Error('Invalid listing')
+  await pool.query(
+    published
+      ? `UPDATE listings SET is_published = true, unpublished_by_admin = false WHERE id = $1`
+      : `UPDATE listings SET is_published = false WHERE id = $1`,
+    [id],
+  )
+}
+
+/**
+ * The history behind the Overview's number cards — one dense series per chartable
+ * metric, for the card → graph panel.
+ *
+ * TWO round trips for all eight metrics, not two per metric: the per-bucket counts
+ * are one UNION ALL and the baselines are another. The Overview already polls
+ * `adminStats` every 30 seconds from every operator's browser, so a fan-out of
+ * sixteen queries behind a chart nobody has clicked yet is exactly the load this
+ * screen cannot afford. The page fetches this once per range instead, and switching
+ * cards is then free — every series is already on the client.
+ *
+ * `baseline` is what makes a running total honest: rows dated before the window
+ * start. Without it the 7-day view would draw the platform's entire user base as
+ * having arrived in the last week.
+ *
+ * Injection surface: `metric` is validated against METRIC_IDS by the route, and the
+ * only interpolated identifiers are the constant from/where/at fragments that
+ * METRICS keys off it. Dates are $n placeholders.
+ */
+export async function adminStatTrends(
+  range: RangeId,
+  now: Date = new Date(),
+): Promise<TrendPayload> {
+  const spec = RANGES[range]
+  const buckets = bucketsFor(range, now)
+  const { from, toExclusive } = windowFor(range, now)
+
+  // date_trunc's unit is a constant from RANGES ('day' | 'month'), never user text.
+  const bucketOf = (at: string) => `to_char(date_trunc('${spec.granularity}', ${at}), 'YYYY-MM-DD')`
+  const scoped = (m: MetricSpec, extra: string) =>
+    `FROM ${m.from} WHERE ${m.where ? `${m.where} AND ` : ''}${extra}`
+
+  const ids = Object.keys(METRICS) as MetricId[]
+
+  const countsSql = ids
+    .map((id) => {
+      const m = METRICS[id]
+      return `SELECT '${id}' AS metric, ${bucketOf(m.at)} AS bucket, COUNT(*)::int AS count
+                ${scoped(m, `${m.at} >= $1::date AND ${m.at} < $2::date`)}
+               GROUP BY 2`
+    })
+    .join('\nUNION ALL\n')
+
+  // A row with a NULL date axis has no bucket to sit in, so it can never appear in
+  // the series — count it in the baseline instead of losing it, or the final
+  // running total would fall short of the card.
+  const baselineSql = ids
+    .map((id) => {
+      const m = METRICS[id]
+      return `SELECT '${id}' AS metric, COUNT(*)::int AS count
+                ${scoped(m, `(${m.at} IS NULL OR ${m.at} < $1::date)`)}`
+    })
+    .join('\nUNION ALL\n')
+
+  const [counts, baselines] = await Promise.all([
+    pool.query(countsSql, [from, toExclusive]),
+    pool.query(baselineSql, [from]),
+  ])
+
+  const baselineOf = new Map<string, number>()
+  for (const r of baselines.rows) baselineOf.set(r.metric, Number(r.count) || 0)
+
+  const rowsOf = new Map<string, Array<{ bucket: string; count: number }>>()
+  for (const r of counts.rows) {
+    const list = rowsOf.get(r.metric) ?? []
+    list.push({ bucket: r.bucket, count: Number(r.count) || 0 })
+    rowsOf.set(r.metric, list)
+  }
+
+  const series = {} as Record<MetricId, SeriesPoint[]>
+  for (const id of ids) {
+    series[id] = buildSeries(buckets, rowsOf.get(id) ?? [], baselineOf.get(id) ?? 0, METRICS[id].cumulative)
+  }
+
+  // The whole response, not just the series: /ops/page.tsx seeds the client with
+  // this on the server and the API route returns it verbatim, so assembling it here
+  // is what stops the two paths shipping subtly different shapes.
+  return { range, granularity: spec.granularity, series, metrics: publicMetrics() }
+}
+
+/** Top-line counts for the admin dashboard, plus the alert queues (F3/F4).
+ *  gross_paid = SUM(total_price) of paid bookings — the HOST side, before the
+ *  markup; commission_paid is the platform's cut on the same population, so
+ *  gross_paid + commission_paid is what guests actually handed over. */
+export async function adminStats(): Promise<AdminStats> {
+  const { rows } = await pool.query(
+    `SELECT
+       (SELECT COUNT(*) FROM users)::int AS users,
+       (SELECT COUNT(*) FROM users WHERE is_host = true)::int AS hosts,
+       -- users.verification_status is the source of truth (E2/E3), not the
+       -- submission log — otherwise this tile disagrees with every badge the
+       -- moment someone is verified without a matching id_verifications row.
+       (SELECT COUNT(*) FROM users WHERE verification_status = 'verified')::int AS verified,
+       (SELECT COUNT(*) FROM listings)::int AS listings,
+       (SELECT COUNT(*) FROM listings WHERE is_published = true)::int AS published,
+       (SELECT COUNT(*) FROM bookings)::int AS bookings,
+       (SELECT COUNT(*) FROM bookings WHERE status = 'pending')::int AS pending_bookings,
+       (SELECT COUNT(*) FROM bookings WHERE status = 'confirmed')::int AS confirmed_bookings,
+       -- payment_status, NOT "paid_at IS NOT NULL": a refund CLEARS paid_at, so that
+       -- predicate silently under-counted. Same rule as analytics-core's PAID_SQL.
+       (SELECT COUNT(*) FROM bookings WHERE COALESCE(payment_status, 'unpaid') = 'paid')::int AS paid_bookings,
+       (SELECT COUNT(*) FROM host_applications WHERE status = 'pending')::int AS pending_applications,
+       (SELECT COUNT(*) FROM id_verifications WHERE status = 'pending')::int AS pending_verifications,
+       COALESCE((SELECT SUM(total_price) FROM bookings WHERE COALESCE(payment_status, 'unpaid') = 'paid'), 0)::float8 AS gross_paid,
+       -- The platform's margin. Because the commission is a MARKUP, it is the gap
+       -- between what the guest was charged and the host's raw price — not a
+       -- percentage of total_price, which would ignore the round-up to 10 EGP.
+       -- Each booking prices at ITS OWN snapshot, so changing the rate never
+       -- restates what has already been earned.
+       COALESCE((SELECT SUM(${COMMISSION_AMOUNT_SQL}) FROM bookings b
+                  WHERE COALESCE(b.payment_status, 'unpaid') = 'paid'), 0)::float8 AS commission_paid,
+       -- Expected, not earned: live reservations with the money still outstanding.
+       -- Cancelled/rejected bookings and refunded ones are excluded — that money is
+       -- never arriving.
+       COALESCE((SELECT SUM(${COMMISSION_AMOUNT_SQL}) FROM bookings b
+                  WHERE b.status IN ('pending', 'confirmed')
+                    AND COALESCE(b.payment_status, 'unpaid') NOT IN ('paid', 'refunded', 'voided')), 0)::float8 AS commission_pending,
+       -- F3/F4: the queues that need someone's attention. These drive both the
+       -- dashboard's alert tiles and the alert centre, so they live in the same single
+       -- query rather than fanning out per poll.
+       (SELECT COUNT(*) FROM bookings WHERE created_at >= date_trunc('day', now()))::int AS bookings_today,
+       (SELECT COUNT(*) FROM listings WHERE COALESCE(approval_status, 'approved') = 'pending')::int AS pending_listings,
+       -- Only the LATEST proof per booking counts — an old disputed proof superseded by
+       -- a fresh one is not an open dispute. Mirrors adminListDisputes.
+       (SELECT COUNT(*) FROM payment_proofs pp
+         WHERE pp.status = 'disputed'
+           AND pp.id = (SELECT id FROM payment_proofs p2 WHERE p2.booking_id = pp.booking_id
+                         ORDER BY p2.submitted_at DESC LIMIT 1))::int AS disputed_payments,
+       -- Transfers waiting for a first decision. Nothing counted these before, so a
+       -- guest could pay and no one would ever be told.
+       (SELECT COUNT(*) FROM payment_proofs pp
+         WHERE pp.status = 'submitted'
+           AND pp.id = (SELECT id FROM payment_proofs p2 WHERE p2.booking_id = pp.booking_id
+                         ORDER BY p2.submitted_at DESC LIMIT 1))::int AS pending_payments,
+       (SELECT COUNT(*) FROM resort_submissions WHERE status = 'pending')::int AS pending_resort_submissions,
+       (SELECT COUNT(*) FROM reports WHERE status = 'open')::int AS open_reports,
+       -- How long the oldest item in each queue has waited, so the alert centre can say
+       -- "3 days" rather than just a number.
+       (SELECT to_char((MIN(submitted_at)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') FROM id_verifications WHERE status = 'pending') AS oldest_verification,
+       (SELECT to_char((MIN(submitted_at)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') FROM host_applications WHERE status = 'pending') AS oldest_application,
+       (SELECT to_char((MIN(created_at)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') FROM listings WHERE COALESCE(approval_status, 'approved') = 'pending') AS oldest_listing,
+       (SELECT to_char((MIN(created_at)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') FROM reports WHERE status = 'open') AS oldest_report,
+       (SELECT to_char((MIN(submitted_at)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') FROM payment_proofs WHERE status = 'submitted') AS oldest_payment`
+  )
+  // The two newest queues are read through their own helpers rather than as
+  // subqueries above, ON PURPOSE: a subquery against a table that doesn't exist
+  // yet fails the WHOLE statement, which would take the dashboard and the alert
+  // centre down on any database where migrate-policy-violations / migrate-disputes
+  // hasn't run. Each helper answers 0 in that case, so the console degrades to
+  // "nothing in this queue" instead of breaking.
+  const [flagged_users, open_disputes, pending_id_changes, oldest_flag, oldest_dispute, oldest_id_change] =
+    await Promise.all([
+      countFlaggedUsers(),
+      countOpenDisputes(),
+      countPendingIdChanges(),
+      oldestFlaggedAt(),
+      oldestOpenDisputeAt(),
+      oldestPendingIdChangeAt(),
+    ])
+  return {
+    ...(rows[0] as AdminStats),
+    flagged_users,
+    open_disputes,
+    pending_id_changes,
+    oldest_flag,
+    oldest_dispute,
+    oldest_id_change,
+  }
+}
+
+/**
+ * Verify a reset code without consuming it. A wrong code increments the attempt
+ * counter (so guessing is bounded); the row is only marked used once the password
+ * has actually been changed — same ordering as HubDrives' Verify()/MarkUsed().
+ */
+export async function checkStaffReset(
+  email: string,
+  code: string,
+  maxAttempts: number
+): Promise<{ ok: true; id: string; staffId: string } | { ok: false; reason: 'not_found' | 'expired' | 'used' | 'locked' | 'mismatch' }> {
+  const { rows } = await pool.query<{
+    id: string
+    staff_id: string
+    code: string
+    used_at: string | null
+    failed_attempts: number
+    expired: boolean
+  }>(
+    `SELECT id, staff_id, code, used_at, failed_attempts, (expires_at <= now()) AS expired
+       FROM staff_password_resets
+      WHERE lower(email) = lower($1)
+      ORDER BY created_at DESC LIMIT 1`,
+    [email]
+  )
+  const row = rows[0]
+  if (!row) return { ok: false, reason: 'not_found' }
+  if (row.used_at) return { ok: false, reason: 'used' }
+  if (row.failed_attempts >= maxAttempts) return { ok: false, reason: 'locked' }
+  if (row.expired) return { ok: false, reason: 'expired' }
+  if (row.code !== String(code).trim()) {
+    await pool.query(
+      `UPDATE staff_password_resets SET failed_attempts = failed_attempts + 1 WHERE id = $1`,
+      [row.id]
+    )
+    return { ok: false, reason: 'mismatch' }
+  }
+  return { ok: true, id: row.id, staffId: row.staff_id }
+}
+
+export async function createStaffAccount(input: {
+  email: string
+  passwordHash: string
+  fullName: string
+  role: 'super_admin' | 'moderator'
+  createdBy: string | null
+  modules: string[]
+}): Promise<StaffAccount> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query<{ id: string }>(
+      `INSERT INTO staff_accounts (email, password_hash, full_name, role, created_by)
+       VALUES (lower($1), $2, $3, $4, $5) RETURNING id`,
+      [input.email.trim(), input.passwordHash, input.fullName.trim().slice(0, 120), input.role,
+       input.createdBy && isUuid(input.createdBy) ? input.createdBy : null]
+    )
+    const id = rows[0].id
+    if (input.role === 'moderator' && input.modules.length) {
+      await client.query(
+        `INSERT INTO staff_permissions (staff_id, module, granted_by)
+         SELECT $1, m, $2 FROM unnest($3::text[]) AS m
+         ON CONFLICT (staff_id, module) DO NOTHING`,
+        [id, input.createdBy && isUuid(input.createdBy) ? input.createdBy : null, input.modules]
+      )
+    }
+    await client.query('COMMIT')
+    return (await getStaffAccount(id))!
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+/** Invalidates any outstanding codes for the account, then issues a fresh one. */
+export async function createStaffReset(input: {
+  staffId: string
+  email: string
+  code: string
+  ttlMs: number
+  ip: string | null
+}): Promise<void> {
+  if (!isUuid(input.staffId)) throw new Error('Invalid id')
+  await pool.query(
+    `UPDATE staff_password_resets SET used_at = now()
+      WHERE staff_id = $1 AND used_at IS NULL`,
+    [input.staffId]
+  )
+  await pool.query(
+    `INSERT INTO staff_password_resets (staff_id, email, code, expires_at, request_ip)
+     VALUES ($1, lower($2), $3, now() + ($4 || ' milliseconds')::interval, $5)`,
+    [input.staffId, input.email, input.code, String(input.ttlMs), input.ip]
+  )
+}
+
+/**
+ * Everything that happened on the site, newest first.
+ *
+ * There is NO activity_log table. Six of the seven kinds are derived from timestamps
+ * already sitting on real rows, so this feed has full history from the day it shipped
+ * rather than starting empty — and it cannot drift from the data it describes, because
+ * it IS the data. `login` is the exception and has its own table.
+ *
+ * Each branch is date-windowed and LIMITed BEFORE the union, so every one uses its own
+ * created_at index instead of sorting a whole table; the outer query only merges an
+ * already-small set. Branches the filter excludes are not emitted at all.
+ */
+export async function getActivityFeed(
+  filter: ActivityFilter,
+): Promise<{ events: ActivityEvent[]; hasMore: boolean }> {
+  const params: unknown[] = []
+  const bind = (v: unknown) => `$${params.push(v)}`
+
+  // One shared window; `to` widens to the whole final day.
+  const from = filter.from ? bind(filter.from) : null
+  const to = filter.to ? bind(filter.to) : null
+  const windowFor = (col: string) => {
+    const parts: string[] = [`${col} IS NOT NULL`]
+    if (from) parts.push(`${col} >= ${from}::date`)
+    if (to) parts.push(`${col} < (${to}::date + interval '1 day')`)
+    return parts.join(' AND ')
+  }
+  const cap = bind(branchLimit(filter))
+  const search = filter.q ? bind(`%${filter.q}%`) : null
+  // Applied to the actor, whoever that is for the branch in question.
+  const match = (email: string, name: string) =>
+    search ? ` AND (${email} ILIKE ${search} OR COALESCE(${name}, '') ILIKE ${search})` : ''
+
+  const branches: string[] = []
+
+  if (wantsKind(filter, 'signup')) branches.push(`
+    (SELECT 'signup' AS kind, u.created_at AS at, u.id AS actor_id, u.email AS actor_email,
+            u.full_name AS actor_name, NULL::text AS subject, 'user' AS subject_type,
+            u.id::text AS subject_id, NULL::float8 AS amount,
+            CASE WHEN COALESCE(u.is_host, false) THEN 'host' ELSE 'guest' END AS detail
+       FROM users u
+      WHERE ${windowFor('u.created_at')}${match('u.email', 'u.full_name')}
+      ORDER BY u.created_at DESC LIMIT ${cap})`)
+
+  if (wantsKind(filter, 'login')) branches.push(`
+    (SELECT 'login' AS kind, lg.created_at AS at, u.id AS actor_id, u.email AS actor_email,
+            u.full_name AS actor_name, NULL::text AS subject, 'user' AS subject_type,
+            u.id::text AS subject_id, NULL::float8 AS amount, lg.method AS detail
+       FROM user_logins lg JOIN users u ON u.id = lg.user_id
+      WHERE ${windowFor('lg.created_at')}${match('u.email', 'u.full_name')}
+      ORDER BY lg.created_at DESC LIMIT ${cap})`)
+
+  if (wantsKind(filter, 'listing_created')) branches.push(`
+    (SELECT 'listing_created' AS kind, l.created_at AS at, u.id AS actor_id, u.email AS actor_email,
+            u.full_name AS actor_name, l.title AS subject, 'listing' AS subject_type,
+            l.id::text AS subject_id, l.price_per_night::float8 AS amount,
+            COALESCE(l.approval_status, 'approved') AS detail
+       FROM listings l LEFT JOIN users u ON u.id = l.host_id
+      WHERE ${windowFor('l.created_at')}${match("COALESCE(u.email, '')", 'u.full_name')}
+      ORDER BY l.created_at DESC LIMIT ${cap})`)
+
+  if (wantsKind(filter, 'booking_created')) branches.push(`
+    (SELECT 'booking_created' AS kind, b.created_at AS at, u.id AS actor_id, u.email AS actor_email,
+            u.full_name AS actor_name, l.title AS subject, 'booking' AS subject_type,
+            b.id::text AS subject_id, ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS amount, b.status AS detail
+       FROM bookings b LEFT JOIN users u ON u.id = b.user_id
+                       LEFT JOIN listings l ON l.id = b.listing_id
+      WHERE ${windowFor('b.created_at')}${match("COALESCE(u.email, '')", 'u.full_name')}
+      ORDER BY b.created_at DESC LIMIT ${cap})`)
+
+  if (wantsKind(filter, 'payment_submitted')) branches.push(`
+    (SELECT 'payment_submitted' AS kind, pp.submitted_at AS at, u.id AS actor_id, u.email AS actor_email,
+            u.full_name AS actor_name, l.title AS subject, 'booking' AS subject_type,
+            b.id::text AS subject_id, COALESCE(pp.amount, ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)})::float8 AS amount,
+            pp.status AS detail
+       FROM payment_proofs pp JOIN bookings b ON b.id = pp.booking_id
+                              LEFT JOIN users u ON u.id = b.user_id
+                              LEFT JOIN listings l ON l.id = b.listing_id
+      WHERE ${windowFor('pp.submitted_at')}${match("COALESCE(u.email, '')", 'u.full_name')}
+      ORDER BY pp.submitted_at DESC LIMIT ${cap})`)
+
+  // NB the paid_at trap: it is NULLed on refund. Gating on PAID_SQL means this branch
+  // shows payments that are still paid, and a refund shows up as its own money event
+  // rather than a payment that silently vanished.
+  if (wantsKind(filter, 'payment_approved')) branches.push(`
+    (SELECT 'payment_approved' AS kind, b.paid_at AS at, u.id AS actor_id, u.email AS actor_email,
+            u.full_name AS actor_name, l.title AS subject, 'booking' AS subject_type,
+            b.id::text AS subject_id, ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS amount, b.payment_status AS detail
+       FROM bookings b LEFT JOIN users u ON u.id = b.user_id
+                       LEFT JOIN listings l ON l.id = b.listing_id
+      WHERE ${windowFor('b.paid_at')} AND ${PAID_SQL}${match("COALESCE(u.email, '')", 'u.full_name')}
+      ORDER BY b.paid_at DESC LIMIT ${cap})`)
+
+  if (wantsKind(filter, 'booking_cancelled')) branches.push(`
+    (SELECT 'booking_cancelled' AS kind, b.cancelled_at AS at, u.id AS actor_id, u.email AS actor_email,
+            u.full_name AS actor_name, l.title AS subject, 'booking' AS subject_type,
+            b.id::text AS subject_id, b.refund_amount::float8 AS amount,
+            COALESCE(b.cancelled_by_role, 'guest') AS detail
+       FROM bookings b LEFT JOIN users u ON u.id = b.user_id
+                       LEFT JOIN listings l ON l.id = b.listing_id
+      WHERE ${windowFor('b.cancelled_at')}${match("COALESCE(u.email, '')", 'u.full_name')}
+      ORDER BY b.cancelled_at DESC LIMIT ${cap})`)
+
+  if (branches.length === 0) return { events: [], hasMore: false }
+
+  const dir = filter.sort === 'oldest' ? 'ASC' : 'DESC'
+  // Fetch one extra row so the client knows whether a next page exists without a
+  // COUNT over a seven-branch union.
+  const limit = bind(filter.limit + 1)
+  const offset = bind(filter.offset)
+  const { rows } = await pool.query(
+    `SELECT kind, to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS at, actor_id, actor_email,
+            actor_name, subject, subject_type, subject_id, amount, detail
+       FROM (${branches.join('\n    UNION ALL')}) e
+      ORDER BY at ${dir}
+      LIMIT ${limit} OFFSET ${offset}`,
+    params,
+  )
+  const hasMore = rows.length > filter.limit
+  return { events: rows.slice(0, filter.limit) as ActivityEvent[], hasMore }
+}
+
+/** The mobile app store links surfaced by the web "download the app" bar.
+ *  Returns nulls when nothing is configured yet (or the table doesn't exist),
+ *  so the public banner endpoint never errors. */
+export async function getAppLinks(): Promise<AppLinks> {
+  try {
+    const { rows } = await pool.query(
+      `SELECT key, value FROM app_settings WHERE key IN ('app_ios_url', 'app_android_url')`
+    )
+    const norm = (v: unknown): string | null => {
+      const s = String(v ?? '').trim()
+      return s || null
+    }
+    const map = new Map(rows.map((r) => [r.key as string, r.value as string | null]))
+    return { ios: norm(map.get('app_ios_url')), android: norm(map.get('app_android_url')) }
+  } catch {
+    // Table not created yet → treat as "no links configured".
+    return { ios: null, android: null }
+  }
+}
+
+/** The distinct actions actually present, for the filter dropdown — so it offers what
+ *  this deployment has really recorded rather than a hardcoded list that drifts. */
+export async function getAuditActions(): Promise<string[]> {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT action FROM staff_audit_log ORDER BY action`,
+  )
+  return rows.map((r) => String(r.action))
+}
+
+/**
+ * The staff audit trail (F2).
+ *
+ * staff_audit_log has been written since the RBAC work landed but NEVER read — until
+ * this, the only way to answer "who deleted that?" was psql against Neon. The table
+ * itself needed no change; it needed a reader.
+ *
+ * `action` and `target_type` arrive pre-validated as plain slugs (parseAuditFilter)
+ * and are still bound, never interpolated.
+ */
+export async function getAuditLog(
+  filter: AuditFilter,
+): Promise<{ entries: AuditEntry[]; hasMore: boolean }> {
+  const where: string[] = []
+  const params: unknown[] = []
+  const bind = (v: unknown) => `$${params.push(v)}`
+
+  if (filter.q) where.push(`COALESCE(staff_email, '') ILIKE ${bind(`%${filter.q}%`)}`)
+  if (filter.action) where.push(`action = ${bind(filter.action)}`)
+  if (filter.targetType) where.push(`target_type = ${bind(filter.targetType)}`)
+  if (filter.from) where.push(`created_at >= ${bind(filter.from)}::date`)
+  if (filter.to) where.push(`created_at < (${bind(filter.to)}::date + interval '1 day')`)
+
+  const limit = bind(filter.limit + 1)
+  const offset = bind(filter.offset)
+  const { rows } = await pool.query(
+    `SELECT id, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS at,
+            staff_id, staff_email, action, target_type, target_id, detail, ip
+       FROM staff_audit_log
+       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY created_at DESC
+      LIMIT ${limit} OFFSET ${offset}`,
+    params,
+  )
+  const hasMore = rows.length > filter.limit
+  return { entries: rows.slice(0, filter.limit) as AuditEntry[], hasMore }
+}
+
+/** How many listings and services the current rate is repricing. Shown on the
+ *  admin screen so an operator sees the blast radius before they change it. */
+export async function getCommissionImpact(): Promise<{ listings: number; services: number }> {
+  const { rows } = await pool.query(
+    `SELECT (SELECT count(*) FROM listings WHERE is_published = true)::int AS listings,
+            (SELECT count(*) FROM services WHERE is_published = true)::int AS services`
+  )
+  return { listings: Number(rows[0]?.listings ?? 0), services: Number(rows[0]?.services ?? 0) }
+}
+
+/** The admin queue. Defaults to the applications still awaiting a decision;
+ *  `status` accepts 'pending' | 'approved' | 'rejected' | 'all'. */
+export async function getPendingHostApplications(status: string = 'pending'): Promise<HostApplication[]> {
+  const filter = ['pending', 'approved', 'rejected'].includes(status) ? status : null
+  const { rows } = await pool.query(
+    // The linked ID submission rides along so the reviewer can open the document
+    // before approving — approving an application now verifies the identity too,
+    // and approving that blind would defeat the point of the check.
+    `SELECT a.id, a.user_id, a.full_name, a.national_id, a.phone, a.address, a.company, a.notes, a.status,
+            to_char(a.submitted_at,'YYYY-MM-DD HH24:MI') AS submitted_at,
+            to_char(a.reviewed_at,'YYYY-MM-DD HH24:MI') AS reviewed_at, a.review_note,
+            u.email, u.host_type,
+            a.verification_id,
+            (SELECT v.doc_type FROM id_verifications v WHERE v.id = a.verification_id) AS doc_type,
+            (SELECT v.status   FROM id_verifications v WHERE v.id = a.verification_id) AS verification_status
+       FROM host_applications a JOIN users u ON u.id = a.user_id
+      WHERE ($1::text IS NULL OR a.status = $1) ORDER BY a.submitted_at ASC`,
+    [filter]
+  )
+  return rows as HostApplication[]
+}
+
+/** The /ops verification queue. `filter` defaults to 'pending' — the work list —
+ *  but a decided case can be found again and reopened. */
+export async function getPendingVerifications(
+  filter: VerificationFilter = 'pending',
+): Promise<AdminVerificationRow[]> {
+  const { rows } = await pool.query(
+    `SELECT v.id, v.user_id, u.email, v.full_name, v.id_number, v.status,
+            (v.image_data        IS NOT NULL AND v.image_data        <> '') AS has_front,
+            (v.back_image_data   IS NOT NULL AND v.back_image_data   <> '') AS has_back,
+            (v.selfie_image_data IS NOT NULL AND v.selfie_image_data <> '') AS has_selfie,
+            to_char(v.submitted_at,'YYYY-MM-DD HH24:MI') AS submitted_at,
+            to_char(v.reviewed_at, 'YYYY-MM-DD HH24:MI') AS reviewed_at,
+            v.reviewed_by, v.notes
+       FROM id_verifications v JOIN users u ON u.id = v.user_id
+      WHERE ($1 = 'all' OR v.status = $1)
+      ORDER BY v.submitted_at ASC
+      LIMIT 300`,
+    [filter],
+  )
+  return rows as AdminVerificationRow[]
+}
+
+/** Login lookup. Returns the hash and lockout state; case-insensitive on email. */
+export async function getStaffByEmail(email: string): Promise<{
+  id: string
+  email: string
+  password_hash: string
+  full_name: string
+  role: 'super_admin' | 'moderator'
+  is_active: boolean
+  failed_login_attempts: number
+  locked_until: string | null
+} | null> {
+  const { rows } = await pool.query(
+    `SELECT id, email, password_hash, full_name, role, is_active,
+            failed_login_attempts, locked_until
+       FROM staff_accounts WHERE lower(email) = lower($1)`,
+    [email]
+  )
+  return rows[0] ?? null
+}
+
+/** Newest-last list for the staff screen: super admins first, then by creation. */
+export async function listStaffAccounts(): Promise<StaffAccount[]> {
+  const { rows } = await pool.query<StaffAccount>(
+    `${STAFF_SELECT}
+      GROUP BY a.id, c.email
+      ORDER BY (a.role = 'super_admin') DESC, a.created_at`
+  )
+  return rows
+}
+
+/** Consume the code. Call only after the new password is committed. */
+export async function markStaffResetUsed(id: string): Promise<void> {
+  await pool.query(`UPDATE staff_password_resets SET used_at = now() WHERE id = $1`, [id])
+}
+
+/** Count a failed sign-in and lock the account once the threshold is hit.
+ *  Per-account columns rather than the in-memory limiter, which dies on cold start
+ *  and isn't shared across serverless instances. Returns the post-update state. */
+export async function noteStaffLoginFailure(
+  id: string,
+  maxAttempts: number,
+  lockoutMs: number
+): Promise<{ attempts: number; lockedUntil: string | null }> {
+  const { rows } = await pool.query<{ failed_login_attempts: number; locked_until: string | null }>(
+    `UPDATE staff_accounts
+        SET failed_login_attempts = failed_login_attempts + 1,
+            locked_until = CASE WHEN failed_login_attempts + 1 >= $2
+                                THEN now() + ($3 || ' milliseconds')::interval
+                                ELSE locked_until END,
+            updated_at = now()
+      WHERE id = $1
+      RETURNING failed_login_attempts, locked_until`,
+    [id, maxAttempts, String(lockoutMs)]
+  )
+  return { attempts: rows[0]?.failed_login_attempts ?? 0, lockedUntil: rows[0]?.locked_until ?? null }
+}
+
+/** Clear the failure counter and stamp the successful sign-in. */
+export async function noteStaffLoginSuccess(id: string): Promise<void> {
+  await pool.query(
+    `UPDATE staff_accounts
+        SET failed_login_attempts = 0, locked_until = NULL, last_login_at = now(), updated_at = now()
+      WHERE id = $1`,
+    [id]
+  )
+}
+
+/** Housekeeping for the daily cron — sessions and reset codes accumulate forever. */
+export async function purgeStaffExpired(): Promise<{ sessions: number; resets: number; logins: number }> {
+  const s = await pool.query(
+    `DELETE FROM staff_sessions WHERE expires_at < now() - interval '30 days'`
+  )
+  const r = await pool.query(
+    `DELETE FROM staff_password_resets
+      WHERE created_at < now() - interval '30 days' AND (used_at IS NOT NULL OR expires_at < now())`
+  )
+  // user_logins carries an IP and a user agent per sign-in — real PII, and unbounded.
+  // 90 days is long enough to investigate an incident and short enough that the table
+  // isn't a standing liability.
+  const l = await pool.query(`DELETE FROM user_logins WHERE created_at < now() - interval '90 days'`)
+  return { sessions: s.rowCount ?? 0, resets: r.rowCount ?? 0, logins: l.rowCount ?? 0 }
+}
+
+/**
+ * Write a document-view audit row — and THROW if it fails.
+ *
+ * Deliberately not `logStaffAction` (staff.ts), which swallows every error by
+ * contract so an audit hiccup can't break the action being audited. That trade is
+ * right for a block/unblock: losing the log is worse than losing the action. Here it
+ * inverts — "log who viewed what" IS the feature, so an unlogged view is the exact
+ * outcome E4 exists to prevent. No log, no bytes.
+ *
+ * Do not "fix" the inconsistency by routing this through logStaffAction.
+ */
+export async function recordDocumentView(entry: {
+  staffId: string | null
+  staffEmail: string | null
+  targetType: 'user' | 'listing'
+  targetId: string
+  detail: unknown
+  ip: string | null
+}): Promise<void> {
+  await pool.query(
+    `INSERT INTO staff_audit_log (staff_id, staff_email, action, target_type, target_id, detail, ip)
+     VALUES ($1, $2, 'document_viewed', $3, $4, $5::jsonb, $6)`,
+    [entry.staffId, entry.staffEmail, entry.targetType, entry.targetId, JSON.stringify(entry.detail), entry.ip],
+  )
+}
+
+/**
+ * Admin decision on an ID submission — the one writer of a user's verified state.
+ *
+ * Writes BOTH tables in one transaction: `id_verifications` is the submission log,
+ * `users.verification_status` is the source of truth every badge reads (mobile
+ * `getUserBadges`, `host_verified` on every listing payload, and the web host
+ * profile). They used to disagree — /ops wrote only the submission row, so the
+ * apps' verified badges were permanently dark and `users.verified_at` was never
+ * written at all.
+ *
+ * `action: 'pending'` reopens a decided case, clearing the review so it returns to
+ * the queue. `actor` is `staff:<uuid>`, replacing the hardcoded 'admin' that
+ * discarded who actually decided.
+ */
+export async function reviewVerification(
+  verifId: string,
+  action: VerificationAction,
+  note: string | null,
+  actor: string,
+): Promise<void> {
+  if (!isUuid(verifId)) throw new Error('Invalid verification')
+  const status = statusForAction(action)
+  const client = await pool.connect()
+  let uid = ''
+  let listingsHidden = 0
+  let listingsRestored = 0
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query(
+      // Reopening clears the review; deciding stamps it.
+      `UPDATE id_verifications
+          SET status = $2,
+              reviewed_at = CASE WHEN $2 = 'pending' THEN NULL ELSE now() END,
+              reviewed_by = CASE WHEN $2 = 'pending' THEN NULL ELSE $4 END,
+              notes = $3
+        WHERE id = $1 RETURNING user_id`,
+      [verifId, status, note, actor],
+    )
+    uid = rows[0]?.user_id ?? ''
+    if (!uid) throw new Error('Verification not found')
+    // Read the OLD status before overwriting it — losing verification has to take
+    // the host's listings off the market, and that is only knowable by comparing.
+    const prev = await client.query(
+      `SELECT COALESCE(verification_status, 'unverified') AS status FROM users WHERE id = $1`,
+      [uid],
+    )
+    const previousStatus = prev.rows[0]?.status ?? 'unverified'
+    await client.query(
+      `UPDATE users
+          SET verification_status = $2,
+              verified_at = CASE WHEN $2 = 'verified' THEN now() ELSE NULL END
+        WHERE id = $1`,
+      [uid, status],
+    )
+
+    // A host who is no longer verified must not keep listings in front of guests
+    // — that is the whole point of the gate. Flagged with a dedicated column so
+    // re-verifying restores exactly these and nothing else; sharing the account
+    // block's unpublished_by_admin flag would let unblocking republish listings
+    // that verification had hidden.
+    if (revokesListingPrivileges(previousStatus, status)) {
+      const hid = await client.query(
+        `UPDATE listings SET is_published = false, unpublished_by_verification = true
+          WHERE host_id = $1 AND is_published = true`,
+        [uid],
+      )
+      listingsHidden = hid.rowCount ?? 0
+    } else if (normalizeVerificationStatus(status) === 'verified') {
+      // Restore only what verification hid, and only if the account is not ALSO
+      // blocked — the two reasons compose, so a listing hidden for both stays
+      // hidden until both clear.
+      const shown = await client.query(
+        `UPDATE listings SET is_published = true, unpublished_by_verification = false
+          WHERE host_id = $1 AND unpublished_by_verification = true
+            AND COALESCE(unpublished_by_admin, false) = false`,
+        [uid],
+      )
+      listingsRestored = shown.rowCount ?? 0
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+  // Reopening is an internal correction — don't tell the user their ID "changed".
+  // It can still have unpublished their listings, so that is reported separately.
+  if (action === 'pending') {
+    if (listingsHidden > 0) {
+      await createNotification(uid, { type: 'verification', title: 'Listings paused', body: `We're re-checking your identity documents. ${listingsHidden} listing${listingsHidden === 1 ? ' is' : 's are'} paused until that's done.`, link: '/host' })
+    }
+    return
+  }
+  const verified = action === 'verify'
+  // Say what happened to their listings — a host whose listings vanished with no
+  // explanation will open a support ticket.
+  const listingNote = verified
+    ? (listingsRestored > 0
+        ? ` ${listingsRestored} listing${listingsRestored === 1 ? '' : 's'} ${listingsRestored === 1 ? 'is' : 'are'} live again.`
+        : '')
+    : (listingsHidden > 0
+        ? ` ${listingsHidden} listing${listingsHidden === 1 ? '' : 's'} ${listingsHidden === 1 ? 'has' : 'have'} been paused until you're verified.`
+        : '')
+  await createNotification(uid, {
+      type: 'verification',
+      title: verified ? 'Identity verified' : 'Identity check update',
+      body: (verified
+      ? 'Your ID was verified — your account is now verified and you can publish listings.'
+      : (note ? `We could not verify your ID: ${note}` : 'We could not verify your ID. Please re-submit a clear photo.')
+    ) + listingNote,
+      link: verified ? '/host' : '/verify-id',
+    })
+}
+
+/** Persist the app store links (admin only). Creates the settings table on
+ *  first use so no separate migration is needed. Pass null to clear a link. */
+export async function setAppLinks(ios: string | null, android: string | null): Promise<void> {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS app_settings (
+       key text PRIMARY KEY, value text, updated_at timestamptz DEFAULT now()
+     )`
+  )
+  const upsert = async (key: string, value: string | null) => {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [key, value]
+    )
+  }
+  await upsert('app_ios_url', ios)
+  await upsert('app_android_url', android)
+}
+
+/** Set a new password and clear any lockout. Callers must also revoke sessions. */
+export async function setStaffPassword(id: string, passwordHash: string): Promise<boolean> {
+  if (!isUuid(id)) return false
+  const { rowCount } = await pool.query(
+    `UPDATE staff_accounts
+        SET password_hash = $2, password_changed_at = now(), updated_at = now(),
+            failed_login_attempts = 0, locked_until = NULL
+      WHERE id = $1`,
+    [id, passwordHash]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+/** The projection the /ops users list renders. Kept as a fragment so the list and
+ *  the profile header agree on what a user row looks like. `u` is the users alias. */
+const ADMIN_USER_COLS = `
+  u.id, u.email, u.full_name, COALESCE(u.is_host, false) AS is_host,
+  COALESCE(u.email_verified, false) AS email_verified,
+  COALESCE(
+    (SELECT v.status FROM id_verifications v
+      WHERE v.user_id = u.id ORDER BY v.submitted_at DESC LIMIT 1),
+    'none'
+  ) AS verification_status,
+  u.provider,
+  u.push_platform,
+  (u.fcm_token IS NOT NULL OR EXISTS (SELECT 1 FROM device_tokens dt WHERE dt.user_id = u.id)) AS has_push,
+  (SELECT string_agg(DISTINCT dt.platform, ', ') FROM device_tokens dt WHERE dt.user_id = u.id) AS device_platforms,
+  (SELECT COUNT(*) FROM device_tokens dt WHERE dt.user_id = u.id)::int AS device_count,
+  to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+  (SELECT COUNT(*) FROM listings l WHERE l.host_id = u.id)::int AS listing_count,
+  (SELECT COUNT(*) FROM bookings b WHERE b.user_id = u.id)::int AS booking_count,
+  COALESCE(u.account_status, 'active') AS account_status,
+  u.status_reason,
+  to_char(u.status_changed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS status_changed_at,
+  u.status_changed_by
+`
+export interface ActivityEvent {
+  kind: string
+  at: string
+  actor_id: string | null
+  actor_email: string | null
+  actor_name: string | null
+  /** What the event was about — a listing title, a reservation code, an amount. */
+  subject: string | null
+  subject_type: string | null
+  subject_id: string | null
+  /** Money, where the event has any. */
+  amount: number | null
+  detail: string | null
+}
+
+export interface AdminBookingRow {
+  id: string
+  /** NULL until the booking is confirmed (see genReservationCode). */
+  reservation_code: string | null
+  status: string
+  payment_status: string
+  /** Commission-inclusive — what the guest owes. */
+  total_price: number
+  /** The host's raw share of it. */
+  host_payout: number
+  /** The platform's cut: total_price − host_payout, at this booking's own rate. */
+  commission: number
+  /** The rate this booking was taken at, as a fraction. Snapshot, not the live rate. */
+  commission_rate: number
+  currency: string
+  check_in: string
+  check_out: string
+  guest_name: string | null
+  guest_email: string | null
+  listing_title: string | null
+  created_at: string
+}
+
+export interface AdminListingRow {
+  id: string
+  title: string
+  location: string | null
+  region: string | null
+  /** The three fields the pin badge is derived from — see listing-geo-policy.ts.
+   *  Nothing about the mismatch is stored: the console recomputes it per row, so
+   *  a host who fixes their pin clears the badge on the next load. */
+  country: string | null
+  lat: number | null
+  lng: number | null
+  /** Set when the host picked from the catalog. */
+  resort_id: string | null
+  /** Set when the host typed their own via "Other" — this is what needs review
+   *  before the listing is approved. Never set at the same time as resort_id. */
+  resort_name: string | null
+  /** Display name, whichever column it came from. */
+  resort: string | null
+  currency: string
+  /** Commission-inclusive — what a guest is quoted. */
+  price_per_night: number
+  /** The host's raw price, before the platform commission. */
+  host_price_per_night: number
+  is_published: boolean
+  approval_status: string
+  host_id: string | null
+  host_name: string | null
+  created_at: string
+  booking_count: number
+  image: string | null
+  /** True when the host attached a proof-of-ownership document. The document ITSELF
+   *  is no longer shipped here — it comes one at a time from the audited
+   *  /api/local/admin/documents/ownership/:id, which needs the `documents` module
+   *  and records who opened it. This payload used to carry the inline base64 for
+   *  every pending listing, to anyone holding `listings`, with no record at all. */
+  has_ownership_doc: boolean
+}
+
+export interface AdminPendingBookingRow {
+  id: string
+  reservation_code: string | null
+  status: string
+  payment_status: string
+  total_price: number
+  currency: string
+  check_in: string
+  check_out: string
+  guests: number
+  guest_name: string | null
+  guest_email: string | null
+  listing_title: string | null
+  listing_location: string | null
+  host_name: string | null
+  host_email: string | null
+  host_id: string | null
+  image: string | null
+  created_at: string
+}
+
+export interface AdminReport {
+  id: string
+  reporter_id: string | null
+  reporter_name: string | null
+  reporter_email: string | null
+  target_type: string
+  target_id: string
+  /** Who or what was reported, resolved to something readable. */
+  target_label: string | null
+  reason: string | null
+  details: string | null
+  status: string
+  created_at: string
+  resolved_at: string | null
+}
+
+export interface AdminStats {
+  users: number
+  hosts: number
+  verified: number
+  listings: number
+  published: number
+  bookings: number
+  pending_bookings: number
+  confirmed_bookings: number
+  paid_bookings: number
+  pending_applications: number
+  pending_verifications: number
+  /** Requests to change an account's ID number, awaiting a decision. */
+  pending_id_changes: number
+  gross_paid: number
+  /** The platform's cut — guest price minus the host's raw price — summed over
+   *  bookings that were actually collected. Refunded rows drop out with PAID_SQL. */
+  commission_paid: number
+  /** The same cut on bookings still expected to be collected: live reservations
+   *  that have not been paid yet. Expected, not earned. */
+  commission_pending: number
+  /** F3/F4 — the "needs attention" counts behind the alert tiles and the alert centre. */
+  bookings_today: number
+  pending_listings: number
+  disputed_payments: number
+  /** Transfer screenshots waiting for an accept/reject. */
+  pending_payments: number
+  pending_resort_submissions: number
+  open_reports: number
+  /** Users with unreviewed content-guard blocks (F5) — the Moderation queue. */
+  flagged_users: number
+  /** Guest disputes still open or in review — the Disputes queue. */
+  open_disputes: number
+  /** When the oldest item in each queue arrived, so an alert can show how long it has waited. */
+  oldest_verification: string | null
+  oldest_id_change: string | null
+  oldest_application: string | null
+  oldest_listing: string | null
+  oldest_report: string | null
+  oldest_payment: string | null
+  oldest_flag: string | null
+  oldest_dispute: string | null
+}
+
+export interface AdminThreadMessage {
+  id: string
+  sender_id: string
+  sender_name: string | null
+  body: string
+  created_at: string
+}
+
+export interface AdminUserBooking {
+  id: string
+  reservation_code: string | null
+  listing_id: string | null
+  listing_title: string | null
+  status: string
+  payment_status: string
+  total_price: number
+  currency: string
+  check_in: string
+  check_out: string
+  created_at: string
+}
+
+export interface AdminUserConversation {
+  id: string
+  listing_id: string | null
+  listing_title: string | null
+  counterparty_id: string | null
+  counterparty_name: string | null
+  counterparty_email: string | null
+  message_count: number
+  last_message_at: string | null
+  /** Which side of the thread this user is on. */
+  viewer_role: 'guest' | 'host'
+}
+
+export interface AdminUserDetail {
+  user: AdminUserRow & {
+    phone: string | null
+    country: string | null
+    bio: string | null
+    avatar_url: string | null
+    role: string | null
+    host_type: string | null
+    company: string | null
+    referral_code: string | null
+  }
+  listings: AdminUserListing[]
+  bookings: AdminUserBooking[]
+  payments: AdminUserPayment[]
+  conversations: AdminUserConversation[]
+  documents: AdminUserDocument[]
+  stats: {
+    gross_paid: number
+    nights_booked: number
+    /** Booking-scoped mobile messages. Those threads have a different shape from
+     *  the web `conversations` above, so they're counted rather than merged. */
+    mobile_message_count: number
+    report_count: number
+  }
+}
+
+export interface AdminUserDocument {
+  kind: 'id_verification' | 'host_application'
+  id: string
+  status: string
+  submitted_at: string | null
+  reviewed_at: string | null
+  notes: string | null
+  /** Whether a document image is on file. The image itself is NOT returned — it's
+   *  reviewed on the Verifications screen, and a profile shouldn't ship megabytes
+   *  of inline base64 (or that much PII) on every open. */
+  has_document: boolean
+}
+
+export interface AdminUserListing {
+  id: string
+  title: string
+  is_published: boolean
+  approval_status: string
+  /** True when a block/removal took this listing down — so /ops can say WHY it's
+   *  hidden rather than leaving the operator guessing. */
+  unpublished_by_admin: boolean
+  price_per_night: number
+  currency: string
+  created_at: string
+  booking_count: number
+}
+
+export interface AdminUserPayment {
+  id: string
+  booking_id: string
+  reservation_code: string | null
+  listing_title: string | null
+  amount: number
+  status: string
+  submitted_at: string | null
+  reviewed_at: string | null
+  reject_reason: string | null
+}
+
+export interface AdminUserRow {
+  id: string
+  email: string
+  full_name: string | null
+  is_host: boolean
+  email_verified: boolean
+  verification_status: string
+  provider: string
+  push_platform: string | null
+  has_push: boolean
+  device_platforms: string | null
+  device_count: number
+  created_at: string
+  listing_count: number
+  booking_count: number
+  /** D3/D4 lifecycle — 'active' | 'blocked' | 'removed'. */
+  account_status: string
+  status_reason: string | null
+  status_changed_at: string | null
+  /** Free-text actor, `staff:<uuid>`. */
+  status_changed_by: string | null
+}
+
+export interface AdminVerificationRow {
+  id: string
+  user_id: string
+  email: string
+  full_name: string | null
+  id_number: string | null
+  status: string
+  /** Which documents are on file. The BYTES are deliberately absent — they come
+   *  from the audited /api/local/admin/documents endpoint, one explicit request at
+   *  a time. This queue used to ship every pending submission's three base64 photos
+   *  to anyone who opened the tab, with no record of who saw them. */
+  has_front: boolean
+  has_back: boolean
+  has_selfie: boolean
+  submitted_at: string
+  reviewed_at: string | null
+  reviewed_by: string | null
+  notes: string | null
+}
+
+export interface AppLinks {
+  ios: string | null
+  android: string | null
+}
+
+export interface AuditEntry {
+  id: string
+  at: string
+  staff_id: string | null
+  staff_email: string | null
+  action: string
+  target_type: string | null
+  target_id: string | null
+  detail: unknown
+  ip: string | null
+}
+
+const BOOKING_STATUSES = ['pending', 'confirmed', 'completed', 'rejected', 'cancelled'] as const
+
+/** Admin drives a reservation's lifecycle (pending → confirmed → completed, or
+ *  rejected/cancelled). Issues the reservation code on confirm/complete. */
+
+/** Guest price − host's raw price, for one booking. See bookingCommissionSql(). */
+const COMMISSION_AMOUNT_SQL = bookingCommissionSql()
+
+// bookings.total_price stores the host's RAW stay total. This projection exposes
+// only the COMMISSION-INCLUSIVE figure, because a booking response is read by the
+// guest and the raw price would hand them the platform's margin. A host's payout
+// is added explicitly by the host-only readers (see getHostBookings).
+
+/** All open payment disputes (latest proof still 'disputed'), for the admin queue. */
+export interface PendingProofRow {
+  booking_id: string
+  reservation_code: string | null
+  title: string | null
+  guest_id: string
+  guest_name: string | null
+  guest_email: string | null
+  host_id: string | null
+  total_price: number
+  amount: number
+  method: string | null
+  submitted_at: string
+  check_in: string
+  check_out: string
+}
+
+const STAFF_SELECT = `
+  SELECT a.id, a.email, a.full_name, a.role, a.is_active, a.last_login_at,
+         a.locked_until, a.failed_login_attempts, a.created_at,
+         c.email AS created_by_email,
+         COALESCE(array_agg(DISTINCT p.module) FILTER (WHERE p.module IS NOT NULL), '{}') AS modules,
+         (SELECT count(*)::int FROM staff_sessions s
+           WHERE s.staff_id = a.id AND s.revoked_at IS NULL AND s.expires_at > now()) AS active_sessions
+    FROM staff_accounts a
+    LEFT JOIN staff_accounts c ON c.id = a.created_by
+    LEFT JOIN staff_permissions p ON p.staff_id = a.id`
+export type StaffAccount = {
+  id: string
+  email: string
+  full_name: string
+  role: 'super_admin' | 'moderator'
+  is_active: boolean
+  last_login_at: string | null
+  locked_until: string | null
+  failed_login_attempts: number
+  created_at: string
+  created_by_email: string | null
+  modules: string[]
+  active_sessions: number
+}
+
+/** Thread metadata for the /ops profile — who with, which listing, how many
+ *  messages, last activity. Message BODIES are deliberately absent: reading them
+ *  goes through adminReadConversation, which the route audits. */
+export async function adminListUserConversations(userId: string): Promise<AdminUserConversation[]> {
+  if (!isUuid(userId)) return []
+  const { rows } = await pool.query(
+    `SELECT c.id, c.listing_id, l.title AS listing_title,
+            CASE WHEN c.guest_id = $1 THEN c.host_id ELSE c.guest_id END AS counterparty_id,
+            CASE WHEN c.guest_id = $1 THEN hu.full_name ELSE gu.full_name END AS counterparty_name,
+            CASE WHEN c.guest_id = $1 THEN hu.email ELSE gu.email END AS counterparty_email,
+            (SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id = c.id)::int AS message_count,
+            to_char(c.last_message_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last_message_at,
+            CASE WHEN c.host_id = $1 THEN 'host' ELSE 'guest' END AS viewer_role
+       FROM conversations c
+       LEFT JOIN listings l ON l.id = c.listing_id
+       LEFT JOIN users gu ON gu.id = c.guest_id
+       LEFT JOIN users hu ON hu.id = c.host_id
+      WHERE c.guest_id = $1 OR c.host_id = $1
+      ORDER BY c.last_message_at DESC NULLS LAST
+      LIMIT 200`,
+    [userId],
+  )
+  return rows as AdminUserConversation[]
+}
+
+export async function getStaffAccount(id: string): Promise<StaffAccount | null> {
+  if (!isUuid(id)) return null
+  const { rows } = await pool.query<StaffAccount>(
+    `${STAFF_SELECT} WHERE a.id = $1 GROUP BY a.id, c.email`,
+    [id]
+  )
+  return rows[0] ?? null
+}
+
+// ---- /ops + wishlists, ported from quickin-frontend 21 Aug 2026 ----
+
+/** Partial update of the editable profile fields. Role is intentionally included so
+ *  a super admin can promote/demote, but callers must run the last-super-admin guard. */
+export async function updateStaffAccount(
+  id: string,
+  fields: { fullName?: string; role?: 'super_admin' | 'moderator'; isActive?: boolean }
+): Promise<StaffAccount | null> {
+  if (!isUuid(id)) return null
+  const { rowCount } = await pool.query(
+    `UPDATE staff_accounts
+        SET full_name = COALESCE($2, full_name),
+            role      = COALESCE($3, role),
+            is_active = COALESCE($4, is_active),
+            updated_at = now()
+      WHERE id = $1`,
+    [id, fields.fullName?.trim().slice(0, 120) ?? null, fields.role ?? null,
+     fields.isActive === undefined ? null : fields.isActive]
+  )
+  if (!rowCount) return null
+  return getStaffAccount(id)
+}
+
+/** Replace a moderator's module set wholesale (the checkbox grid posts the full list).
+ *  Takes effect on the moderator's next request — no re-login needed, since
+ *  getStaffFromRequest re-reads permissions every time. */
+export async function setStaffModules(id: string, modules: string[], grantedBy: string | null): Promise<void> {
+  if (!isUuid(id)) throw new Error('Invalid id')
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(`DELETE FROM staff_permissions WHERE staff_id = $1 AND NOT (module = ANY($2::text[]))`, [id, modules])
+    if (modules.length) {
+      await client.query(
+        `INSERT INTO staff_permissions (staff_id, module, granted_by)
+         SELECT $1, m, $2 FROM unnest($3::text[]) AS m
+         ON CONFLICT (staff_id, module) DO NOTHING`,
+        [id, grantedBy && isUuid(grantedBy) ? grantedBy : null, modules]
+      )
+    }
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+export async function deleteStaffAccount(id: string): Promise<boolean> {
+  if (!isUuid(id)) return false
+  const { rowCount } = await pool.query(`DELETE FROM staff_accounts WHERE id = $1`, [id])
+  return (rowCount ?? 0) > 0
+}
+
+/** How many super admins could still sign in — the last-one-standing guard. */
+export async function countActiveSuperAdmins(excludeId?: string): Promise<number> {
+  const { rows } = await pool.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM staff_accounts
+      WHERE role = 'super_admin' AND is_active AND ($1::uuid IS NULL OR id <> $1::uuid)`,
+    [excludeId ?? null]
+  )
+  return rows[0]?.n ?? 0
+}
+
+/** The user's saved listings (same row shape as getListings, incl. a primary image_url). */
+export async function getWishlistListings(userId: string): Promise<Listing[]> {
+  if (!isUuid(userId)) return []
+  const { rows } = await pool.query(
+    `SELECT ${LISTING_COLS},
+            (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image_url
+       FROM saved_listings w JOIN listings l ON l.id = w.listing_id
+      WHERE w.user_id = $1
+      ORDER BY w.created_at DESC`,
+    [userId]
+  )
+  return rows as Listing[]
+}
+
+/** Toggle a listing in the user's wishlist. Insert → {saved:true}; existing → delete → {saved:false}. */
+export async function toggleWishlist(userId: string, listingId: string): Promise<{ saved: boolean }> {
+  if (!isUuid(userId) || !isUuid(listingId)) throw new Error('Invalid id')
+  const del = await pool.query(
+    `DELETE FROM saved_listings WHERE user_id = $1 AND listing_id = $2`,
+    [userId, listingId]
+  )
+  if (del.rowCount && del.rowCount > 0) return { saved: false }
+  await pool.query(
+    `INSERT INTO saved_listings (user_id, listing_id) VALUES ($1, $2)
+     ON CONFLICT (user_id, listing_id) DO NOTHING`,
+    [userId, listingId]
+  )
+  return { saved: true }
 }

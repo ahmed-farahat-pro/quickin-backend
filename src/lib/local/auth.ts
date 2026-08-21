@@ -2,6 +2,7 @@ import { scryptSync, randomBytes, timingSafeEqual, createHmac, randomInt } from 
 import { NextResponse } from 'next/server'
 import { pool } from './pool'
 import { blockedLoginBody, BLOCKED_STATUS_CODE, isActiveStatus } from './account-status-core'
+import { pickLoginRow as pickLoginRowCore, blockedRowAmong as blockedRowAmongCore, LOGIN_ROW_ORDER_SQL } from './login-row-core'
 import { guardContent } from './moderation'
 
 // Local auth — no Supabase. Postgres via node-postgres (Vercel/Neon-ready),
@@ -123,6 +124,46 @@ export async function getUserRowByEmail(email: string): Promise<UserRow | null> 
     [email]
   )
   return rows[0] ?? null
+}
+
+/** Every row for an address, most-canonical first. `migrate-split-accounts.mjs` keyed
+ *  uniqueness on (lower(email), role) instead of email, so one address can own several
+ *  rows and "the user with this email" is genuinely ambiguous. Ordered so callers that
+ *  want a single row get a STABLE one rather than whatever the heap returns. */
+export async function getUserRowsByEmail(email: string): Promise<UserRow[]> {
+  const { rows } = await pool.query(
+    `SELECT id, email, password_hash, full_name, provider, avatar_url, role, email_verified,
+            COALESCE(account_status, 'active') AS account_status
+     FROM users WHERE lower(email) = lower($1)
+     ${LOGIN_ROW_ORDER_SQL}`,
+    [email]
+  )
+  return rows
+}
+
+/**
+ * Resolve the account an email+password pair actually belongs to.
+ *
+ * Sign-in must NOT pick one row and test the password only against that one. Because an
+ * address can own several rows (see getUserRowsByEmail), picking first and verifying
+ * second means the password is checked against a row that may not be the one holding it
+ * — and the web and mobile APIs disambiguated differently, so identical credentials
+ * signed in on quickin-frontend and were rejected with "Invalid email or password" by
+ * this project, i.e. only on iOS/Android. Verify against every row instead; the
+ * credentials decide, so both clients now agree no matter how the duplicates are laid out.
+ *
+ * Falls back to the canonical row when nothing matches, so the wrong-password path and
+ * its 401 are unchanged.
+ */
+export function pickLoginRow(rows: UserRow[], password: string): UserRow | null {
+  return pickLoginRowCore(rows, r => verifyPassword(password, r.password_hash))
+}
+
+/** The row that decides whether an address may sign in at all. /ops suspends a single
+ *  row by id, so with duplicates present a block could otherwise be sidestepped by
+ *  signing in with a sibling row's password — refuse the address as a whole. */
+export function blockedRowAmong(rows: UserRow[]): UserRow | null {
+  return blockedRowAmongCore(rows, r => isActiveStatus(r.account_status))
 }
 
 /**
@@ -466,3 +507,56 @@ export async function upsertSocialUser(args: {
   if (!rows[0]) throw new Error('Failed to upsert social user')
   return rows[0] as User
 }
+
+
+// ---- /ops additions, ported from quickin-frontend 21 Aug 2026 ----
+
+/** Best-effort client IP from proxy headers (Vercel/Next). */
+export function clientIp(req: Request): string {
+  const xff = req.headers.get('x-forwarded-for')
+  if (xff) return xff.split(',')[0].trim()
+  return req.headers.get('x-real-ip') || 'local'
+}
+
+/**
+ * Resolve a user's host state from the database — the single source of truth the
+ * clients read on every launch (never a cached local flag).
+ *
+ * `approved` follows `users.is_host`, NOT the application row, so pre-existing
+ * hosts (is_host=true with no application) keep working. One tolerant query: on a
+ * pre-migration DB (no host_type / host_applications) it degrades to is_host alone
+ * rather than failing the session.
+ */
+
+/**
+ * Returns null when the action is allowed, or the seconds the caller must wait
+ * once [key] exceeds [max] hits within [windowMs]. Best-effort, per-process.
+ */
+export function rateLimit(key: string, max: number, windowMs: number): number | null {
+  const now = Date.now()
+  const hit = _buckets.get(key)
+  if (!hit || now >= hit.resetAt) {
+    _buckets.set(key, { count: 1, resetAt: now + windowMs })
+    return null
+  }
+  if (hit.count >= max) return Math.ceil((hit.resetAt - now) / 1000)
+  hit.count++
+  return null
+}
+
+/** Replace a user's password with a fresh scrypt hash. */
+
+/** Replace a user's password with a fresh scrypt hash. */
+export async function updatePassword(userId: string, newPassword: string): Promise<void> {
+  const hash = hashPassword(newPassword)
+  await pool.query(`UPDATE users SET password_hash = $2 WHERE id = $1`, [userId, hash])
+}
+
+const _buckets = new Map<string, Hit>()
+
+/**
+ * Returns null when the action is allowed, or the seconds the caller must wait
+ * once [key] exceeds [max] hits within [windowMs]. Best-effort, per-process.
+ */
+
+type Hit = { count: number; resetAt: number }

@@ -25,7 +25,7 @@ export async function submitVerification(userId: string, doc: string): Promise<V
   const { rows } = await pool.query(
     `UPDATE users SET verification_status = 'pending', verification_doc = $2
       WHERE id = $1
-      RETURNING verification_status AS status, to_char(verified_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS verified_at`,
+      RETURNING verification_status AS status, to_char(verified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS verified_at`,
     [userId, d]
   )
   if (!rows[0]) throw new Error('User not found')
@@ -37,7 +37,7 @@ export async function getVerificationStatus(userId: string): Promise<Verificatio
   if (!isUuid(userId)) return { status: 'unverified', verified_at: null }
   const { rows } = await pool.query(
     `SELECT COALESCE(verification_status, 'unverified') AS status,
-            to_char(verified_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS verified_at
+            to_char(verified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS verified_at
        FROM users WHERE id = $1`,
     [userId]
   )
@@ -52,7 +52,7 @@ export async function setVerification(userId: string, approve: boolean): Promise
     `UPDATE users SET verification_status = $2,
             verified_at = CASE WHEN $2 = 'verified' THEN now() ELSE NULL END
       WHERE id = $1
-      RETURNING verification_status AS status, to_char(verified_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS verified_at`,
+      RETURNING verification_status AS status, to_char(verified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS verified_at`,
     [userId, status]
   )
   if (!rows[0]) return null
@@ -203,8 +203,8 @@ export async function listReports(status?: string): Promise<Report[]> {
   const { rows } = await pool.query(
     `SELECT r.id, r.reporter_id, u.full_name AS reporter_name, r.target_type, r.target_id,
             r.reason, r.details, r.status,
-            to_char(r.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
-            to_char(r.resolved_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS resolved_at
+            to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+            to_char(r.resolved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS resolved_at
        FROM reports r JOIN users u ON u.id = r.reporter_id
       ${filterable ? 'WHERE r.status = $1' : ''}
       ORDER BY r.created_at DESC`,

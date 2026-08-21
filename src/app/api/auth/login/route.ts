@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getUserRowByEmail, verifyPassword, signToken, blockedAccountResponse } from '@/lib/local/auth'
+import { getUserRowsByEmail, pickLoginRow, blockedRowAmong, verifyPassword, signToken, blockedAccountResponse } from '@/lib/local/auth'
 import { withHostState, recordLogin } from '@/lib/local/db'
 
 export const dynamic = 'force-dynamic'
@@ -55,7 +55,11 @@ export async function POST(req: Request) {
     // ---- Regular email/password user ----
     // ONE unified account per email — no guest/host split (matches the web). Host
     // capability is a flag on the same account, gained via "become a host".
-    const row = await getUserRowByEmail(ident)
+    // Verify against EVERY row for this address, not one pre-picked row — an email can
+    // own more than one (see getUserRowsByEmail). Picking first and verifying second is
+    // what made these exact credentials work on the web and fail here, on iOS/Android.
+    const rows = await getUserRowsByEmail(ident)
+    const row = pickLoginRow(rows, String(password))
     if (!row || !verifyPassword(String(password), row.password_hash)) {
       return NextResponse.json(
         { error: 'Invalid email or password' },
@@ -65,7 +69,9 @@ export async function POST(req: Request) {
     // Blocked / removed → stop here. AFTER the password check, so this never tells a
     // stranger which emails are suspended; BEFORE the email_verified branch, so a
     // blocked account is not routed to the OTP screen it could never get past.
-    const blocked = blockedAccountResponse(row.account_status, CORS)
+    // Checked across ALL rows for the address: a duplicate row left active would
+    // otherwise hand back a token for an account /ops has suspended.
+    const blocked = blockedAccountResponse(blockedRowAmong(rows)?.account_status, CORS)
     if (blocked) return blocked
     if (!row.email_verified) {
       return NextResponse.json(
