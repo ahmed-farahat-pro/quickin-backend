@@ -24,20 +24,19 @@ npm run dev        # API at http://localhost:4000
 | PATCH | `/api/local/listings/[id]` | The host edits their listing. Carries the same **`pin_warning`** field, for the same reason — a pin can be dragged into the wrong country from the editor too |
 | GET  | `/api/local/listings/[id]/calendar` | The listing's day-by-day calendar, `?start=&end=` (**inclusive** of both ends, ≤400 days; defaults to today → +92d). `{ listing_id, currency, commission_rate, base_price, start, end, days[] }` where each day is `{ date, price, source, status }`. `source` is which rung priced the night — `custom` \| `weekend` \| `monthly` \| `base`; `status` is `available` \| `blocked` \| `booked`. **Public, but money-aware:** the listing's host gets their RAW rates plus a `guest_price` companion and the block `note`; everyone else gets only the commission-inclusive figure |
 | PUT  | `/api/local/listings/[id]/calendar` | The host prices or opens/closes a set of days: `{ dates: ["YYYY-MM-DD" \| {start,end}], price?, blocked?, note? }` → `{ updated, skipped, calendar }`. `price: <n>` pins that nightly rate, `price: null` **resets** those days to the listing's normal pricing (deletes the rows), and omitting `price` leaves prices alone; `blocked: true/false` closes or opens them. Days held by a reservation come back in **`skipped`** rather than failing the request. 401 unsigned, 403 not the host, 400 on a bad date or price |
-| GET  | `/api/local/profile/id-change` | The signed-in user's ID number and the state of any request to change it → `{ current, request, can_request }` |
-| POST | `/api/local/profile/id-change` | File a change request: `{ requested_value, doc_type, front, back?, reason? }`. **`front` is required** — without a document the reviewer has nothing to check the number against. Resubmitting replaces a request still awaiting review |
+| GET  | `/api/local/profile/id-change` | The signed-in user's ID number and the state of any request to change it → `{ current, request, can_request, available }`. The request half **degrades**: if `id_change_requests` has not been migrated onto this database the read still answers with the number on file, `request: null` and `available: false`, rather than taking the Edit Profile row down with it |
+| POST | `/api/local/profile/id-change` | File a change request: `{ requested_value, doc_type, front, back?, reason? }`. **`front` is required** — without a document the reviewer has nothing to check the number against. Resubmitting replaces a request still awaiting review. **503 `{ code: 'id_change_unavailable' }`** when the table has not been migrated onto this database — not a 500, because nothing about the request is wrong and "try again later" is true |
 | DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
 | POST | `/api/local/bookings` | Create a reservation (auth required) |
 | GET  | `/api/local/bookings` | The signed-in user's reservations |
 | POST | `/api/auth/signup` | Register (email + password) |
 | POST | `/api/auth/login` | Sign in (email + password) |
-| POST | `/api/auth/social` | Demo social sign-in (`google` / `apple`) |
+| POST | `/api/auth/social` | Demo social sign-in (`google`) |
 | POST | `/api/auth/google` | Google sign-in — verifies a Google ID token against Google's JWKS |
-| POST | `/api/auth/apple` | Sign in with Apple — verifies an identity token against Apple's JWKS |
 | GET  | `/api/auth/me` | Resolve the current user (Bearer token or `qk_token` cookie) |
 | —    | *(all auth routes above)* | A **blocked or removed** account is refused with **403 `{ error, accountStatus }`** — deliberately **without** `needsVerification`, so the apps show the message instead of routing to the OTP screen. See Account status below |
 | DELETE | `/api/local/admin/users/:id` | **410 Gone** — hard delete is retired. Block or remove the account in `/ops` → Users |
-| GET  | `/api/auth/logout` | Clear the auth cookie |
+| GET  | `/api/auth/logout` | Clear the auth cookie, then **302 to the relative `/explore`** (relative on purpose — the browser reaches this through the web app’s `/api/*` rewrite, so an absolute redirect built from `req.url` would point at this backend, which serves no pages) |
 | GET  | `/api/local/payment-config` | Every destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload, instapay_enabled, bank:{…}, available_methods}` |
 | GET  | `/api/local/admin/settings/instapay` | Read the same config for editing (both methods). Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/instapay` | Update the Instapay half — `{enabled?, instapay_handle?, instapay_link?, instapay_qr_image?, instructions?}`. Each field is optional: omit to leave untouched, send `""` to clear. `400` on an invalid link or QR |
@@ -398,8 +397,8 @@ Three tiers, cheapest first:
    the policy**: a domain missing from it is *not* refused, which is exactly what
    keeps company addresses (`ahmed@orascom.com`) and universities (`@aucegypt.edu`)
    working. Adding to it is safe; deleting from it is not.
-   `privaterelay.appleid.com` is load-bearing — Sign in with Apple hands us that
-   domain whenever the user hides their real address.
+   `privaterelay.appleid.com` stays on the list even though Sign in with Apple is
+   gone: accounts created through it still carry a relay address.
 3. **Root zone, then blocklist.** Everything else must have a really-delegated TLD
    and must not be a known disposable domain (or a subdomain of one — a parent-domain
    walk, so `x@sub.mailinator.com` is refused too).
@@ -735,7 +734,6 @@ cases. Run it after touching either rung.
 | `DATABASE_URL` | yes | Postgres connection string. Falls back to `postgresql://ahmedfarahat@127.0.0.1:5432/quickin_local` for local dev. Managed Postgres (Neon/Vercel/RDS) uses TLS automatically. |
 | `AUTH_SECRET` | yes (prod) | Secret used to HMAC-sign auth tokens. Defaults to a dev secret — set a real one in production. |
 | `GOOGLE_CLIENT_ID` | optional | Enables `/api/auth/google` (Google ID-token audience). |
-| `APPLE_CLIENT_ID` | optional | Enables `/api/auth/apple` (Apple Services/bundle id). |
 
 ## Run the whole stack locally
 
@@ -819,8 +817,8 @@ imported by a test at all**. The rule that works around it:
 `src/lib/local/resort-core.ts`, `payment-config-core.ts`, `contentguard.ts`,
 `moderation-core.ts`, `disputes-core.ts`, `ranking-core.ts`, `phone-core.ts`,
 `name-policy.ts`, `password-policy.ts`, `email-core.ts`, `listing-geo-policy.ts`,
-`listing-title-policy.ts`, `listing-review-note-core.ts` and `account-status-core.ts`
-are the working examples.
+`listing-title-policy.ts`, `listing-review-note-core.ts`, `profile-core.ts` and
+`account-status-core.ts` are the working examples.
 
 `name-policy.test.mjs` carries the signup name rule in both directions: that `12345`,
 `٠١٢٣٤`, `0100`, `Layla2`, `j.doe`, an emoji and `-----` are refused, that `Ma7moud`
@@ -845,7 +843,8 @@ guard signup (`type="email"` and a shape regex) pass it. But the larger half of 
 suite is the mirror image, and it is the half to keep growing: the ordinary addresses
 a hand-written allowlist would have quietly locked out. `.eg`, `.com.eg`, `.co.uk`
 and new gTLDs; a host on their company domain; a student on `@aucegypt.edu`; and
-`privaterelay.appleid.com`, which our own Sign in with Apple depends on. A domain
+`privaterelay.appleid.com`, still carried by accounts made back when Sign in with
+Apple existed. A domain
 rule that turns away a paying guest is the worse failure, and unlike a bounced OTP it
 generates no support ticket — they just leave.
 
@@ -895,6 +894,10 @@ exemption, so check-in details belong in the stay guide, not in chat.
 | Reviews (`POST /api/local/reviews`) | `createReview` (reviews.ts) |
 | Listing title + description (`POST/PATCH /api/local/listings`) | `createListing`, `updateListingDetails` (db.ts) |
 | Profile name + bio (`PATCH /api/local/profile`) | `updateProfile` (auth.ts) |
+
+`users.age` is on the same screen but is **not** guarded here and cannot be: it is an
+integer column, so there is no text to read. It is held to a range instead — see *An
+age is a number, not a channel*.
 
 `users.phone` is deliberately **exempt** — it is the user's own number and is only
 ever returned to themselves, never on a listing or a booking.
@@ -960,6 +963,49 @@ Neon rows, so `contentguard.ts` is duplicated byte-for-byte and guarded by
 drifted, the weaker one would become the way around the policy for everyone. Edit one,
 copy it over the other verbatim, and add cases to `test/unit/contentguard.test.mjs` —
 the false-positive half of that file matters as much as the block half.
+
+## An age is a number, not a channel
+
+`users.age` is the field on Edit profile between the name and the bio, and it was the
+one box on that screen the contact guard could not read. It is an **integer column**,
+so by the time a value reaches storage there is no text left for `contentguard` to
+look at — and `PATCH /api/local/profile` reached the column through `Number()`, which
+reads `01012345678` as the age `1012345678`. A phone number, rendered on a profile,
+through the gap between the two fields either side of it. Reported against iOS, where
+the field additionally had no input filter at all; Android has capped the box at three
+digits since it shipped, which is why the same tap did nothing there.
+
+`src/lib/local/profile-core.ts` decides now — `checkAge` before the write, `parseAge`
+instead of `Number()` — and it is **byte-identical to the web's copy**
+(`scripts/check-profile-core-parity.mjs`, part of `npm run check`), because both repos
+edit the same `users` row and a rule that only holds on one door is not a rule.
+
+**The rule.** A whole number, 1–3 digits, `MIN_AGE` 13 to `MAX_AGE` 120. Blank stays
+blank — the age is optional, and clearing it is something a person is allowed to do.
+The parse is deliberately stricter than `Number()`, which also accepts `3e2` (300),
+`0x22` (34) and `34.5`; each of those either passes a range check as an age nobody is
+or stores a number the user never typed. A refusal is the only honest answer to a
+phone number — storing the first three digits of it would put `101` on the profile of
+someone who typed no such thing.
+
+The bounds are a **plausibility check, not an eligibility rule**. Whether an account
+has to be 18 to book is a decision for the booking door, where it can be held against
+an ID document, not for a number a user types about themselves.
+
+**The answer.** `400` with `{ error, field: 'age', ageProblem: { code } }` — the same
+shape `full_name` refusals use, so a client can localize from the code
+(`notANumber` / `tooYoung` / `tooOld`) instead of re-deciding the rule. iOS's
+`AgeRules.swift` is the Swift twin: it filters the field to three ASCII digits as they
+are typed (folding `٣٤` from an Arabic number pad), shows the sentence under the field,
+and refuses at Save, so the answer arrives without a round trip. A value stored before
+this rule existed is shown as stored and explained on Save, never silently truncated.
+
+Covered by `test/unit/profile-core.test.mjs`, including the phone forms — plain,
+`+20`, Arabic-Indic, and separated — that used to be storable.
+
+**What is already stored.** Refusing new ones does not remove the ones that got in,
+and they are still rendered. `scripts/cleanup-implausible-ages.mjs` reports them and,
+with `--apply`, clears them to NULL. Run it after the deploy, not before.
 
 ## Every blocked attempt is recorded
 
@@ -1067,7 +1113,7 @@ which bypassed the staff module system entirely. It now uses
 `requireStaff(req, 'applications')` like every other admin route.
 
 Sign-ins are recorded to `user_logins` from every token-minting path here (login,
-verify-otp, social, google, apple, reset-password) so the web `/ops` activity feed sees
+verify-otp, social, google, reset-password) so the web `/ops` activity feed sees
 mobile sign-ins too. Best-effort: a logging failure never blocks a sign-in.
 
 ## Who confirms a payment
@@ -1180,7 +1226,7 @@ web project and only **read** here. Two things to know when touching auth:
    hardcoded `sub === 'admin'` token is checked *above* it and is never lockable.
 2. **Routes that mint a token run before there is a session** and each need their own
    `blockedAccountResponse` call: `login`, `verify-otp`, `resend-otp`, `signup`,
-   `forgot-password`, `social`, `google`, `apple`. The social ones must check
+   `forgot-password`, `social`, `google`. The social ones must check
    **before** `upsertSocialUser`, which writes the row and marks the email verified —
    otherwise a removed user reactivates themselves by tapping "Sign in with Google".
 
@@ -1414,10 +1460,11 @@ the list of record. Recent additions:
 | `migrate-disputes.mjs` | `disputes` (a guest's issue with a stay: category, description, photos, four-state status, resolution) and `dispute_events` (the filing plus every status change, with actor and note) — behind `/ops` → Guest disputes. Additive |
 | `migrate-payout-methods.mjs` | `host_payout_methods` — one row per host (`UNIQUE user_id`) holding the single destination they chose for their earnings (`bank_name`/`iban`/`account_number`/`swift_bic`/`branch` for a bank account). Also **reports** how many approved hosts have not added one. Additive, and the read path degrades to "none set" if it has not run, so it is safe to apply well ahead of the deploy. Re-running it converges a database built by the first version of the script, which had a `credit_card` method with an `expiry` — that version never reached production, so there is nothing to back-fill |
 
-| `migrate-id-change-requests.mjs` | `id_change_requests` — a user's request to change the ID number on their profile, with the document photo backing it, one open request per user (partial unique index). Behind `/ops` → ID verifications, and the only thing that writes `users.id_document` now that `PATCH /api/local/profile` refuses it. Also **reports** how many accounts already carry a self-declared number that nobody ever reviewed. Additive, and the reads degrade to an empty queue if it has not run, so it is safe to apply well ahead of the deploy |
+| `migrate-id-change-requests.mjs` | `id_change_requests` — a user's request to change the ID number on their profile, with the document photo backing it, one open request per user (partial unique index). Behind `/ops` → ID verifications, and the only thing that writes `users.id_document` now that `PATCH /api/local/profile` refuses it. Also **reports** how many accounts already carry a self-declared number that nobody ever reviewed. Additive, and the reads degrade to an empty queue if it has not run, so it is safe to apply well ahead of the deploy. Until it runs the mobile submit answers **503 `id_change_unavailable`** — it used to answer a bare 500 reading "Could not submit your request", which QA and users both read as the request being at fault |
 | `migrate-listing-review-note.mjs` | `listings.review_note` — the operator's reason for rejecting a listing, which used to exist only inside a notification body and is now shown to the host on the web dashboard, in the listing editor and on both mobile host dashboards. Nullable, no backfill: NULL means "no reason recorded", the honest answer both for an unexplained rejection (the note is optional) and for every listing rejected before the column existed. Also **reports** how many rejected listings carry no reason. **Unlike most additive columns this one must be applied BEFORE the deploy** — the host projection selects it, so a database without it fails every host read |
 | `migrate-date-prices.mjs` | `listing_date_prices` — one row per (listing, day) holding the RAW nightly rate a host pinned on their calendar, `PRIMARY KEY (listing_id, date)` so setting a day twice is an upsert rather than a second row whose precedence would depend on row order. The **absence** of a row is what "this day follows the listing's normal pricing" means, which is why "reset to default" deletes rather than writing the base price. Additive, and the ladder falls through to weekend/month/base if it has not run — but it **must be applied before the deploy**, since the per-night stay sum joins it on every quote and booking |
 | `dedupe-user-emails.mjs` | **Data repair, not a schema change — and the only script here that is destructive, so it reports by default and writes nothing without `--apply`.** Merges `users` rows that share an email (legal since `migrate-split-accounts.mjs` keyed uniqueness on `(lower(email), role)`), re-pointing every referencing row onto one keeper — referencing tables are read from the catalog, not hardcoded, so a table added later is not orphaned. The keeper is the row with the most linked data, then verified/active/has-a-password, then oldest. It **warns** when a discarded row holds a different password: login currently accepts either, so after the merge only the keeper's works. `--restore-unique` then re-creates `UNIQUE (lower(email))` and drops `users_email_role_uidx` — refused while any duplicate remains. Run the report against Neon before deciding anything |
+| `cleanup-implausible-ages.mjs` | **Data repair, not a schema change**, and like `dedupe-user-emails.mjs` it reports by default and writes nothing without `--apply`. Clears `users.age` values outside 13–120 — the phone numbers `PATCH /api/local/profile` used to store as ages before it checked the range (see *An age is a number, not a channel*). Sets them to NULL rather than to a guess: the age is optional, so none is honest and an invented one is not. Run it **after** the deploy — before, and the route would let a new one straight back in |
 | `migrate-ranking-indexes.mjs` | Two indexes for the search ranking — `reviews(listing_id) INCLUDE (rating, created_at)` and `bookings(listing_id, status, check_out)`. **Pure performance, no schema change:** the ranking is correct without it, so the usual order does not apply and it can be run before or after the deploy |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The

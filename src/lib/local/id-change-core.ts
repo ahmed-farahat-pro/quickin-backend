@@ -25,12 +25,12 @@
 // The route passes the already-normalized doc type in. db.ts imports the core,
 // never the reverse. See CLAUDE.md → "Standing requirement — docs and tests".
 //
-// KEEP IN SYNC — quickin-backend and quickin-frontend each hold a copy and both
-// write the same Neon rows: mobile submits through the backend, /ops decides through
-// the frontend. If they disagreed on what a valid number is, a request accepted on
-// one side could be un-reviewable on the other.
-// scripts/check-id-change-core-parity.mjs fails if they drift, so edit one copy and
-// paste it over the other verbatim.
+// NO LONGER MIRRORED. This used to be one of the files quickin-frontend held a
+// byte-identical copy of, because /ops decided requests through its own API. That API
+// and its db client were deleted on 2026-08-21 — the web app now calls this backend
+// for the queue as well — so there is one copy, here, and no parity script. Both
+// halves of the decision validate through this module either way, which is what the
+// mirroring existed to guarantee.
 
 /** `id_change_requests.status`. A row is created pending and decided exactly once. */
 export const ID_CHANGE_STATUSES = ['pending', 'approved', 'rejected'] as const
@@ -69,6 +69,47 @@ export class IdChangeError extends Error {
 /** Cross-realm-safe check (routes may see an error thrown in another bundle). */
 export function isIdChangeError(e: unknown): e is IdChangeError {
   return e instanceof Error && e.name === 'IdChangeError'
+}
+
+/**
+ * Thrown when the queue has nowhere to write — `id_change_requests` does not exist on
+ * the database this deployment is talking to, because the migration has not been run
+ * there yet.
+ *
+ * This is NOT the same failure as a bug, and the difference matters to the person
+ * holding the phone. A generic 500 tells them "could not submit your request", which
+ * reads as *your* request being wrong, so they retype the number and try again forever.
+ * Routes answer 503 with this message instead: nothing about the request is wrong, and
+ * trying later is advice that will actually come true.
+ */
+export class IdChangeUnavailableError extends Error {
+  constructor(
+    message = 'ID change requests are temporarily unavailable. Please try again later.'
+  ) {
+    super(message)
+    this.name = 'IdChangeUnavailableError'
+  }
+}
+
+/** Cross-realm-safe check, as with isIdChangeError. */
+export function isIdChangeUnavailableError(e: unknown): e is IdChangeUnavailableError {
+  return e instanceof Error && e.name === 'IdChangeUnavailableError'
+}
+
+/**
+ * Whether a database error means "this relation/column is not on this database":
+ * Postgres 42P01 `undefined_table` and 42703 `undefined_column`.
+ *
+ * Matching on the code and nothing else is deliberate. The alternative the /ops
+ * readers use — a bare `catch {}` around the query — also swallows connection
+ * failures, syntax errors and permission problems, so a genuinely broken query looks
+ * exactly like an un-migrated database and no one ever finds out. Every other error
+ * must keep travelling.
+ */
+export function isMissingRelationError(e: unknown): boolean {
+  if (typeof e !== 'object' || e === null) return false
+  const code = (e as { code?: unknown }).code
+  return code === '42P01' || code === '42703'
 }
 
 /**

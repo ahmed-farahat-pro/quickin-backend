@@ -3,6 +3,7 @@ import { getUserFromRequest, getFullProfile, updateProfile } from '@/lib/local/a
 import { isContactBlockedError } from '@/lib/local/contentguard'
 import { canonicalDocumentNumber } from '@/lib/local/id-change-core'
 import { checkName, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
+import { ageProblemMessage, checkAge, parseAge } from '@/lib/local/profile-core'
 
 // Profile of the signed-in user.
 //   GET   /api/local/profile           → { id, email, full_name, role, age, id_document, phone, … }
@@ -106,10 +107,28 @@ export async function PATCH(req: Request) {
       fullName = name
     }
 
+    // The age is a number in a plausible range, decided here and not only in the
+    // apps. It reached the database through `Number()`, which reads `01012345678`
+    // as the age 1012345678 — a phone number stored in a field that renders as
+    // free text on a profile, which is exactly what `contentguard` keeps out of
+    // the name and the bio either side of it. The guard cannot see it (the column
+    // is an integer, and the digits are not text by the time they arrive), so the
+    // range is what closes that door. iOS's `AgeRules` and Android's input filter
+    // say the same thing at the field; this is what makes it true of every client.
     const ageRaw = b.age ?? b.Age
+    const ageProblem = checkAge(ageRaw)
+    if (ageProblem) {
+      return NextResponse.json(
+        { error: ageProblemMessage(ageProblem), field: 'age', ageProblem },
+        { status: 400, headers: CORS },
+      )
+    }
+
     const updated = await updateProfile(user.id, {
       fullName,
-      age: ageRaw === '' || ageRaw == null ? null : Number(ageRaw),
+      // Blank stays null — `updateProfile` writes with COALESCE, so a save that
+      // carries no age leaves the column alone, as it always has.
+      age: parseAge(ageRaw),
       phone: b.phone ?? null,
       bio: typeof b.bio === 'string' ? b.bio : null,
       avatarUrl: b.avatar_url ?? b.avatarUrl ?? null,

@@ -14,7 +14,7 @@ The **web** UI lives in a separate repo (`quickin-master` → deployed as `quick
 
 ## Layout
 
-- `src/app/api/auth/*` — signup, login, verify-otp, resend-otp, forgot/reset-password, google, apple, social, me, logout, **smtp-status** (a non-secret SMTP probe).
+- `src/app/api/auth/*` — signup, login, verify-otp, resend-otp, forgot/reset-password, google, social, me, logout, **smtp-status** (a non-secret SMTP probe).
 - `src/app/api/mail/send-otp` — the relay the web calls (secret-gated).
 - `src/app/api/local/*` — app data (listings, bookings, host/*, admin/*, services, notifications, …).
 - `src/lib/local/db.ts` — SQL (node-postgres). `src/lib/local/auth.ts` — users/OTP/token. `src/lib/local/mailer.ts` — nodemailer + templates (`sendOtpEmail`, `sendNotificationEmail`, `smtpConfigured`, `smtpDiagnostics`).
@@ -44,7 +44,7 @@ This backend still uses the **older dual `(email, role)` account model**: `getUs
 
 ## Env (Vercel, Production)
 
-`SMTP_HOST/PORT/USER/PASS/FROM` (mail.privateemail.com:465), `MAIL_RELAY_SECRET` (must match quickin-frontend), `DATABASE_URL` (shared Neon), `ADMIN_USERNAME/PASSWORD`, `OPENAI_API_KEY`, Apple/Google client IDs, `PASS_*` (wallet). Env values are encrypted — set via `vercel env add`, never paste `vercel env pull` ciphertext back as a value.
+`SMTP_HOST/PORT/USER/PASS/FROM` (mail.privateemail.com:465), `MAIL_RELAY_SECRET` (must match quickin-frontend), `DATABASE_URL` (shared Neon), `ADMIN_USERNAME/PASSWORD`, `OPENAI_API_KEY`, the Google client ID, `PASS_*` (wallet). Env values are encrypted — set via `vercel env add`, never paste `vercel env pull` ciphertext back as a value.
 
 ## Deploy
 

@@ -233,9 +233,9 @@ const DISPOSABLE_DOMAINS = new Set([
 // universities (`@aucegypt.edu`) and small providers working. An omission
 // therefore costs nothing — never "tighten" this by deleting entries.
 //
-// `privaterelay.appleid.com` is load-bearing: Sign in with Apple hands us an
-// address on that domain whenever the user chooses to hide their real one.
-// Drop it and our own Apple sign-in stops being able to create accounts.
+// `privaterelay.appleid.com` stays listed even though we no longer offer Sign
+// in with Apple: users who signed up through it before still carry a relay
+// address, and anyone may type one in by hand.
 
 const TRUSTED_DOMAINS = new Set([
   // Google
@@ -265,7 +265,7 @@ const TRUSTED_DOMAINS = new Set([
   'yahoo.com.br', 'yahoo.com.mx', 'yahoo.com.ar', 'yahoo.com.co',
   'yahoo.com.ph', 'yahoo.com.sg', 'yahoo.com.hk', 'yahoo.com.tw',
   'yahoo.com.tr', 'yahoo.com.vn', 'yahoo.com.my',
-  // Apple — including the Sign in with Apple relay. See the note above.
+  // Apple — including the iCloud relay domain. See the note above.
   'icloud.com', 'me.com', 'mac.com', 'privaterelay.appleid.com',
   // AOL
   'aol.com', 'aol.co.uk', 'aim.com',

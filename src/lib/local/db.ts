@@ -3564,7 +3564,7 @@ export async function postChatMessage(userId: string, conversationId: string, ra
  */
 export async function recordLogin(
   userId: string,
-  method: 'password' | 'otp' | 'google' | 'apple' | 'social',
+  method: 'password' | 'otp' | 'google' | 'social',
   req?: Request,
 ): Promise<void> {
   try {

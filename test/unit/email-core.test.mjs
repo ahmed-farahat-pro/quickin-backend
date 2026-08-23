@@ -243,9 +243,9 @@ describe('the trusted-provider allowlist', () => {
     }
   })
 
-  test('Sign in with Apple\'s private relay is trusted', () => {
-    // Apple hands us this domain when the user hides their real address. If it
-    // is ever refused, our own Apple sign-in cannot create an account.
+  test("Apple's private relay domain is trusted", () => {
+    // Sign in with Apple is gone, but accounts created through it still carry a
+    // relay address, so the domain must keep passing signup and login.
     assert.ok(isTrustedEmail('a1b2c3@privaterelay.appleid.com'))
     assert.equal(checkEmail('a1b2c3@privaterelay.appleid.com'), null)
   })

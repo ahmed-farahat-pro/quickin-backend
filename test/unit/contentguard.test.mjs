@@ -96,6 +96,24 @@ describe('phone numbers — blocked', () => {
     ['padded, spaced out', 'Kareem 0 a 1 b 0 c 1 d 2 e 3 f 4 g 5 h 6 i 7 j 8'],
     ['padded with Arabic letters', 'م0ح1م0د1ي2ن3ا4ي5ر6'],
     ['padded, in a name', 'Ahmed0a1b0c1d2e3f4g5h6i7j8'],
+    // The number in three- and four-digit CHUNKS, each welded to a nonsense
+    // word, with the leading 0 left for the reader to put back — QA's follow-up
+    // report. Every group is too wide for the single-digit padding scan and
+    // every gap too long, so it read as five unrelated little numbers; the
+    // digit-only reduction missed it too, because that needs the trunk 0 the
+    // writer dropped. What ties it together is that the letters are GLUED to the
+    // digits, the way padding is and prose is not.
+    ['chunked, trunk 0 dropped', 'ajajx101 bsjs416 jsua3 aj2 a10'],
+    ['chunked, longer pad words', 'kareem101 hassan416 sam3 x2 y10'],
+    ['chunked, in a sentence', 'Hi there ajajx101 bsjs416 jsua3 aj2 a10 thanks'],
+    ['chunked, Arabic around it', 'اهلا ajajx101 bsjs416 jsua3 aj2 a10'],
+    ['chunked, no spaces', 'ka1014zx163qp210'],
+    ['chunked, country code written in', 'ax201 by014 cz163 dw210'],
+    ['chunked, 01 dropped entirely', 'ka0 ajajx1 a4 zx1 bsjs6 mohamed3 bsjs2 q1 samir0'],
+    ['trunk 0 dropped, plain', '1014163210'],
+    ['trunk 0 dropped, one blob', 'q1014163210'],
+    ['trunk 0 dropped, split across a sentence', 'reach me on 101, then 4163, then 210'],
+    ['chunked, other plan + intent', 'whatsapp me on ab014 cd163 ef210'],
   ]
   for (const [label, text] of cases) {
     test(label, () => assert.ok(containsPhoneNumber(text), `should block: ${text}`))
@@ -195,6 +213,25 @@ describe('ordinary chat — allowed', () => {
     'Suite 1A, 2B, 3C, 4D',
     'Model S3 X5 Y7 Z9 available',
     'Size 3x4 m bedroom, 2x2 m bath, 6x8 m living',
+    // The chunked scan above stitches digit groups across a whole phrase, so
+    // these are the shapes that tell it where a number stops. A number is
+    // written as one unbroken stream of glued pieces; prose keeps each number a
+    // word of its own, and the run has to END at the first such word — otherwise
+    // the first two of these stitch to 1232943215 and 1002400236, both of which
+    // are perfectly mobile-shaped.
+    'Villa 12, block 3, phase 2, road 9, gate 4, floor 3, unit 21, apt 5',
+    'Villas 100m2 to 400m2, 3 to 6 bedrooms and 1 pool',
+    'area 128, Villa 2500, floor 12, floor 1',
+    'Chalet A5, building 12, floor 3, unit 21, Marassi',
+    'Unit 4B2, gate 3, road 9, Maadi, 5 min walk to metro line 3',
+    'Room A1 sleeps 2, room B2 sleeps 3, room C1 sleeps 2, room D2 sleeps 1',
+    'Wifi 200mbps, TV 55in, AC in 3 rooms, parking for 2 cars',
+    'Beach 2 min, pool 3 min, gym 5 min, market 8 min, airport 45 min',
+    // The letter→digit pass turns "villa3" into "v1111a3" and "pool2" into
+    // "p0012", which is why the chunked scan reads the un-leeted text instead.
+    'villa3 pool2 wifi6 unit10',
+    'floor2 room3 pool4 unit5 villa1',
+    'مساحه 150 متر، 3 غرف، 2 حمام، الدور 4، عماره 12',
   ]
   for (const text of cases) {
     test(JSON.stringify(text).slice(0, 56), () => {
@@ -277,6 +314,10 @@ describe('split across messages', () => {
     ['address then TLD', ['my email is kareem@gmail'], '.com'],
     ['name then address', ['kareem'], '@gmail.com'],
     ['platform then handle', ['find me on insta'], 'kareem_eladl'],
+    // The trunk 0 is optional across messages for the same reason it is optional
+    // everywhere else — a reader supplies it. Safe here because this path only
+    // runs once the window already shows intent to hand over contact details.
+    ['sentence + intent, no trunk 0', ['you can reach me at 101'], '4163210 anytime'],
   ]
   for (const [label, prev, next] of cases) {
     test(`blocks: ${label}`, () => assert.ok(combinesIntoContact(prev, next).blocked))

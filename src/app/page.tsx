@@ -20,9 +20,8 @@ const ENDPOINTS: Endpoint[] = [
   { method: 'GET', path: '/api/local/bookings', desc: "The signed-in user's reservations" },
   { method: 'POST', path: '/api/auth/signup', desc: 'Register with email + password' },
   { method: 'POST', path: '/api/auth/login', desc: 'Sign in with email + password' },
-  { method: 'POST', path: '/api/auth/social', desc: 'Demo social sign-in (google / apple)' },
+  { method: 'POST', path: '/api/auth/social', desc: 'Demo social sign-in (google)' },
   { method: 'POST', path: '/api/auth/google', desc: 'Google sign-in (verifies an ID token)' },
-  { method: 'POST', path: '/api/auth/apple', desc: 'Sign in with Apple (verifies an identity token)' },
   { method: 'GET', path: '/api/auth/me', desc: 'Resolve the current user from token / cookie' },
   { method: 'GET', path: '/api/auth/logout', desc: 'Clear the auth cookie' },
 ]

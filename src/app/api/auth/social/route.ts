@@ -21,24 +21,23 @@ export async function OPTIONS() {
   })
 }
 
-// DEMO social sign-in. Real Google/Apple OAuth would verify an ID token here;
+// DEMO social sign-in. Real Google OAuth verifies an ID token in /api/auth/google;
 // for the local demo we accept the provider + profile and create/log in the user.
 export async function POST(req: Request) {
   try {
     const body = await req.json()
-    const provider = body.provider === 'apple' ? 'apple' : body.provider === 'google' ? 'google' : null
+    const provider = body.provider === 'google' ? 'google' : null
     if (!provider) {
-      return NextResponse.json({ error: 'provider must be "google" or "apple"' }, { status: 400, headers: CORS })
+      return NextResponse.json({ error: 'provider must be "google"' }, { status: 400, headers: CORS })
     }
     // Allow the client to pass a profile; otherwise mint a stable demo identity.
     const email: string = (body.email && String(body.email).trim()) || `demo.${provider}@quickin.local`
-    const fullName: string = (body.full_name && String(body.full_name).trim()) ||
-      (provider === 'apple' ? 'Nora Salem' : 'Omar Khaled')
+    const fullName: string = (body.full_name && String(body.full_name).trim()) || 'Omar Khaled'
     const avatarUrl: string | undefined = body.avatar_url
 
     // BEFORE the upsert — upsertSocialUser writes the row and marks the email
     // verified, so a removed user could otherwise reactivate themselves by tapping
-    // "Sign in with Google/Apple".
+    // "Sign in with Google".
     const existing = await getUserRowByEmail(email)
     if (existing) {
       const blocked = blockedAccountResponse(existing.account_status, CORS)

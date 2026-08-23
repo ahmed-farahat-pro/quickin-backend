@@ -29,7 +29,11 @@ import {
   canRequestIdChange,
   canonicalDocumentNumber,
   idChangeStatusLabel,
+  IdChangeError,
   isIdChangeError,
+  IdChangeUnavailableError,
+  isIdChangeUnavailableError,
+  isMissingRelationError,
   normalizeDocumentImage,
   normalizeDocumentNumber,
   normalizeIdChangeAction,
@@ -247,5 +251,42 @@ describe('canRequestIdChange', () => {
     assert.equal(canRequestIdChange(null), true)
     assert.equal(canRequestIdChange(undefined), true)
     assert.equal(canRequestIdChange(''), true)
+  })
+})
+
+describe('isMissingRelationError', () => {
+  test('recognises the two Postgres codes that mean "not on this database"', () => {
+    // 42P01 undefined_table is the real-world one: id_change_requests ships with a
+    // migration that is run by hand, so the code can be live before the table is.
+    assert.equal(isMissingRelationError({ code: '42P01' }), true)
+    assert.equal(isMissingRelationError({ code: '42703' }), true)
+  })
+
+  test('every other failure keeps travelling — a fault must not read as un-migrated', () => {
+    // 23505 is the one-open-request-per-user index, 42601 a syntax error, 08006 a
+    // dropped connection. Swallowing any of these would hide a real bug behind a
+    // "temporarily unavailable" that never becomes available.
+    for (const code of ['23505', '42601', '08006', '23503', undefined]) {
+      assert.equal(isMissingRelationError({ code }), false, `code ${code} must not count`)
+    }
+    assert.equal(isMissingRelationError(new Error('boom')), false)
+    assert.equal(isMissingRelationError(null), false)
+    assert.equal(isMissingRelationError('42P01'), false)
+  })
+})
+
+describe('IdChangeUnavailableError', () => {
+  test('is told apart from a validation error, so the route can answer 503 not 400', () => {
+    const unavailable = new IdChangeUnavailableError()
+    assert.equal(isIdChangeUnavailableError(unavailable), true)
+    assert.equal(isIdChangeError(unavailable), false)
+    assert.equal(isIdChangeUnavailableError(new IdChangeError('nope')), false)
+  })
+
+  test('says the queue is unavailable, not that the request was wrong', () => {
+    // The whole point: "Could not submit your request" sent people back to re-type a
+    // number that was never the problem. The default message has to point elsewhere.
+    assert.match(new IdChangeUnavailableError().message, /unavailable/i)
+    assert.match(new IdChangeUnavailableError().message, /try again later/i)
   })
 })

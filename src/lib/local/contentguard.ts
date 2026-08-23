@@ -11,6 +11,10 @@
 //
 //   • separators              010 123 45 67 · 010-123-4567 · (010)/123 · 0_1_0
 //   • letters as separators   A0101 S416 M3280 · 0101x416x3280 · 0a1b0c1d2e3f4g5h6
+//   • chunked + trunk 0 gone  ajajx101 bsjs416 jsua3 aj2 a10 — the number in
+//                             three- and four-digit pieces, each welded to a
+//                             nonsense word, with the leading 0 (or 01) left
+//                             for the reader to supply
 //   • Arabic-Indic digits     ٠١٠١٢٣٤٥٦٧٨ and Eastern ۰۱۰
 //   • fullwidth / enclosed    ０１０１２３４５６７８ · ⓪①⓪ · 0️⃣1️⃣0️⃣
 //   • invisible characters    zero-width space, soft hyphen, RTL/LTR marks
@@ -141,6 +145,36 @@ const CONTACT_HINT =
  * ordinary words into short digit runs ("will" → "1i11" → "111").
  */
 export function normalizeForPhone(input: string, aggressive = false): string {
+  let t = numberWords(input)
+  // Letters standing in for digits. Restricted to tokens that already contain a
+  // digit unless `aggressive`, so "hello" is untouched in the normal path.
+  t = t
+    .split(/(\s+)/)
+    .map((tok) => {
+      if (!aggressive && !/\d/.test(tok)) return tok
+      const leet = tok.replace(/o/g, '0').replace(/[li|]/g, '1')
+      // s→5 and z→2 only in the aggressive pass; they are strong lookalikes but
+      // common enough in prose that the digit-containing pass shouldn't use them.
+      return aggressive ? leet.replace(/s/g, '5').replace(/z/g, '2') : leet
+    })
+    .join('')
+  return t
+}
+
+/**
+ * Everything `normalizeForPhone` does EXCEPT the letter→digit substitution:
+ * `fold()`, "double 5"/"triple 7", and the spelled-out English and Arabic
+ * numbers.
+ *
+ * Split out because that last step is the only one that INVENTS digits out of
+ * prose — "villa3" becomes "v1111a3", "pool2" becomes "p0012" — and the chunked
+ * scan below stitches digit groups together across a whole phrase. Run on the
+ * leeted form, "villa3 pool2 wifi6 unit10" stitches to fifteen digits that
+ * happen to carry a mobile-shaped substring; run on this one it is "32610".
+ * Every other caller wants the leet pass and keeps going through
+ * `normalizeForPhone`.
+ */
+function numberWords(input: string): string {
   let t = fold(input)
   // "double 5" → 55, "triple 7" → 777.
   t = t.replace(/\b(double|triple)\s+([a-z]+|\d)\b/g, (m, mult: string, w: string) => {
@@ -154,18 +188,6 @@ export function normalizeForPhone(input: string, aggressive = false): string {
   t = t.replace(/(\d)\s*o\s*(?=\d)/g, '$10')
   // Spelled-out Arabic number words → digits.
   for (const [re, d] of AR_WORD) t = t.replace(re, d)
-  // Letters standing in for digits. Restricted to tokens that already contain a
-  // digit unless `aggressive`, so "hello" is untouched in the normal path.
-  t = t
-    .split(/(\s+)/)
-    .map((tok) => {
-      if (!aggressive && !/\d/.test(tok)) return tok
-      const leet = tok.replace(/o/g, '0').replace(/[li|]/g, '1')
-      // s→5 and z→2 only in the aggressive pass; they are strong lookalikes but
-      // common enough in prose that the digit-containing pass shouldn't use them.
-      return aggressive ? leet.replace(/s/g, '5').replace(/z/g, '2') : leet
-    })
-    .join('')
   return t
 }
 
@@ -200,69 +222,139 @@ function longestDigitRun(s: string): number {
   return max
 }
 
-/**
- * The longest run of digits that arrive in ONES AND TWOS with letters wedged
- * between them — "0a1b0c1d2e3f4g5h6i7j8". Returns its digit count, or 0.
- *
- * That padding defeats every other detector here: each digit run is length one,
- * so no run threshold fires, and a letter is not punctuation, so
- * `collapseDigitSeparators` deliberately won't bridge it. Reducing the whole
- * text to its digits does see it, but only a shape as specific as an Egyptian
- * mobile can safely be matched against a whole-text concatenation — anything
- * looser reads "Built 2003, 12 rooms, 45 guests" as a phone number. A number
- * written to any other plan (a Saudi 05x, a ten-digit international line, a
- * landline) therefore walked straight through.
- *
- * A contiguous run is safe to count on its own, because three things have to
- * hold at once and honest text never has all three:
- *   • every digit group is one or two digits long — a third digit is a year, a
- *     price or a size, so it ends the run rather than extending it. This is
- *     what keeps "90m2, 120m2, 150m2, 200m2" out.
- *   • each group is at most `MAX_GAP` characters from the next — prose puts
- *     whole words between its numbers ("3 pools, 2 floors"), which breaks the
- *     run before it can grow.
- *   • at least `MIN_LETTER_JOINS` of those gaps contain a letter — a gap of
- *     pure punctuation is `collapseDigitSeparators`'s job, already done above.
- */
-function letterInterleavedDigits(s: string): number {
-  const MAX_GAP = 3 // "0 a 1" — a longer separator is prose, not padding
-  const MAX_GROUP = 2
-  const MIN_LETTER_JOINS = 3
-  const HAS_LETTER = /\p{L}/u
+/** How forgiving one pass of the padded-digit scan below is. */
+interface PaddingShape {
+  /** A digit group longer than this ENDS the run rather than extending it — past
+   *  that width the number is a year, a price or a size, not a chunk of a phone
+   *  number. This is what keeps "90m2, 120m2, 150m2, 200m2" from joining up. */
+  maxGroup: number
+  /** A gap wider than this ends the run too — prose puts whole words between its
+   *  numbers ("3 pools, 2 floors"), padding puts a few letters. */
+  maxGap: number
+  /** How many of those gaps must contain a LETTER before the run counts at all.
+   *  A gap of pure punctuation is `collapseDigitSeparators`'s job, already done
+   *  by the time these run. */
+  minJoins: number
+  /** Whether the run is held together by GLUE — letters touching the digits that
+   *  follow them, with no space in between — and ENDS at the first gap that is
+   *  not glue.
+   *
+   *  This is the line between padding and prose, and a sharper one than any
+   *  length limit. Padding welds its letters to the number ("bsjs416"), so a
+   *  reader’s eye slides straight off them onto the digits; prose keeps a number
+   *  a word of its own ("floor 12", "area 128", "الدور 4"), because that is what
+   *  makes it readable. So "ajajx101 bsjs416 jsua3" joins up, while "Villa 12,
+   *  block 3, phase 2, road 9, gate 4, floor 3, unit 21" — which stitches to a
+   *  perfectly mobile-shaped ten digits — never forms a run at all.
+   *
+   *  ENDING the run, rather than merely not counting the gap, is what the second
+   *  half of that buys. "Villas 100m2 to 400m2, 3 to 6 bedrooms" has real glue in
+   *  it — the `m` of each `100m2` — and if an unglued gap only failed to COUNT,
+   *  those two joins would carry one run across " to " and ", " alike and stitch
+   *  1002400236, which is mobile-shaped. A number stops being written the moment
+   *  an ordinary word turns up in the middle of it. */
+  glued: boolean
+}
 
-  let best = 0
-  let digits = 0
+/** Digits wedged apart one and two at a time — "0a1b0c1d2e3f4g5h6i7j8". Every
+ *  group is length one or two, so no run threshold fires, and a letter is not
+ *  punctuation, so `collapseDigitSeparators` deliberately won't bridge it. */
+const TIGHT_PADDING: PaddingShape = { maxGroup: 2, maxGap: 3, minJoins: 3, glued: false }
+
+/** The same idea at the scale QA reported: the number cut into three- and
+ *  four-digit CHUNKS with a short nonsense word glued to each —
+ *  "ajajx101 bsjs416 jsua3 aj2 a10". Every group is too wide for TIGHT_PADDING
+ *  and every gap too long, so the tight scan reads five unrelated little
+ *  numbers. What a person reads is 1014163210. */
+const CHUNK_PADDING: PaddingShape = { maxGroup: 4, maxGap: 8, minJoins: 2, glued: true }
+
+/** The same scan asking for one more glued join. Used only with the nine-digit
+ *  shape below, which is a weaker anchor than a whole mobile and so has to be
+ *  paid for with more evidence that the text is padded at all. */
+const CHUNK_PADDING_STRICT: PaddingShape = { ...CHUNK_PADDING, minJoins: 3 }
+
+/**
+ * Every run of digits in `s` that arrives in short groups with letters wedged
+ * between them, returned as the digits of each run concatenated in order.
+ *
+ * A contiguous run is safe to reason about on its own, because three things have
+ * to hold at once and honest text rarely has all three: every group is short,
+ * each group is close to the next, and enough of those gaps carry a letter.
+ * What the CALLER then does with the digits is where the two passes differ —
+ * see `containsPhoneNumber`.
+ */
+function letterInterleavedRuns(s: string, shape: PaddingShape): string[] {
+  const HAS_LETTER = /\p{L}/u
+  const GLUED_LETTER = /\p{L}$/u // the gap's last character, i.e. touching the next digit
+
+  const runs: string[] = []
+  let digits = ''
   let joins = 0
   let prevEnd = -1 // end of the previous group, or -1 when no run is open
   const flush = () => {
-    if (joins >= MIN_LETTER_JOINS && digits > best) best = digits
-    digits = 0
+    if (joins >= shape.minJoins && digits) runs.push(digits)
+    digits = ''
     joins = 0
   }
 
   const group = /\d+/g
   let m: RegExpExecArray | null
   while ((m = group.exec(s)) !== null) {
-    if (m[0].length > MAX_GROUP) {
+    if (m[0].length > shape.maxGroup) {
       flush()
       prevEnd = -1
       continue
     }
     const gap = prevEnd < 0 ? null : s.slice(prevEnd, m.index)
-    if (gap === null || gap.length > MAX_GAP) flush()
-    else if (HAS_LETTER.test(gap)) joins += 1
-    digits += m[0].length
+    const isJoin =
+      gap !== null &&
+      gap.length <= shape.maxGap &&
+      (shape.glued ? GLUED_LETTER : HAS_LETTER).test(gap)
+    // A glued run ends at the first gap that isn't glue. A tight one tolerates a
+    // punctuation-only gap mid-run, which is how it has always behaved.
+    if (gap === null || gap.length > shape.maxGap || (shape.glued && !isJoin)) flush()
+    else if (isJoin) joins += 1
+    digits += m[0]
     prevEnd = m.index + m[0].length
   }
   flush()
-  return best
+  return runs
 }
+
+/** The digit count of the longest such run, or 0 when there is none. */
+function letterInterleavedDigits(s: string, shape: PaddingShape = TIGHT_PADDING): number {
+  return letterInterleavedRuns(s, shape).reduce((n, run) => Math.max(n, run.length), 0)
+}
+
+// ── Egyptian mobile shapes ───────────────────────────────────────────────────
+//
+// A mobile's NATIONAL SIGNIFICANT NUMBER is `1`, then the operator digit
+// (0 Vodafone / 1 Etisalat / 2 Orange / 5 WE), then eight more. Everything in
+// front of it — the trunk `0` a number is written with nationally, the `+20` or
+// `0020` country code — is decoration, and decoration is the first thing an
+// evader drops: 01014163210, 1014163210 and +201014163210 are one number, and a
+// reader puts back whatever is missing without thinking about it. So the shapes
+// below are written around the NSN with the prefixes optional.
+
+const EG_MOBILE_NSN = '1[0125]\\d{8}'
+
+/** The digits ARE a mobile: a country code and/or the trunk zero may sit in
+ *  front, and nothing at all may follow. Deliberately anchored at both ends —
+ *  see the note at its call site for why a substring match is not safe here. */
+const EG_MOBILE_EXACT = new RegExp(`^(?:00)?(?:20)?0?${EG_MOBILE_NSN}$`)
+
+/** The digits are a mobile with the whole `01` cut off. Nine digits behind a
+ *  one-digit anchor is loose enough that it is only read off a run with an extra
+ *  glued join under it — see CHUNK_PADDING_STRICT. */
+const EG_MOBILE_TRIMMED = /^[0125]\d{8}$/
 
 /** True if `text` appears to contain a phone number (after de-obfuscation). */
 export function containsPhoneNumber(text: string): boolean {
   if (!text) return false
   const norm = normalizeForPhone(text)
   const compact = collapseDigitSeparators(norm)
+  // The chunked scan below reads the UN-leeted form on purpose — see numberWords.
+  const words = numberWords(text)
   // An 8+ digit run is a phone number (Egyptian mobile = 11, landline+area ≥ 8).
   if (longestDigitRun(compact) >= 8) return true
   // Egyptian mobile prefixes (010/011/012/015) + body.
@@ -288,7 +380,28 @@ export function containsPhoneNumber(text: string): boolean {
   // is safe to count instead: honest prose separates its numbers with whole
   // words, which never join into one run. Eight digits is the same floor a
   // plain run has to clear.
-  if (letterInterleavedDigits(norm) >= 8) return true
+  if (letterInterleavedDigits(norm, TIGHT_PADDING) >= 8) return true
+  // The number cut into CHUNKS rather than wedged apart digit by digit —
+  // "ajajx101 bsjs416 jsua3 aj2 a10", which stitches to 1014163210: an Egyptian
+  // mobile with only its trunk 0 left off, and a reader puts that back without
+  // thinking. Nothing above sees it. Its groups are three and four digits wide,
+  // so the scan on the line above ends its run at the first of them; its gaps
+  // are letters, so `collapseDigitSeparators` won't bridge them; and the
+  // whole-text shape match needs the leading 0 that was dropped.
+  //
+  // A second, more forgiving scan therefore runs over the same text, and what
+  // keeps it honest is the shape it has to match: the run's digits must BE a
+  // mobile from the first digit to the last, with only a country code or the
+  // trunk zero allowed in front. A number written to be read has nothing else
+  // in it. Matching a mobile-shaped SUBSTRING instead would block real listing
+  // copy — "90m2, 120m2, 150m2, 200m2 units" stitches to 902120215022002, which
+  // contains one; anchoring both ends is the whole difference.
+  if (letterInterleavedRuns(words, CHUNK_PADDING).some((run) => EG_MOBILE_EXACT.test(run))) return true
+  // The same chunking with the whole `01` dropped rather than just the trunk 0 —
+  // "ka0 ajajx1 a4 zx1 bsjs6 mohamed3 bsjs2 q1 samir0" stitches to 014163210,
+  // and a reader puts the `01` back exactly as readily. Nine digits is a weaker
+  // shape than ten, so it is only read off a more thoroughly padded run.
+  if (letterInterleavedRuns(words, CHUNK_PADDING_STRICT).some((run) => EG_MOBILE_TRIMMED.test(run))) return true
   if (!CONTACT_HINT.test(norm)) return false
   // From here on the sender has said they're handing over contact details, so a
   // weaker signal is enough.
@@ -298,7 +411,14 @@ export function containsPhoneNumber(text: string): boolean {
   // accident in a number-heavy listing than a mobile prefix is.
   if (/0[23]\d{8}/.test(digitsOnly(norm))) return true
   // Six padded digits, for the short numbers the 8-digit floor above misses.
-  if (letterInterleavedDigits(norm) >= 6) return true
+  if (letterInterleavedDigits(norm, TIGHT_PADDING) >= 6) return true
+  // With intent stated, a chunked run no longer has to match a shape at all —
+  // being long enough is sufficient, which is what catches a number written to
+  // some other country's plan. Too loose to sit in front of the intent check.
+  if (letterInterleavedRuns(words, CHUNK_PADDING).some((run) => run.length >= 8)) return true
+  // The mobile with its trunk 0 dropped, scattered through a sentence rather
+  // than chunked ("reach me on 101, then 4163, then 210").
+  if (new RegExp(EG_MOBILE_NSN).test(digitsOnly(norm))) return true
   // An all-letter number written out in lookalikes ("my number is OIO IZ34567").
   if (longestDigitRun(collapseDigitSeparators(normalizeForPhone(text, true))) >= 8) return true
   return false
@@ -575,7 +695,9 @@ export function combinesIntoPhoneNumber(previousBodies: string[], newBody: strin
   const windowNorm = normalizeForPhone([...previousBodies, newBody].join('  '))
   if (CONTACT_HINT.test(windowNorm)) {
     const digits = collapseDigitSeparators(windowNorm).replace(/\D/g, '')
-    if (/01[0125]\d{8}/.test(digits)) return true // Egyptian mobile (11 digits) split across messages
+    // The trunk 0 is optional here for the same reason it is optional everywhere
+    // else: a reader supplies it. Safe to loosen behind the intent check above.
+    if (new RegExp(EG_MOBILE_NSN).test(digits)) return true // Egyptian mobile split across messages
     if (/(?:\+|00)\s*\d[\d\s.\-]{7,}/.test(windowNorm)) return true // international form anywhere in the window
   }
   return false

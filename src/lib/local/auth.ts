@@ -476,11 +476,11 @@ export async function verifyUserOtp(email: string, code: string, role?: string):
   return (updated[0] as User) ?? null
 }
 
-/** Upsert a social (google/apple) user — provider already verified the email. */
+/** Upsert a social (google) user — provider already verified the email. */
 export async function upsertSocialUser(args: {
   email: string
   fullName: string
-  provider: 'google' | 'apple'
+  provider: 'google'
   avatarUrl?: string
   role?: string
 }): Promise<User> {

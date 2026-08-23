@@ -2,17 +2,15 @@ import crypto from 'node:crypto'
 
 // REAL OAuth ID-token verification — no third-party SDKs, no npm packages.
 // Verifies the RS256 signature against the provider's published JWKS and checks
-// the standard claims (iss / aud / exp). Used by /api/auth/google and /api/auth/apple.
+// the standard claims (iss / aud / exp). Used by /api/auth/google.
 
 // Accept ONE or SEVERAL client ids, comma-separated. Google issues tokens with a
 // different `aud` per platform (web client, iOS client, …) so list them all:
 //   GOOGLE_CLIENT_ID=<web-id>,<ios-id>
-//   APPLE_CLIENT_ID=com.quickin.ahmed         (native iOS bundle id; add the web Services ID later)
 function parseIds(v: string | undefined): string[] {
   return (v || '').split(',').map((s) => s.trim()).filter(Boolean)
 }
 export const GOOGLE_CLIENT_IDS = parseIds(process.env.GOOGLE_CLIENT_ID)
-export const APPLE_CLIENT_IDS = parseIds(process.env.APPLE_CLIENT_ID)
 
 interface Jwk {
   kid: string
@@ -97,17 +95,6 @@ export async function verifyGoogleIdToken(idToken: string): Promise<VerifiedClai
   })
 }
 
-/** Verify an Apple identity token (returned by Sign in with Apple). */
-export async function verifyAppleIdToken(idToken: string): Promise<VerifiedClaims> {
-  if (!APPLE_CLIENT_IDS.length) throw new Error('APPLE_CLIENT_ID is not configured')
-  return verifyIdToken(idToken, {
-    jwksUrl: 'https://appleid.apple.com/auth/keys',
-    issuers: ['https://appleid.apple.com'],
-    audiences: APPLE_CLIENT_IDS,
-  })
-}
-
 export const oauthConfigured = {
   google: () => GOOGLE_CLIENT_IDS.length > 0,
-  apple: () => APPLE_CLIENT_IDS.length > 0,
 }

@@ -1,6 +1,8 @@
 import { pool } from './pool'
 import {
   IdChangeError,
+  IdChangeUnavailableError,
+  isMissingRelationError,
   assertActuallyChanges,
   assertReviewable,
   canonicalDocumentNumber,
@@ -27,6 +29,31 @@ import {
 
 const isUuid = (s: string) => /^[0-9a-fA-F-]{36}$/.test(s)
 
+/**
+ * Run a statement against `id_change_requests`, turning "that table is not on this
+ * database" into the error the routes answer 503 to.
+ *
+ * The write paths need this because the table ships with a migration that is applied
+ * by hand: code can reach production a deploy or several before the SQL does, and in
+ * that window a submit failed as an unexplained 500 reading "Could not submit your
+ * request" — which sends the user back to correct a number that was never the problem.
+ * Only the missing-relation codes are translated; a real fault still raises a 500,
+ * because pretending a broken query is a maintenance window is how a fault goes
+ * unnoticed for weeks.
+ */
+async function queueQuery(text: string, params: unknown[] = []) {
+  try {
+    return await pool.query(text, params)
+  } catch (err) {
+    if (!isMissingRelationError(err)) throw err
+    console.error(
+      'id_change_requests is not on this database — run scripts/migrate-id-change-requests.mjs against it:',
+      (err as Error).message
+    )
+    throw new IdChangeUnavailableError()
+  }
+}
+
 export interface IdChangeRequest {
   id: string
   status: IdChangeStatus
@@ -48,6 +75,13 @@ export interface IdChangeState {
   request: IdChangeRequest | null
   /** False only while a request is pending; the clients hide the action on false. */
   can_request: boolean
+  /**
+   * False when the queue's table is not on this database yet, so `request` is not
+   * "you have never filed one" but "we could not look". Reported rather than inferred:
+   * without it the profile screen cannot tell a clean slate from a blind spot, and a
+   * pending request would silently render as none.
+   */
+  available: boolean
 }
 
 // Images are excluded from every read below. A user re-opening their profile does not
@@ -73,22 +107,36 @@ function rowToRequest(row: Record<string, unknown> | undefined): IdChangeRequest
   }
 }
 
-/** The user's current ID number plus the state of their latest change request. */
+/**
+ * The user's current ID number plus the state of their latest change request.
+ *
+ * The request half DEGRADES when the table is missing, the same contract the /ops
+ * counts have always had. This read backs the ID row on Edit Profile, and a 500 here
+ * took the row's own value down with it for a request the user may not even have —
+ * the number on file lives on `users` and is knowable either way.
+ */
 export async function getIdChangeState(userId: string): Promise<IdChangeState> {
   if (!isUuid(userId)) throw new IdChangeError('Invalid user')
   const [profile, request] = await Promise.all([
     pool.query(`SELECT id_document FROM users WHERE id = $1`, [userId]),
-    pool.query(
-      `SELECT ${REQUEST_COLUMNS} FROM id_change_requests
-        WHERE user_id = $1 ORDER BY submitted_at DESC LIMIT 1`,
-      [userId],
-    ),
+    pool
+      .query(
+        `SELECT ${REQUEST_COLUMNS} FROM id_change_requests
+          WHERE user_id = $1 ORDER BY submitted_at DESC LIMIT 1`,
+        [userId],
+      )
+      // Only the un-migrated case. Anything else is a fault and must still surface.
+      .catch((err) => {
+        if (!isMissingRelationError(err)) throw err
+        return null
+      }),
   ])
-  const latest = rowToRequest(request.rows[0])
+  const latest = rowToRequest(request?.rows[0])
   return {
     current: (profile.rows[0]?.id_document as string) ?? null,
     request: latest,
     can_request: latest?.status !== 'pending',
+    available: request !== null,
   }
 }
 
@@ -124,12 +172,12 @@ export async function submitIdChangeRequest(args: {
   const current = (profile.rows[0].id_document as string) ?? null
   assertActuallyChanges(current, requested)
 
-  const pending = await pool.query(
+  const pending = await queueQuery(
     `SELECT id FROM id_change_requests WHERE user_id = $1 AND status = 'pending' LIMIT 1`,
     [userId],
   )
   if (pending.rows[0]) {
-    await pool.query(
+    await queueQuery(
       `UPDATE id_change_requests
           SET requested_value = $2, current_value = $3, doc_type = $4,
               image_data = $5, back_image_data = $6, reason = $7,
@@ -139,7 +187,7 @@ export async function submitIdChangeRequest(args: {
       [pending.rows[0].id, requested, current, docType, front, back, reason],
     )
   } else {
-    await pool.query(
+    await queueQuery(
       `INSERT INTO id_change_requests
          (user_id, requested_value, current_value, doc_type, image_data, back_image_data, reason, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
@@ -158,7 +206,7 @@ export async function submitIdChangeRequest(args: {
  */
 export async function cancelIdChangeRequest(userId: string): Promise<IdChangeState> {
   if (!isUuid(userId)) throw new IdChangeError('Invalid user')
-  const { rowCount } = await pool.query(
+  const { rowCount } = await queueQuery(
     `DELETE FROM id_change_requests WHERE user_id = $1 AND status = 'pending'`,
     [userId],
   )
