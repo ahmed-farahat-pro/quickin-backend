@@ -16,7 +16,9 @@ import type { MetricId, MetricSpec, RangeId, SeriesPoint, TrendPayload } from '.
 import type { DocumentKind, VerificationAction, VerificationFilter } from './document-core'
 
 import {
-  refundPercentForDays, refundAmountFor, isCancellable, FLAT_POLICY_LABEL,
+  refundPercentFor, refundAmountFor, isCancellable, normalizePolicy,
+  CANCELLATION_POLICIES,
+  type CancellationPolicy,
 } from './cancellation-core'
 import { resolveResortSelection } from './resorts'
 import { normalizeResortName, validateResortName } from './resort-core'
@@ -27,7 +29,7 @@ import { sendNotificationEmail } from './mailer'
 import { sendPush } from './push'
 import { isContactBlockedError } from './contentguard'
 import { guardContent, guardSplitContent } from './moderation'
-import { INSTAPAY_KEYS, rowsToPaymentConfig } from './payment-config-core'
+import { PAYMENT_SETTING_KEYS, normalizePaymentMethod, rowsToPaymentConfig } from './payment-config-core'
 import type { PaymentConfig } from './payment-config-core'
 import { rowToPayoutMethod } from './payout-method-core'
 import { needsIdentityDocuments, normalizeVerificationStatus, revokesListingPrivileges } from './host-verification-core'
@@ -1095,14 +1097,11 @@ export async function setBookingNotes(bookingId: string, hostUserId: string, not
 
 // ---- Cancellation policy ----------------------------------------------------
 
-export type CancellationPolicy = 'flexible' | 'moderate' | 'strict'
-export const CANCELLATION_POLICIES: CancellationPolicy[] = ['flexible', 'moderate', 'strict']
-
-/** Coerce arbitrary input to a valid policy (defaults to 'moderate'). */
-export function normalizePolicy(p?: string | null): CancellationPolicy {
-  const v = String(p ?? '').toLowerCase().trim()
-  return (CANCELLATION_POLICIES as string[]).includes(v) ? (v as CancellationPolicy) : 'moderate'
-}
+// The policy type, its values and the coercion live in cancellation-core.ts, beside
+// the refund ladder that reads them. Re-exported here because callers have always
+// imported them from db.ts.
+export type { CancellationPolicy } from './cancellation-core'
+export { CANCELLATION_POLICIES, normalizePolicy }
 
 export interface CancellationQuote {
   policy: CancellationPolicy
@@ -1118,17 +1117,6 @@ export interface CancellationQuote {
  *   flexible — 100% if ≥1 day out, else 0%.
  *   moderate — 100% if ≥5 days out, else 50%.
  *   strict   — 50% if ≥7 days out, else 0%. */
-export function refundPercentFor(policy: CancellationPolicy, daysUntilCheckIn: number): number {
-  switch (policy) {
-    case 'flexible':
-      return daysUntilCheckIn >= 1 ? 100 : 0
-    case 'strict':
-      return daysUntilCheckIn >= 7 ? 50 : 0
-    case 'moderate':
-    default:
-      return daysUntilCheckIn >= 5 ? 100 : 50
-  }
-}
 
 function daysUntil(dateStr: string): number {
   const today = new Date()
@@ -1147,12 +1135,18 @@ async function loadCancelable(userId: string, bookingId: string) {
     // paid, not of the host's raw price. See cancellation-core -> refundAmountFor.
     `SELECT b.status, ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS total,
             COALESCE(l.currency, 'EGP') AS currency,
-            (b.check_in - CURRENT_DATE)::int AS days_until
+            (b.check_in - CURRENT_DATE)::int AS days_until,
+            -- The SNAPSHOT the booking was taken under, falling back to the listing's
+            -- current policy only for rows written before the column existed. A host
+            -- tightening their terms today must not reprice a stay already agreed.
+            COALESCE(b.cancellation_policy, l.cancellation_policy, 'moderate') AS policy
        FROM bookings b JOIN listings l ON l.id = b.listing_id
       WHERE b.id = $1 AND b.user_id = $2`,
     [bookingId, userId]
   )
-  return rows[0] as { status: string; total: number; currency: string; days_until: number } | undefined
+  return rows[0] as
+    | { status: string; total: number; currency: string; days_until: number; policy: string }
+    | undefined
 }
 
 /** Argument order is (userId, bookingId) in BOTH projects. They used to disagree, and
@@ -1166,9 +1160,10 @@ export async function getCancellationQuote(
   if (!b) return null
   // An already-cancelled booking owes nothing further — the guard against a retried
   // request refunding twice.
-  const refundPercent = isCancellable(b.status) ? refundPercentForDays(b.days_until) : 0
+  const policy = normalizePolicy(b.policy)
+  const refundPercent = isCancellable(b.status) ? refundPercentFor(policy, b.days_until) : 0
   return {
-    policy: FLAT_POLICY_LABEL,
+    policy,
     daysUntilCheckIn: b.days_until,
     refundPercent,
     refundAmount: refundAmountFor(b.total, refundPercent),
@@ -2655,14 +2650,21 @@ export async function setCommissionRate(rate: number, updatedBy: string | null =
 }
 
 /**
- * The public-facing Instapay destination shown to guests at checkout: the
- * handle/number, the optional deep link, and the optional admin-uploaded QR.
- * Rows that were never saved read as '' — no migration is needed to add a key.
+ * Every guest-facing way to pay, in one read: the Instapay destination (handle,
+ * optional deep link, optional uploaded QR) and the bank-transfer destination
+ * (bank, account holder, account number, optional IBAN), each with its own
+ * on/off toggle, plus the derived `available_methods` a client renders a picker
+ * from.
+ *
+ * Rows that were never saved read as '' — **no migration is needed to add a
+ * key**, which is why the bank destination ships without one. An absent toggle
+ * row reads as ON (see storedToBool), so a database that predates this never
+ * goes dark; an empty destination is hidden by `configured` instead.
  */
 export async function getPaymentConfig(): Promise<PaymentConfig> {
   const { rows } = await pool.query(
     `SELECT key, value FROM app_settings WHERE key = ANY($1::text[])`,
-    [Object.values(INSTAPAY_KEYS)]
+    [PAYMENT_SETTING_KEYS]
   )
   return rowsToPaymentConfig(rows as Array<{ key: string; value: string | null }>)
 }
@@ -2681,7 +2683,11 @@ export async function submitPaymentProof(
 ): Promise<Booking | null> {
   if (!isUuid(bookingId) || !isUuid(userId)) return null
   const img = assertProofImage(imageData)
-  const m = method === 'instapay' ? 'instapay' : String(method).slice(0, 32)
+  // Constrained to the shared vocabulary rather than any 32-char string: this
+  // value labels the row in the ops queue, and a reviewer needs to know which
+  // account to check the money landed in. An unknown value falls back to
+  // 'instapay' — see normalizePaymentMethod.
+  const m = normalizePaymentMethod(method)
   const cur = await pool.query(
     `SELECT payment_status FROM bookings WHERE id = $1 AND user_id = $2`,
     [bookingId, userId]
@@ -2819,6 +2825,8 @@ export interface DisputeRow {
   guest_email: string | null
   host_id: string | null
   total_price: number
+  /** Which destination the guest says they sent to — see PAYMENT_METHODS. */
+  method: string | null
   reject_reason: string | null
   dispute_note: string | null
   submitted_at: string | null
@@ -2833,7 +2841,7 @@ export async function adminListDisputes(): Promise<DisputeRow[]> {
             (SELECT full_name FROM users u WHERE u.id = b.user_id) AS guest_name,
             (SELECT email     FROM users u WHERE u.id = b.user_id) AS guest_email,
             l.host_id, b.total_price::float8 AS total_price,
-            pp.reject_reason, pp.dispute_note,
+            pp.method, pp.reject_reason, pp.dispute_note,
             to_char(pp.submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS submitted_at,
             to_char(pp.disputed_at AT TIME ZONE 'UTC',  'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS disputed_at
        FROM payment_proofs pp

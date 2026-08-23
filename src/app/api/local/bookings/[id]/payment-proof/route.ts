@@ -6,6 +6,10 @@ import { getUserFromRequest } from '@/lib/local/auth'
 //   POST /api/local/bookings/:id/payment-proof {image, method?}
 //        → guest uploads / re-uploads a screenshot (payment 'submitted'; a
 //          previously host-rejected booking reopens to 'pending').
+//          `method` is 'instapay' | 'bank_transfer' — which destination the guest
+//          says they sent to, so the reviewer knows which account to check.
+//          Anything else, or omitted, is read as 'instapay' (older clients sent
+//          no method at all).
 //   GET  /api/local/bookings/:id/payment-proof
 //        → the latest screenshot (base64), for the guest, the listing's host, or an admin.
 export const dynamic = 'force-dynamic'
@@ -34,7 +38,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const body = await req.json().catch(() => ({}))
     const image = body.image ?? body.payment_proof ?? body.proof
     if (!image) return NextResponse.json({ error: 'A screenshot is required' }, { status: 400, headers: CORS })
-    const booking = await submitPaymentProof(id, user.id, String(image), body.method || 'instapay')
+    // The method is validated inside submitPaymentProof against the shared
+    // PAYMENT_METHODS vocabulary — passed through raw here on purpose, so there is
+    // one place that decides what a valid method is.
+    const booking = await submitPaymentProof(id, user.id, String(image), body.method)
     if (!booking) return NextResponse.json({ error: 'Reservation not found' }, { status: 404, headers: CORS })
     return NextResponse.json(booking, { headers: CORS })
   } catch (err) {

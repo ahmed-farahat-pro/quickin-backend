@@ -64,7 +64,7 @@ export const STAFF_MODULES = [
   // either module.
   { key: 'id_changes', label: 'ID change requests', description: 'Approve or reject changes to a user\'s ID number' },
   { key: 'documents', label: 'Documents', description: 'Open ID and ownership documents' },
-  { key: 'payments', label: 'Payments & disputes', description: 'Instapay proofs, disputes, handle' },
+  { key: 'payments', label: 'Payments & disputes', description: 'Transfer proofs, disputes, destinations' },
   { key: 'promos', label: 'Promo codes', description: 'Discount codes and limits' },
   { key: 'reports', label: 'Reports', description: 'User-filed abuse reports' },
   { key: 'moderation', label: 'Moderation', description: 'Users caught sharing contact details, warnings and suspensions' },

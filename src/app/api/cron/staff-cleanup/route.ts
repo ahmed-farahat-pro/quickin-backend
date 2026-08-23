@@ -10,8 +10,13 @@ import { purgeStaffExpired } from '@/lib/local/db'
 //
 //   GET /api/cron/staff-cleanup     header: Authorization: Bearer <CRON_SECRET>
 //
-// Scheduled daily at 03:00 UTC in vercel.json. Safe to run by hand, and safe to run
-// repeatedly.
+// Scheduled daily at 03:00 UTC by this project's vercel.json — the schedule moved here
+// with the route on 21 Aug 2026, from quickin-frontend. Safe to run by hand, and safe
+// to run repeatedly.
+//
+// NOTE the guard below is opt-in: with CRON_SECRET unset the endpoint is UNPROTECTED.
+// It only purges already-expired staff sessions, so the blast radius is small, but set
+// CRON_SECRET in production and the check starts enforcing itself.
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 

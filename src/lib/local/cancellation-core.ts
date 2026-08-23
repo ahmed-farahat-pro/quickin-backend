@@ -10,31 +10,58 @@
 // see README → Testing. Kept byte-identical across both repos by
 // scripts/check-cancellation-core-parity.mjs.
 
+/** The three policies a host may choose. Ordered most to least generous. */
+export type CancellationPolicy = 'flexible' | 'moderate' | 'strict'
+export const CANCELLATION_POLICIES: CancellationPolicy[] = ['flexible', 'moderate', 'strict']
+
 /**
- * ONE FLAT POLICY, on purpose — pending a business decision.
- *
- * `listings.cancellation_policy` still exists, hosts still set it, and createBooking
- * still snapshots it onto every booking row. Nothing reads it yet. That is the point:
- * when the per-listing flexible/moderate/strict ladder is agreed, switching it on is a
- * change to this file plus a read of the snapshot — not a migration and not a
- * backfill, because the data has been recorded the whole time.
- *
- * Until then every listing refunds on this single ladder:
- *   7 or more days before check-in ... 100%
- *   1 to 6 days before ...............  50%
- *   day of check-in or later .........   0%
+ * Coerce arbitrary input to a valid policy. Anything missing, blank or unrecognised
+ * reads as `moderate` — the same value `listings.cancellation_policy` defaults to in
+ * the database, so a listing created before the column existed, a client that omits
+ * the field, and a typo all land on the middle ground rather than on the strictest or
+ * the most generous terms by accident.
  */
-export function refundPercentForDays(daysUntilCheckIn: number): number {
-  const d = Number(daysUntilCheckIn)
-  if (!Number.isFinite(d)) return 0
-  if (d >= 7) return 100
-  if (d >= 1) return 50
-  return 0
+export function normalizePolicy(p?: string | null): CancellationPolicy {
+  const v = String(p ?? '').toLowerCase().trim()
+  return (CANCELLATION_POLICIES as string[]).includes(v) ? (v as CancellationPolicy) : 'moderate'
 }
 
-/** The label reported to clients while the policy is flat. Clients show this to the
- *  guest, so it must not claim a per-listing policy the refund maths does not honour. */
-export const FLAT_POLICY_LABEL = 'moderate'
+/**
+ * What fraction of what the guest paid comes back, given the policy their booking was
+ * taken under and how many whole days remain before check-in.
+ *
+ *   days ≥ 7   ≥ 5    ≥ 1    day of check-in or later
+ *   flexible    100%   100%   100%   0%
+ *   moderate    100%   100%    50%   0%
+ *   strict       50%     0%     0%   0%
+ *
+ * `policy` is the SNAPSHOT on the booking, never the listing's current value — a host
+ * tightening their terms must not reprice a reservation a guest already agreed to.
+ * createBooking has written that snapshot since the column existed, which is why
+ * switching this on needed no migration and no backfill.
+ *
+ * NOTHING refunds on or after the check-in day. The stay has begun; a guest who does
+ * not show up has consumed the night the host held for them. This floor is deliberate
+ * and applies to `moderate` too — the earlier, unused draft of this ladder returned
+ * 50% for moderate no matter how late the cancellation, which would have paid out half
+ * a stay to a no-show.
+ */
+export function refundPercentFor(
+  policy: CancellationPolicy | string | null | undefined,
+  daysUntilCheckIn: number
+): number {
+  const d = Number(daysUntilCheckIn)
+  if (!Number.isFinite(d) || d < 1) return 0
+  switch (normalizePolicy(policy as string)) {
+    case 'flexible':
+      return 100
+    case 'strict':
+      return d >= 7 ? 50 : 0
+    case 'moderate':
+    default:
+      return d >= 5 ? 100 : 50
+  }
+}
 
 /**
  * Money owed back, from the total the GUEST PAID — not the host's raw price.

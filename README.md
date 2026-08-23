@@ -38,9 +38,11 @@ npm run dev        # API at http://localhost:4000
 | —    | *(all auth routes above)* | A **blocked or removed** account is refused with **403 `{ error, accountStatus }`** — deliberately **without** `needsVerification`, so the apps show the message instead of routing to the OTP screen. See Account status below |
 | DELETE | `/api/local/admin/users/:id` | **410 Gone** — hard delete is retired. Block or remove the account in `/ops` → Users |
 | GET  | `/api/auth/logout` | Clear the auth cookie |
-| GET  | `/api/local/payment-config` | The Instapay destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload}` |
-| GET  | `/api/local/admin/settings/instapay` | Read the same config for editing. Staff session with the `payments` module |
-| PUT  | `/api/local/admin/settings/instapay` | Update it — `{instapay_handle?, instapay_link?, instapay_qr_image?, instructions?}`. Each field is optional: omit to leave untouched, send `""` to clear. `400` on an invalid link or QR |
+| GET  | `/api/local/payment-config` | Every destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload, instapay_enabled, bank:{…}, available_methods}` |
+| GET  | `/api/local/admin/settings/instapay` | Read the same config for editing (both methods). Staff session with the `payments` module |
+| PUT  | `/api/local/admin/settings/instapay` | Update the Instapay half — `{enabled?, instapay_handle?, instapay_link?, instapay_qr_image?, instructions?}`. Each field is optional: omit to leave untouched, send `""` to clear. `400` on an invalid link or QR |
+| GET  | `/api/local/admin/settings/bank` | Read the config (same payload as the Instapay route). Staff session with the `payments` module |
+| PUT  | `/api/local/admin/settings/bank` | Update the bank-transfer half — `{enabled?, bank_name?, account_name?, account_number?, iban?, instructions?}`. `400` with the reason on a malformed account number or IBAN |
 | POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, doc_type, id_front, id_back, company?, notes?}`. **The ID documents are required** (`doc_type` + both sides, as `data:image/…` URLs) unless the applicant's identity is already `verified` or `pending`, in which case they are omitted and the application is linked to the submission on file; they are filed as a pending `id_verifications` row (`source='host_application'`) so one admin decision covers host status and identity. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review |
 | GET  | `/api/local/host/listing-gate` | May this host add a listing — `{allowed, code, message, reason}`. Same `code` the create route returns on 403, so the apps can refuse up front. `reason` only on a rejection |
 | GET  | `/api/local/host/commission` | The platform commission — `{rate, percent}` — so the add/edit-listing screens can show a host what guests will pay. Auth required (a guest holding the rate could divide out the host's raw price) |
@@ -142,13 +144,29 @@ non-empty, so `12345` created an account whose display name is `12345` — what 
 reads next to a booking request and what an operator matches against an ID document.
 `src/lib/local/name-policy.ts` decides now, and it is **byte-identical to the web's
 copy** (`scripts/check-name-policy-parity.mjs`), because both repos create accounts in
-the same `users` table. A name must contain **letters** (`\p{L}`, so Arabic counts),
-at least two of them, and at most 60 characters. Deliberately *not* "no digits":
-Franco-Arabic writes real names with numerals (`Ma7moud`, `3omar`), and refusing those
-would turn away exactly the guests this app serves. A 400 carries the plain sentence in
-`error` **and** the code in `nameProblem` (`required` · `letters` · `tooShort` ·
-`tooLong`), the same shape `emailProblem` and `passwordProblem` use, so a client can
-localize the reason without re-deciding it — iOS does, in `Sources/NameRules.swift`.
+the same `users` table. **A name is letters and nothing else** — `\p{L}` in any script
+(Arabic, Cyrillic and the CJK ideographs count), the combining marks that sit on those
+letters (`\p{M}`: harakat, the accent of a decomposed `José`), and the three characters
+that hold a real name together: the space between its parts, the hyphen of `Jean-Luc`,
+the apostrophe of `O'Brien` — both of the last two in the typographic forms a phone
+keyboard actually sends (`’`, `‐`, `‑`), because smart punctuation substitutes them as
+the guest types and the guest cannot see it. At least two letters, at most 60
+characters.
+
+Digits and symbols are refused outright, which is a **tightening**: the first version of
+this rule asked only that a name contain *some* letter, so `Ma7moud` and `3omar` were
+deliberately let in. They are refused now — the field is what an operator matches
+against an ID document, and `Ma7moud` is not what the document says. Two consequences
+worth knowing: a guest who writes their name that way is asked for `Mahmoud`, and an
+account whose stored name predates this rule keeps it until the account next saves a
+name, at which point it is judged like any other.
+
+A 400 carries the plain sentence in `error` **and** the code in `nameProblem`
+(`required` · `invalidCharacters` · `letters` · `tooShort` · `tooLong`), the same shape
+`emailProblem` and `passwordProblem` use, so a client can localize the reason without
+re-deciding it — both apps do, in `Sources/NameRules.swift` and `NameRules.kt`.
+`letters` survives alongside `invalidCharacters` for the one input the character rule
+cannot catch: `-----`, every character legal and no name in it.
 
 A request that sends **no** name at all is still accepted, because social sign-in has
 none: the name falls back to the local part of the address, and to `Guest` when that
@@ -159,10 +177,10 @@ refuses.
 hardest: the application's `full_name` is the name an operator reads *against the ID
 photos* when approving a host, so `12345` was not merely ugly, it was unreviewable. The
 name arrives in `fields.full_name` like the other per-field messages, with the code in
-`nameProblem` beside it. Both clients check the same rule before submitting — iOS
-through `NameRules` (the host form and sign-up share it), Android in
-`HostApplyScreen.kt`, which shows the reason under the field and keeps Submit disabled
-until the name has letters.
+`nameProblem` beside it. Both clients check the same rule before submitting through
+their `NameRules` twin — iOS shares it between the host form and sign-up, and Android's
+`HostApplyScreen.kt` shows the reason under the field and keeps Submit disabled until
+the name clears it.
 
 **`PATCH /api/local/profile` applies it too**, and until now it did not — which made
 every gate above a front door with an open window beside it. Signup refused `12345`,
@@ -299,20 +317,50 @@ as the catalogue grows.
 same catalogue, and a drifted weight would put the same two chalets in different orders
 on the web and in the apps. `scripts/check-ranking-core-parity.mjs` fails on drift.
 
-### The Instapay destination
+### The payment destinations
 
-Guests pay by transferring manually, so the number, QR code and link they see are all
-admin-controlled — edited in the web ops panel at `/ops/payments` and stored as four
-`app_settings` rows (`instapay_handle`, `instapay_instructions`, `instapay_link`,
-`instapay_qr_image`). Validation lives in `src/lib/local/payment-config-core.ts`:
-the link must be `http(s)` (it is rendered inside an anchor), and the QR must be a
-PNG/JPEG/GIF/WebP data URL under ~500KB — SVG is rejected because it can carry markup.
+Guests pay by transferring manually, so everything they see is admin-controlled —
+edited in the web ops panel at `/ops/payments` and stored as `app_settings` rows.
+There are **two destinations**, each with its own on/off toggle:
+
+| Method | Rows | Shown when |
+| --- | --- | --- |
+| `instapay` | `instapay_enabled`, `instapay_handle`, `instapay_instructions`, `instapay_link`, `instapay_qr_image` | enabled, and a handle **or** a link is set |
+| `bank_transfer` | `bank_transfer_enabled`, `bank_name`, `bank_account_name`, `bank_account_number`, `bank_iban`, `bank_instructions` | enabled, and the bank, the account holder **and** an account number or IBAN are all set |
+
+`GET /api/local/payment-config` derives `available_methods` from those two rules, and
+every client renders its picker from that list rather than hardcoding one — that is
+what keeps a toggle meaningful on a build that shipped months ago. Which method the
+guest chose is posted back as `method` on the payment proof, so the reviewer in
+`/ops/payments` knows which account the money should have landed in.
+
+Validation lives in `src/lib/local/payment-config-core.ts`: the Instapay link must be
+`http(s)` (it is rendered inside an anchor), the QR must be a PNG/JPEG/GIF/WebP data
+URL under ~500KB (SVG is rejected because it can carry markup), an account number is
+letters and digits with at least one digit — optionally split by spaces, `-` or `/` —
+and the **optional** IBAN is checked against both the ISO 7064 mod-97 checksum and its
+country's length, because a transposed digit can survive either one alone.
+
+Two rules worth not re-deriving:
+
+- **No migration is needed.** `app_settings` is key/value, `getPaymentConfig()` reads a
+  missing row as `''` and `setSetting()` upserts — which is how the bank destination
+  shipped without touching the schema.
+- **A missing toggle row means ON.** Both methods predate their own toggle, so a
+  database that has never seen these keys must keep showing what it was showing. A
+  method with nothing filled in is hidden by its `configured` rule, not by the toggle,
+  so defaulting to on can never expose an empty destination.
+
+The bank account number and IBAN are stored and shown back **whole**, never masked —
+same reasoning as the host payout method: a masked destination is one nobody can send
+money to.
 
 `instapay_qr_image` holds the QR the admin uploaded, base64-inline like every other
 World-1 image. When it is empty, clients draw their own QR from `qr_payload` (the link
 if one is set, else the handle) — the web with `qrcode.react`, iOS with CoreImage — so
-a guest always has something to scan. Nothing is stored twice: `qr_payload` is derived
-on read, never persisted.
+a guest always has something to scan. Nothing is stored twice: `qr_payload`,
+`bank.iban_formatted`, `bank.configured` and `available_methods` are all derived on
+read, never persisted.
 
 ## The address has to be one mail can reach
 
@@ -775,9 +823,12 @@ imported by a test at all**. The rule that works around it:
 are the working examples.
 
 `name-policy.test.mjs` carries the signup name rule in both directions: that `12345`,
-`٠١٢٣٤`, `0100` and `-----` are refused, and — the half that matters more — that
-`Ma7moud`, `Bo`, `محمد أحمد`, `李伟` and `O'Brien` still get in, because a name rule
-that turns away a paying guest is the worse failure.
+`٠١٢٣٤`, `0100`, `Layla2`, `j.doe`, an emoji and `-----` are refused, that `Ma7moud`
+joined them when the rule tightened to letters-only, and — the half that matters more —
+that `Bo`, `محمد أحمد`, `مُحَمَّد` with its harakat, `李伟`, `Jean-Luc` and `O’Brien`
+with the apostrophe a phone actually sends still get in, because a name rule that turns
+away a paying guest is the worse failure. It also pins that the email fallback reads
+`layla.hassan@` as `layla hassan` and can never seed a name the rule would refuse.
 
 `password-policy.test.mjs` is the web's suite verbatim, which is the point: the two
 copies of the module are byte-identical, so the tests that hold one honest have to
@@ -1009,7 +1060,7 @@ client says so.
 Every staff-gated mutation in this repo now writes a `staff_audit_log` row — it
 previously wrote **none at all**, so an action taken through this API was
 unattributable. That includes `admin/notify` (a push + email blast to every user) and
-`admin/settings/instapay` (the account guests are told to pay).
+`admin/settings/instapay` + `admin/settings/bank` (the accounts guests are told to pay).
 
 `admin/host-applications` was gated on `users.role === 'admin'` — the pre-RBAC check,
 which bypassed the staff module system entirely. It now uses
@@ -1182,21 +1233,35 @@ what keeps the web and the apps agreeing.
 
 ## What a guest gets back when they cancel
 
-Refund maths lives in `src/lib/local/cancellation-core.ts`, shared byte-identically with
-the web and guarded by `scripts/check-cancellation-core-parity.mjs`. It exists because
-the two projects disagreed and both answers were live: for a stay 6 days out this API
-refunded **100% of the host's raw price** while the web refunded **50% of what the guest
-paid**. Same booking, same day, two numbers — decided by which app the guest opened.
+Refund maths lives in `src/lib/local/cancellation-core.ts`. It exists because the two
+projects disagreed and both answers were live: for a stay 6 days out this API refunded
+**100% of the host's raw price** while the web refunded **50% of what the guest paid**.
+Same booking, same day, two numbers — decided by which app the guest opened. (The web no
+longer computes refunds at all; it is UI and calls this API.)
 
 Three things to know:
 
-1. **One flat ladder, on purpose.** 7+ days before check-in refunds 100%, 1–6 days
-   refunds 50%, the day of check-in or later refunds nothing. `listings.cancellation_policy`
-   still exists, hosts still set it, and `createBooking` still snapshots it onto every
-   booking — nothing reads it yet. That is deliberate: when the per-listing
-   flexible/moderate/strict ladder is agreed with the business, switching it on is a
-   change to `refundPercentForDays` plus a read of the snapshot, **not a migration and
-   not a backfill**, because the data has been recorded the whole time.
+1. **The host's policy decides the ladder** (switched on 2026-08-21 — before that one
+   flat ladder applied and the policy was recorded but ignored):
+
+   | days before check-in | `flexible` | `moderate` | `strict` |
+   | --- | --- | --- | --- |
+   | 7 or more | 100% | 100% | 50% |
+   | 5–6 | 100% | 100% | — |
+   | 1–4 | 100% | 50% | — |
+   | day of check-in or later | — | — | — |
+
+   **Nothing refunds on or after the check-in day, under any policy.** The stay has
+   begun; a guest who does not show up has consumed the night the host held. That floor
+   applies to `moderate` too — an earlier unused draft of this ladder returned 50% for
+   moderate however late the cancellation, which would have paid half a stay to a
+   no-show.
+
+   The policy read is the **snapshot on the booking**, never the listing's current
+   value: `COALESCE(b.cancellation_policy, l.cancellation_policy, 'moderate')`. A host
+   tightening their terms cannot reprice a reservation a guest already agreed to.
+   Switching this on needed **no migration and no backfill** because `createBooking` had
+   been writing that snapshot since the column existed.
 2. **The refund is a share of what the GUEST PAID**, commission included — so callers
    must pass a commission-inclusive total, which in SQL is
    `sqlWithCommission('b.total_price', BOOKING_RATE_SQL)`. Refunding the host's raw
@@ -1205,9 +1270,15 @@ Three things to know:
 3. **`isCancellable` blocks the double refund.** A retried cancel would otherwise write a
    second `refund_amount` over the first.
 
-`getCancellationQuote` and `cancelBooking` both take **`(userId, bookingId)`** — in both
-projects. They used to disagree on the order, and since both are strings a swapped call
+`getCancellationQuote` and `cancelBooking` both take **`(userId, bookingId)`**. They used
+to disagree on the order between the projects, and since both are strings a swapped call
 compiles cleanly and silently returns nothing.
+
+The quote's `policy` field now reports the booking's real policy rather than a fixed
+label, so the mobile clients' refund copy resolves per reservation. Hosts choose the
+policy on `/host/new` and `/host/:id/edit` (web), in the Details step of Add listing and
+the availability manager (iOS), and in the listing editor (Android); every surface
+defaults to `moderate`, matching the column's database default.
 
 ## Timestamps are serialised as real UTC
 

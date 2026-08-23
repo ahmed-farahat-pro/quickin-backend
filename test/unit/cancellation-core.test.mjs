@@ -6,43 +6,92 @@
 // needs the extension, and cancellation-core.ts has no relative imports, which is
 // what makes it loadable here. See README → Testing.
 //
-// These tests pin the two decisions taken on 21 Aug 2026, both of which resolved a
-// live disagreement between this API and the web:
-//   1. ONE FLAT refund ladder, pending a business decision on per-listing policies.
-//   2. The refund is a percentage of what the GUEST PAID, commission included.
+// These tests pin the decisions taken on 21 Aug 2026:
+//   1. The refund honours the host's PER-LISTING policy, read from the snapshot on
+//      the booking. (This replaced a flat ladder that ignored the policy entirely.)
+//   2. Nothing refunds on or after the check-in day, under ANY policy.
+//   3. The refund is a percentage of what the GUEST PAID, commission included.
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  refundPercentForDays, refundAmountFor, isCancellable, FLAT_POLICY_LABEL,
+  CANCELLATION_POLICIES, normalizePolicy,
+  refundPercentFor, refundAmountFor, isCancellable,
 } from '../../src/lib/local/cancellation-core.ts'
 
-describe('refundPercentForDays — the flat ladder', () => {
-  test('7 or more days before check-in refunds in full', () => {
-    assert.equal(refundPercentForDays(7), 100)
-    assert.equal(refundPercentForDays(30), 100)
+describe('normalizePolicy', () => {
+  test('accepts the three policies, case- and space-insensitively', () => {
+    assert.equal(normalizePolicy('flexible'), 'flexible')
+    assert.equal(normalizePolicy('  STRICT '), 'strict')
+    assert.equal(normalizePolicy('Moderate'), 'moderate')
   })
 
-  test('1 to 6 days before check-in refunds half', () => {
-    assert.equal(refundPercentForDays(6), 50)
-    assert.equal(refundPercentForDays(1), 50)
+  test('anything missing or unrecognised is moderate, not the extremes', () => {
+    // Matches the database default. A listing created before the column existed, a
+    // client that omits the field and a typo must all land on the middle ground —
+    // never on the strictest or the most generous terms by accident.
+    for (const bad of [undefined, null, '', '   ', 'nope', 'FLEXIBLE!', 42, {}]) {
+      assert.equal(normalizePolicy(bad), 'moderate', `for ${JSON.stringify(bad)}`)
+    }
   })
 
-  test('the day of check-in, or after it, refunds nothing', () => {
-    assert.equal(refundPercentForDays(0), 0)
-    assert.equal(refundPercentForDays(-3), 0)
+  test('the catalog is the three, in order', () => {
+    assert.deepEqual(CANCELLATION_POLICIES, ['flexible', 'moderate', 'strict'])
+  })
+})
+
+describe('refundPercentFor — the per-policy ladder', () => {
+  test('flexible refunds in full right up to the day before', () => {
+    assert.equal(refundPercentFor('flexible', 30), 100)
+    assert.equal(refundPercentFor('flexible', 7), 100)
+    assert.equal(refundPercentFor('flexible', 1), 100)
   })
 
-  test('the boundaries are exactly 7 and 1, not 5', () => {
-    // quickin-backend previously used a per-listing "moderate" ladder that paid 100%
-    // from 5 days out. A stay 6 days away therefore refunded 100% on iOS and 50% on
-    // the web. This asserts the single agreed answer.
-    assert.equal(refundPercentForDays(6), 50)
-    assert.equal(refundPercentForDays(5), 50)
+  test('moderate refunds in full from 5 days out, half inside that', () => {
+    assert.equal(refundPercentFor('moderate', 30), 100)
+    assert.equal(refundPercentFor('moderate', 5), 100)
+    assert.equal(refundPercentFor('moderate', 4), 50)
+    assert.equal(refundPercentFor('moderate', 1), 50)
   })
 
-  test('a non-finite input refunds nothing rather than NaN', () => {
-    assert.equal(refundPercentForDays(NaN), 0)
-    assert.equal(refundPercentForDays(undefined), 0)
+  test('strict refunds half from 7 days out, nothing inside that', () => {
+    assert.equal(refundPercentFor('strict', 30), 50)
+    assert.equal(refundPercentFor('strict', 7), 50)
+    assert.equal(refundPercentFor('strict', 6), 0)
+    assert.equal(refundPercentFor('strict', 1), 0)
+  })
+
+  test('NOTHING refunds on or after the check-in day, under any policy', () => {
+    // The floor is universal and deliberate. An earlier, unused draft of this ladder
+    // returned 50% for moderate no matter how late — which would have paid out half a
+    // stay to a guest who simply never showed up.
+    for (const policy of CANCELLATION_POLICIES) {
+      assert.equal(refundPercentFor(policy, 0), 0, `${policy} on the day`)
+      assert.equal(refundPercentFor(policy, -3), 0, `${policy} after check-in`)
+    }
+  })
+
+  test('an unknown policy is priced as moderate', () => {
+    assert.equal(refundPercentFor('nonsense', 5), refundPercentFor('moderate', 5))
+    assert.equal(refundPercentFor(null, 2), refundPercentFor('moderate', 2))
+    assert.equal(refundPercentFor(undefined, 9), refundPercentFor('moderate', 9))
+  })
+
+  test('a non-finite day count refunds nothing rather than NaN', () => {
+    assert.equal(refundPercentFor('flexible', NaN), 0)
+    assert.equal(refundPercentFor('flexible', undefined), 0)
+    assert.equal(refundPercentFor('moderate', 'soon'), 0)
+  })
+
+  test('no policy is ever more generous than flexible or harsher than strict', () => {
+    // A cheap invariant, but it is the one that would catch a future edit that
+    // accidentally inverted a comparison.
+    for (const days of [-1, 0, 1, 4, 5, 6, 7, 30]) {
+      const flexible = refundPercentFor('flexible', days)
+      const moderate = refundPercentFor('moderate', days)
+      const strict = refundPercentFor('strict', days)
+      assert.ok(flexible >= moderate, `flexible < moderate at ${days} days`)
+      assert.ok(moderate >= strict, `moderate < strict at ${days} days`)
+    }
   })
 })
 
@@ -96,10 +145,3 @@ describe('isCancellable', () => {
   })
 })
 
-describe('FLAT_POLICY_LABEL', () => {
-  test('reports the policy the refund maths actually honours', () => {
-    // Clients show this to the guest. While the ladder is flat it must not claim a
-    // per-listing policy, or the label and the number disagree.
-    assert.equal(FLAT_POLICY_LABEL, 'moderate')
-  })
-})

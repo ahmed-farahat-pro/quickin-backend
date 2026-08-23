@@ -9,13 +9,24 @@
 // request, what a review is signed with, and what an operator matches against
 // an ID document at verification time — a field that only checks for emptiness
 // is not checking anything. Every path that sets a name calls `checkName`:
-// both signup routes, `signUpSchema`, the host application, and the iOS twin.
+// signup, the profile save behind Edit profile, the host application, and the
+// iOS and Android twins.
 //
-// The rule that does the work is `letters`: a name must contain letters. Not
-// "must be Latin", not "must not contain digits" — Franco-Arabic writes real
-// names with numerals (`Ma7moud`, `3omar`) and refusing those would turn away
-// exactly the guests this app is built for. What it refuses is a name with no
-// letters *at all*: `12345`, `0100`, `٠١٢٣`, `----`.
+// The rule that does the work is `invalidCharacters`: a name is made of letters
+// and nothing else. Letters in any script — `\p{L}` takes Arabic, Latin,
+// Cyrillic and the CJK ideographs alike — plus the marks that sit on top of them
+// (`\p{M}`: harakat, a Devanagari matra, the accent in a decomposed `José`), and
+// the three characters that hold a real name together: the space between its
+// parts, the hyphen in `Jean-Luc`, the apostrophe in `O'Brien`. Digits, `@`, `.`,
+// `_`, emoji and every other symbol are refused.
+//
+// This is stricter than the rule that shipped first, which asked only that a
+// name contain *some* letter and so accepted Franco-Arabic spellings like
+// `Ma7moud` and `3omar`. Those are refused now — the field is a legal-ish name
+// matched against an ID document at verification, and `Ma7moud` is not what the
+// document says. A guest who writes it that way is asked for `Mahmoud`. Names
+// already stored with a digit stay as they are until the account next saves a
+// name, at which point this rule applies to it like any other.
 //
 // KEEP IN SYNC — quickin-backend and quickin-frontend each hold a copy, and both
 // create accounts in the same `users` table. If the mobile API accepted a name
@@ -37,7 +48,7 @@ export const MAX_NAME_LENGTH = 60
  * reason: the API echoes the code so a client can localize the reason without
  * re-deciding it.
  */
-export type NameProblemCode = 'required' | 'letters' | 'tooShort' | 'tooLong'
+export type NameProblemCode = 'required' | 'invalidCharacters' | 'letters' | 'tooShort' | 'tooLong'
 
 export interface NameProblem {
   code: NameProblemCode
@@ -46,6 +57,22 @@ export interface NameProblem {
 // A letter in any script — `\p{L}` covers Arabic, Latin, Cyrillic and the CJK
 // ideographs alike, which is the whole point of using it over /[A-Za-z]/.
 const HAS_LETTER = /\p{L}/u
+
+// Anything that is not part of a name. The allowed set, read from the inside
+// out: a letter in any script, a combining mark (harakat, a Devanagari matra,
+// the accent of a decomposed `José` — dropping these would break the very
+// scripts `\p{L}` was chosen for), the space between the parts of a name, the
+// apostrophe of `O'Brien`, the hyphen of `Jean-Luc`.
+//
+// Both punctuation marks are listed twice because a phone does not send the one
+// on the keycap: iOS and Android smart punctuation turn `'` into `’` (U+2019) as
+// it is typed, and a name pasted from a document carries the typographic hyphens
+// (U+2010, U+2011) with it. Refusing those would refuse `O’Brien` for a
+// substitution the guest never made and cannot see.
+//
+// Only U+0020 is listed for the space because `normalizeName` runs first and has
+// already collapsed every other kind of whitespace into it.
+const DISALLOWED_NAME_CHAR = /[^\p{L}\p{M} '\u2019\-\u2010\u2011]/u
 
 // Invisible characters people paste in without meaning to: the soft hyphen, the
 // Mongolian vowel separator, the zero-width spaces and bidi marks, the BOM. They
@@ -77,9 +104,12 @@ function letterCount(name: string): number {
 /**
  * Decide a name. Returns the first problem, or null when it is acceptable.
  *
- * Order matters: `letters` is checked before `tooShort` so `5` is told the thing
- * that is actually wrong with it ("names contain letters") rather than being
- * sent back to add a second digit.
+ * Order matters. `invalidCharacters` is decided before `letters` and
+ * `tooShort`, so `5` and `A1` are told the thing that is actually wrong with
+ * them ("a name is letters only") rather than being sent back to type another
+ * character. `letters` survives that for the inputs made entirely of the
+ * punctuation this rule does allow — `-----`, `'''` — which are legal
+ * characters arranged into something that is still not a name.
  */
 export function checkName(name: unknown): NameProblem | null {
   const value = normalizeName(name)
@@ -87,6 +117,7 @@ export function checkName(name: unknown): NameProblem | null {
   // Count code points, not UTF-16 units — an emoji is one character to whoever
   // typed it, and a name of 60 Arabic characters must not read as 120.
   if ([...value].length > MAX_NAME_LENGTH) return { code: 'tooLong' }
+  if (DISALLOWED_NAME_CHAR.test(value)) return { code: 'invalidCharacters' }
 
   const letters = letterCount(value)
   if (letters === 0) return { code: 'letters' }
@@ -107,8 +138,10 @@ export function nameProblemMessage(problem: NameProblem): string {
   switch (problem.code) {
     case 'required':
       return 'Please enter your name'
+    case 'invalidCharacters':
+      return 'Please use letters only — a name has no numbers or symbols in it'
     case 'letters':
-      return 'Please enter your name — a name contains letters, not only numbers'
+      return 'Please enter your name — a name contains letters'
     case 'tooShort':
       return `Name must contain at least ${MIN_NAME_LETTERS} letters`
     case 'tooLong':
@@ -122,16 +155,24 @@ export function validateName(name: unknown): string | null {
   return problem ? nameProblemMessage(problem) : null
 }
 
+// The characters an address uses to separate the words of a name: `.`, `_` and
+// the `+` of a tagged address. In `layla.hassan@…` they stand where a space
+// stands, so the fallback below reads them as one before it judges the result.
+const EMAIL_WORD_SEPARATORS = /[._+]+/gu
+
 /**
  * The display name for an account created without one — a social login that
  * returned no name, or an older client that posts no `full_name`.
  *
  * The local part of the address is the best guess available, but it is guest
- * input too: `0100@gmail.com` would seed exactly the numeric-only name this
- * policy exists to refuse. When it isn't a usable name, say `Guest` rather than
- * storing something the policy would have rejected at the front door.
+ * input too: `0100@gmail.com` would seed exactly the name this policy exists to
+ * refuse, and `ma7moud@gmail.com` the Franco-Arabic spelling it refuses now.
+ * Separators become spaces, because `layla.hassan` is a name written the only
+ * way an address lets you write it — but nothing else is rewritten. A local part
+ * that still holds a digit is not quietly stripped down to a name the guest
+ * never typed; it says `Guest`, and the guest tells us who they are later.
  */
 export function fallbackNameFromEmail(email: unknown): string {
-  const localPart = normalizeName(String(email ?? '').split('@')[0])
+  const localPart = normalizeName(String(email ?? '').split('@')[0].replace(EMAIL_WORD_SEPARATORS, ' '))
   return isValidName(localPart) ? localPart : 'Guest'
 }
