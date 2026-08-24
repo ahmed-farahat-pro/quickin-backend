@@ -113,6 +113,22 @@ CREATE INDEX IF NOT EXISTS id_change_requests_user_idx
 CREATE UNIQUE INDEX IF NOT EXISTS id_change_requests_one_pending_per_user
   ON id_change_requests (user_id) WHERE status = 'pending';
 
+-- Repair, for a database that already has SOME version of this table. CREATE TABLE IF
+-- NOT EXISTS is a no-op against a table that exists, so a half-built one sails through
+-- the block above and still fails every insert with 42703 undefined_column — which the
+-- API reports as the same 503 as no table at all. No-ops on a correct table.
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS current_value   text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS requested_value text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS doc_type        text NOT NULL DEFAULT 'national_id';
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS image_data      text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS back_image_data text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS reason          text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS status          text NOT NULL DEFAULT 'pending';
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS notes           text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS submitted_at    timestamptz NOT NULL DEFAULT now();
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS reviewed_at     timestamptz;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS reviewed_by     text;
+
 
 -- === D. policy_violations + policy_warnings — the contact-detail guard =======
 CREATE TABLE IF NOT EXISTS policy_violations (

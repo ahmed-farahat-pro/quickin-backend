@@ -46,8 +46,12 @@ async function queueQuery(text: string, params: unknown[] = []) {
     return await pool.query(text, params)
   } catch (err) {
     if (!isMissingRelationError(err)) throw err
+    // The code separates the two cases, and they need different SQL: 42P01 means no
+    // table (CREATE), 42703 means a table missing a column (ALTER). Both are printed
+    // because this line is the only trace of it in a Vercel log.
     console.error(
-      'id_change_requests is not on this database — run scripts/migrate-id-change-requests.mjs against it:',
+      `id_change_requests is unusable on this database (pg ${(err as { code?: string }).code}) — ` +
+        'run scripts/migrate-id-change-requests.mjs against it:',
       (err as Error).message
     )
     throw new IdChangeUnavailableError()

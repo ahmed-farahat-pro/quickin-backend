@@ -22,6 +22,7 @@ import {
 } from './cancellation-core'
 import { resolveResortSelection } from './resorts'
 import { normalizeResortName, validateResortName } from './resort-core'
+import { storeListingPhotos } from './blob-store'
 import type { PoolClient } from 'pg'
 import { randomInt } from 'node:crypto'
 import { createNotification } from './notifications'
@@ -1803,6 +1804,11 @@ export async function updateListingDetails(
   if (!touched.length) throw new ListingInputError('No listing fields to update')
   const requeue = requeuesForReview(touched)
 
+  // As in addListingImages: upload before the transaction, insert the URLs.
+  // Photos already stored as URLs pass through untouched, so re-saving a
+  // listing whose photos have not changed uploads nothing.
+  const storedPhotos = nextPhotos === null ? null : await storeListingPhotos(listingId, nextPhotos)
+
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
@@ -1821,7 +1827,7 @@ export async function updateListingDetails(
       await client.query('ROLLBACK')
       return null
     }
-    if (nextPhotos !== null) await replaceListingImages(client, listingId, nextPhotos)
+    if (storedPhotos !== null) await replaceListingImages(client, listingId, storedPhotos)
     await client.query('COMMIT')
   } catch (e) {
     await client.query('ROLLBACK')
@@ -1871,7 +1877,11 @@ export async function addListingImages(
   if (!isUuid(listingId) || !isUuid(hostUserId)) return null
   const list = Array.isArray(urls) ? urls : [urls]
   if (!list.length) throw new ListingInputError('Please attach at least one photo')
-  const photos = list.map((u) => assertImageSrc(u, 'Each photo must be an image'))
+  const validated = list.map((u) => assertImageSrc(u, 'Each photo must be an image'))
+  // Bytes go to Blob BEFORE the transaction opens: an upload is network I/O and
+  // must never run while this listing's row lock is held. What gets inserted is
+  // the returned URL — see blob-store.ts.
+  const photos = await storeListingPhotos(listingId, validated)
 
   const client = await pool.connect()
   try {
@@ -2454,8 +2464,11 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   )
   const id = rows[0].id as string
   const images = (input.images ?? []).filter((u) => typeof u === 'string' && u.trim()).slice(0, 10)
-  for (let i = 0; i < images.length; i++) {
-    await pool.query(`INSERT INTO listing_images (listing_id, url, "order") VALUES ($1,$2,$3)`, [id, images[i].trim(), i])
+  // The listing row exists, so its id can group the photos in Blob. Uploaded
+  // here rather than inline in the loop so all of them go up concurrently.
+  const storedImages = await storeListingPhotos(id, images.map((u) => u.trim()))
+  for (let i = 0; i < storedImages.length; i++) {
+    await pool.query(`INSERT INTO listing_images (listing_id, url, "order") VALUES ($1,$2,$3)`, [id, storedImages[i], i])
   }
   const created = await getListingById(id, { asHost: true })
   if (!created) throw new Error('Failed to create listing')

@@ -727,6 +727,53 @@ and TypeScript rungs inside it agree with each other. **`scripts/_verify-night-p
 does** — it runs both against a real database over weekend/monthly/NULL/empty-array
 cases. Run it after touching either rung.
 
+## Listing photos live in Blob, not in the database
+
+`listing_images.url` used to hold the photo itself — a `data:image/jpeg;base64,…`
+string of 250–640 KB per picture. The cost of that was not subtle:
+
+| | before |
+| --- | --- |
+| `GET /api/local/listings` | **7,290,461 bytes** for **two** listings |
+| of which `listing_images` | 7,288,792 bytes — **99.97%** |
+| `/en/explore` HTML | 8.4 MB (the server component serialises the same photos into the RSC payload) |
+| wall clock | 38–68 s, against a TTFB of 0.64 s |
+
+It was never a slow query. It was twenty full-resolution JPEGs inlined into JSON,
+served `Cache-Control: no-store` so every visit paid for them again, and growing
+linearly — 50 listings would have been ~180 MB and the page would never have
+finished loading. Base64 also inflates the bytes by a third and, not being a URL,
+defeats every cache between Postgres and the screen.
+
+Photos are now uploaded to Vercel Blob and the row stores the returned https URL:
+~100 bytes per photo, served from the CDN as an immutable cached object.
+
+- **`listing-image-core.ts`** — pure logic: parse a data URL, size it, name its
+  blob key. Unit-tested (`test/unit/listing-image-core.test.mjs`).
+- **`blob-store.ts`** — the upload itself. `storeListingPhotos(listingId, srcs)`
+  is called by `createListing`, `updateListing` and `addListingImages`, always
+  **before** the transaction opens — an upload is network I/O and must not run
+  while a row lock is held.
+- **`scripts/backfill-listing-images-to-blob.mjs`** — moves rows already written.
+  Re-runnable; `--dry-run` reports without uploading.
+
+```bash
+DATABASE_URL='<url>' BLOB_READ_WRITE_TOKEN='<token>' node scripts/backfill-listing-images-to-blob.mjs --dry-run
+```
+
+**Both url shapes stay legal, permanently.** With no `BLOB_READ_WRITE_TOKEN`, and
+if an upload fails, the data URL is stored exactly as before — a missing store or
+a Blob outage costs a slow response, never a host who cannot add a photo. Any
+reader that assumed every url were an https link would blank the photos on every
+listing the backfill has not reached.
+
+**The list response deliberately still carries the whole gallery.** Trimming it to
+a cover photo looks like an easy win and is not one: iOS reads the gallery straight
+off the LIST payload — `ListingDetailView` holds `let listing: Listing` and never
+refetches it — so a trimmed list would leave a tapped card showing one photo
+instead of ten. At ~100 bytes a URL the full set costs ~1 KB per listing; trimming
+was only ever a workaround for the base64 bloat this section removes.
+
 ## Environment
 
 | Var | Required | Purpose |
@@ -734,6 +781,7 @@ cases. Run it after touching either rung.
 | `DATABASE_URL` | yes | Postgres connection string. Falls back to `postgresql://ahmedfarahat@127.0.0.1:5432/quickin_local` for local dev. Managed Postgres (Neon/Vercel/RDS) uses TLS automatically. |
 | `AUTH_SECRET` | yes (prod) | Secret used to HMAC-sign auth tokens. Defaults to a dev secret — set a real one in production. |
 | `GOOGLE_CLIENT_ID` | optional | Enables `/api/auth/google` (Google ID-token audience). |
+| `BLOB_READ_WRITE_TOKEN` | optional | Vercel Blob store for listing photos. Injected automatically when a Blob store is linked to the project; locally via `vercel env pull`. **Unset is a supported state** — photos then keep being stored inline as data URLs, exactly as they were before. See [Listing photos live in Blob, not in the database](#listing-photos-live-in-blob-not-in-the-database). |
 
 ## Run the whole stack locally
 
@@ -939,8 +987,43 @@ at most three characters from the next, and at least three of those gaps contain
 letter (a gap of pure punctuation is the separator collapse's job, already done).
 `0a1b0c1d2e3f4g5h6i7j8`, `05a0b1c2d3e4f5g6` and `12a34b56c78` are blocked;
 `Sizes: 90m2, 120m2, 150m2, 200m2` and `Rooms A12 B34` are not. Under stated intent
-the floor drops to six digits. A number padded in groups of *three* is still only
-caught when its concatenation matches the Egyptian shape or intent is stated.
+the floor drops to six digits.
+
+**Chunked padding, and the leading zero left for the reader.** The scan above ends a
+run at the first group of three digits, because a three-digit group is usually a year
+or a size. `ajajx101 bsjs416 jsua3 aj2 a10` is written entirely in groups of three and
+four, so it read as five unrelated little numbers — and the whole-field shape match
+missed it too, because the writer had dropped the trunk `0` the shape is anchored on.
+Reported by QA against the Android name and bio fields; it applied to all four
+surfaces. What makes it a leak rather than a curiosity is that a reader reconstructs
+`01014163210` from `1014163210` without effort — the `0`, or the whole `01`, is
+decoration, and decoration is the first thing an evader drops.
+
+A second, more forgiving scan (`CHUNK_PADDING`) therefore runs over the same text,
+allowing four-digit groups and wider gaps. Two things keep it from eating honest copy:
+
+* **Glue, not gap length.** A run is held together by letters *touching* the digits
+  that follow them, and it **ends** at the first gap that isn't glue. Padding welds
+  its letters to the number (`bsjs416`) so the eye slides off them; prose keeps a
+  number a word of its own (`floor 12`, `الدور 4`) because that is what makes it
+  readable. `Villa 12, block 3, phase 2, road 9, gate 4, floor 3, unit 21, apt 5`
+  stitches to a perfectly mobile-shaped ten digits and never forms a run at all.
+  Ending the run is what does the second half of that work: `Villas 100m2 to 400m2, 3
+  to 6 bedrooms` has real glue in it — the `m` of each `100m2` — and if an unglued gap
+  merely failed to *count*, those two joins would carry one run across `" to "`.
+* **The run's digits must BE the number, end to end.** Only a country code and/or the
+  trunk zero may sit in front, and nothing may follow. Matching a mobile-shaped
+  *substring* would block `90m2, 120m2, 150m2, 200m2 units`, which stitches to
+  `902120215022002` — that contains one. Anchoring both ends is the whole difference.
+
+The nine-digit form (the whole `01` dropped) is a weaker anchor, so it asks for one
+more glued join before it counts. Under stated intent a chunked run needs no shape at
+all, just eight digits, which is what catches the same trick on another country's plan.
+
+Measured on 200 000 generated number-heavy listing sentences this adds **no** new
+false positives; on a synthetic corpus made *only* of glued alphanumeric tokens
+(`A12 g2000 A50 flat96` — not text a person writes) it costs about 0.8%. It catches
+100% of 4 000 generated chunkings of one number, against 55.6% before.
 
 **Split across messages.** `combinesIntoContact` stitches the sender's last 16
 messages in the thread, so `010` / `1234567` / `8` is caught, as is `kareem@gmail`

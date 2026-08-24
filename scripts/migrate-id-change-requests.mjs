@@ -79,6 +79,26 @@ CREATE INDEX IF NOT EXISTS id_change_requests_user_idx
 -- operator would approve one identity while the other still claimed a different number.
 CREATE UNIQUE INDEX IF NOT EXISTS id_change_requests_one_pending_per_user
   ON id_change_requests (user_id) WHERE status = 'pending';
+
+-- Repair, for a database that already has SOME version of this table.
+-- CREATE TABLE IF NOT EXISTS is a no-op against a table that exists, columns and all,
+-- so a half-built one would sail through this script and still fail every insert with
+-- 42703 undefined_column — the same 503 the user sees for no table at all. These are
+-- no-ops on a table this script just created, and on a correct one.
+-- NOT NULL is deliberately absent here: an existing table may hold rows, and the two
+-- required columns cannot be added as NOT NULL without a default that would invent an
+-- identity number or a document. A fresh table gets the constraints from the DDL above.
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS current_value   text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS requested_value text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS doc_type        text NOT NULL DEFAULT 'national_id';
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS image_data      text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS back_image_data text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS reason          text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS status          text NOT NULL DEFAULT 'pending';
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS notes           text;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS submitted_at    timestamptz NOT NULL DEFAULT now();
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS reviewed_at     timestamptz;
+ALTER TABLE id_change_requests ADD COLUMN IF NOT EXISTS reviewed_by     text;
 `
 
 ;(async () => {
