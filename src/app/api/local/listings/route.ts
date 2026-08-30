@@ -106,6 +106,10 @@ export async function POST(req: Request) {
       weeklyDiscount: b.weekly_discount ?? b.weeklyDiscount,
       monthlyDiscount: b.monthly_discount ?? b.monthlyDiscount,
       weekendPrice: b.weekend_price ?? b.weekendPrice,
+      // `??` deliberately, not a presence check: an absent day set is not the
+      // same statement as an empty one (see resolveWeekendSchedule), and only
+      // the absent one may be answered with Fri+Sat.
+      weekendDays: b.weekend_days ?? b.weekendDays,
       monthlyPrices: b.monthly_prices ?? b.monthlyPrices,
     })
     // A pin that disagrees with the country/region the host chose is reported,

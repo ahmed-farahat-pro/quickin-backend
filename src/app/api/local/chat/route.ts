@@ -9,11 +9,18 @@ import { getUserFromRequest } from '@/lib/local/auth'
 import { pendingWarningFor } from '@/lib/local/moderation'
 import { warningGateBody, WARNING_GATE_STATUS } from '@/lib/local/moderation-core'
 
-// Pre-booking chat (guest ⇄ host). Polled by the web + mobile clients.
+// The Messages inbox (guest ⇄ host). Polled by the web + mobile clients.
 //   GET  /api/local/chat                        → { conversations }
 //   GET  /api/local/chat?conversationId=…       → { messages }
 //   POST /api/local/chat { listingId }          → { conversationId }  (open/reuse a thread)
 //   POST /api/local/chat { conversationId, body } → { message }        (send)
+//
+// `conversations` covers BOTH thread kinds: the pre-booking thread opened from a
+// listing, and the per-reservation thread opened from a reservation request —
+// which used to be invisible here, so a host's reply reached a guest who could
+// only find it by reopening the reservation. Each row carries `kind`, and a
+// reservation thread is addressed as `booking:<uuid>` wherever a conversation id
+// goes. Clients pass the id back untouched; see lib/local/inbox-core.ts.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',

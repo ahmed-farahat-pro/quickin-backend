@@ -19,7 +19,7 @@ npm run dev        # API at http://localhost:4000
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET  | `/api/local/listings` | All published listings. Filters: `?location=&guests=&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD`. `?sort=` is `recommended` (default) \| `price_asc` \| `price_desc` \| `newest`; **`recommended` ranks by rating + completed bookings** — see Search ranking below |
-| GET  | `/api/local/listings/[id]` | One listing by UUID (404 if missing) |
+| GET  | `/api/local/listings/[id]` | One listing by UUID (404 if missing). **404 also when the listing is unpublished** — a listing a host or an operator has taken down stops resolving from a deep link too, not only from search. Its own host still gets it (that is what the dashboard's *View* opens); `?asHost=1` additionally switches to the raw-price projection, and is honoured only for the actual host |
 | POST | `/api/local/listings` | Create a listing (approved + identity-verified host). The response is the listing plus **`pin_warning`** — `null`, or `{code, scope, message}` when the map pin falls outside the `country` / `region` the host chose. It is a **warning**: the listing is created either way. A lat/lng outside ±90/±180 is a different matter and answers **400** |
 | PATCH | `/api/local/listings/[id]` | The host edits their listing. Carries the same **`pin_warning`** field, for the same reason — a pin can be dragged into the wrong country from the editor too |
 | GET  | `/api/local/listings/[id]/calendar` | The listing's day-by-day calendar, `?start=&end=` (**inclusive** of both ends, ≤400 days; defaults to today → +92d). `{ listing_id, currency, commission_rate, base_price, start, end, days[] }` where each day is `{ date, price, source, status }`. `source` is which rung priced the night — `custom` \| `weekend` \| `monthly` \| `base`; `status` is `available` \| `blocked` \| `booked`. **Public, but money-aware:** the listing's host gets their RAW rates plus a `guest_price` companion and the block `note`; everyone else gets only the commission-inclusive figure |
@@ -29,6 +29,11 @@ npm run dev        # API at http://localhost:4000
 | DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
 | POST | `/api/local/bookings` | Create a reservation (auth required) |
 | GET  | `/api/local/bookings` | The signed-in user's reservations |
+| GET  | `/api/local/chat` | **The Messages inbox** — every thread the signed-in user is part of as guest or host, newest activity first: `{ conversations: [{ id, kind, booking_id, listing_id, listing_title, listing_image, other_name, last_message, last_message_at, is_host, check_in, check_out, booking_status }] }`. `kind` is `listing` (the pre-booking thread) or `booking` (**the thread inside a reservation request**, whose `id` reads `booking:<uuid>`); the reservation fields are null on a `listing` row. A reservation appears only once it has at least one message. See One inbox, two kinds of thread below |
+| GET  | `/api/local/chat?conversationId=…` | One thread, oldest first → `{ messages: [{ id, sender_id, body, created_at, mine }] }`. Takes **either** id shape; a non-member gets 400 `Conversation not found`, and a malformed id 400 `Invalid id` |
+| POST | `/api/local/chat` | `{ listingId }` → 201 `{ conversationId, listingTitle }` opens/reuses the pre-booking thread. `{ conversationId, body }` → 201 `{ message }` sends — again on **either** id shape, so a reservation thread is answered from the inbox exactly as it is from the reservation screen |
+| GET  | `/api/local/bookings/:id/messages` | The reservation's thread, as opened from the reservation request itself. Guest, host or admin |
+| POST | `/api/local/bookings/:id/messages` | Send into that thread. **Notifies the other party** (`type: 'message'`, link `/messages`) — the same notification the pre-booking thread has always sent |
 | POST | `/api/auth/signup` | Register (email + password) |
 | POST | `/api/auth/login` | Sign in (email + password) |
 | POST | `/api/auth/social` | Demo social sign-in (`google`) |
@@ -43,6 +48,10 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/admin/settings/bank` | Read the config (same payload as the Instapay route). Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/bank` | Update the bank-transfer half — `{enabled?, bank_name?, account_name?, account_number?, iban?, instructions?}`. `400` with the reason on a malformed account number or IBAN |
 | POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, doc_type, id_front, id_back, company?, notes?}`. **The ID documents are required** (`doc_type` + both sides, as `data:image/…` URLs) unless the applicant's identity is already `verified` or `pending`, in which case they are omitted and the application is linked to the submission on file; they are filed as a pending `id_verifications` row (`source='host_application'`) so one admin decision covers host status and identity. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review |
+| PATCH | `/api/local/host/listings/[id]/visibility` | **The host takes their own listing off the market, or puts it back** — `{is_published: false\|true}` → `{id, is_published, unpublished_by_host, declined_requests, blocked_by, blocked_message, listing}`. There is no host-facing DELETE and there will not be one; see *A host removes a listing by hiding it* below. Deactivating also **declines every booking request still waiting on this host** (`declined_requests` says how many) through the same path a manual decline uses, so each guest gets the ordinary notification. Reactivating clears only the host's own flag: when an account block, the identity gate or the review queue still holds the listing down, `blocked_by` names it (`verification` \| `staff` \| `rejected` \| `under_review`) and `is_published` comes back **false**. 401 unsigned, 403 not the host |
+| PATCH | `/api/local/host/services/[id]/visibility` | The same, for one of the host's standalone services. Declines every pending request. Services have no moderation queue and no identity gate, so a reactivate always goes live and there is no `blocked_by` |
+| GET  | `/api/local/services/[id]` | One service. **404 when unpublished**, except for its own host, who gets the host projection |
+| GET  | `/api/local/host/bookings` | The host's reservation inbox — every booking across their listings, **a bare JSON array**, newest first. Not `{bookings}`: iOS decodes `[HostBooking]`, Android `JSONArray(text)`, and the web reads the array through `hostBookingsFrom()`. Carries two host-only columns the shared booking projection withholds — **`host_payout`** (the raw amount owed, before commission) and **`guest_name`** (null when the guest account is gone). 401 unsigned |
 | GET  | `/api/local/host/listing-gate` | May this host add a listing — `{allowed, code, message, reason}`. Same `code` the create route returns on 403, so the apps can refuse up front. `reason` only on a rejection |
 | GET  | `/api/local/host/commission` | The platform commission — `{rate, percent}` — so the add/edit-listing screens can show a host what guests will pay. Auth required (a guest holding the rate could divide out the host's raw price) |
 | GET  | `/api/local/host/payout-method` | Where QuickIn sends this host's earnings — `{payout_method, payout_ready, is_host}`. `payout_method` is `null` until they add one. Host-only; a guest gets `403 {code:'not_host'}` |
@@ -586,6 +595,20 @@ both: that digit-only, symbol-only and Arabic-Indic-digit titles are refused, th
 the Franco-Arabic and Arabic titles above still get in, that invisibles do not pass
 for content, and that the code chosen for each refusal is the one the host can act on.
 
+**The rule reaches the phones as a translation, not as a 400.** Enforcing it only here
+was still enforcing it three steps too late: the mobile add-listing wizard is four
+steps, its step 1 gated on `title.isNotBlank()`, and the refusal arrived from this API
+on step 4 — after Location, Details and Review, with no way back to the offending field
+but the Back button. (The website never had that failure mode: `/host/new` is a single
+page whose only gate already runs this file.) Both apps now carry a hand-written
+`ListingTitlePolicy` — `mobile/android/app/src/main/java/com/quickin/app/ListingTitlePolicy.kt`
+and the enum of the same name in `mobile/ios/Sources/AddListingView.swift` — checked on
+step 1 of the create wizard and on the editor, with the sentence shown under the field.
+`MIN_TITLE_LETTERS` / `MAX_TITLE_LENGTH` are the contract between all four copies;
+`ListingTitlePolicyTest.kt` mirrors the suite above case for case and is what notices
+when Kotlin drifts. Nothing can run the Swift copy — that project has no test target —
+so it is the one to change by eye, and the parity script's header says so.
+
 ## A listing has to say enough to be a listing
 
 `createListing` required a **title and a price. That was all.** Every other column
@@ -642,6 +665,50 @@ no pin while `0,0` is a real coordinate, that a non-array `images` value is zero
 photos rather than an exemption — and, for the edit door, that clearing any required
 field is refused while a field the patch never mentions is left alone.
 
+## A place has to have somewhere to sleep
+
+Bedrooms, beds and bathrooms were floored at **zero** on both doors: `createListing`
+wrote `Math.max(0, Math.floor(value ?? 1))` straight into the row, the patch door
+asked for a whole number of at least `0`, and both mobile wizards' steppers went
+**down to 0** — so a host could publish a chalet with 0 bedrooms, 0 beds and 0
+bathrooms. Those three numbers are the line under every listing card ("0 bedrooms ·
+0 beds · 0 baths"), they are what a guest filters and compares on, and a stay with
+nowhere to sleep is not a stay. `max_guests` had a floor of 1 already, because a
+0-guest listing cannot be booked at all (`createBooking` checks `guests <=
+max_guests`) — the other three simply never got one.
+
+**`src/lib/local/listing-capacity-policy.ts`** decides now, for all four counts:
+
+| Door | What it does |
+| --- | --- |
+| `createListing` | Judges `bedrooms`, `beds`, `bathrooms` and `max_guests`. An **omitted** field still falls back to its documented default (1/1/1/2) — a client that never asks the question is not the same as a host answering zero — but a value that IS sent must clear the floor. Throws `ListingInputError`, so the create route answers **400** |
+| `updateListingDetails` | Same floor on each of the four capacity branches, so a listing created with a real capacity cannot be edited down to nothing |
+
+The rule is deliberately dull: each count is a **whole number of at least
+`MIN_CAPACITY` (1)**. There is no upper bound — an unusually large villa is not an
+error, and a cap invented here would start refusing edits to rows that already exist.
+`parseCapacity` is strict where `Math.floor(Number(v))` was lenient: `2.5`, `1e3`,
+`0x2`, `true` and `['2']` are refused rather than silently rounded into a number
+nobody typed, and Arabic-Indic digits (`٣`) are folded to ASCII first, because these
+values arrive as JSON from the mobile apps where no browser number input is involved.
+`required` is reported before `notWhole`, so an empty field hears "you skipped this"
+rather than being told that nothing is not a whole number.
+
+**A studio is entered as 1 bedroom, not 0.** The property type already says "Studio",
+and a capacity line reading zeroes tells a guest nothing. If studios should instead be
+modelled with 0 bedrooms, `MIN_CAPACITY` is the one constant to change (and
+`test/unit/listing-capacity-policy.test.mjs` the one suite to update).
+
+`listing-capacity-policy.ts` is byte-identical to the web project's copy;
+`scripts/check-listing-capacity-policy-parity.mjs` fails if they drift (`npm run check`
+runs it) — both repos write into the **same** `listings` table, so a floor living in
+only one of them means "0 beds" is refused on the website and created from the phone.
+`test/unit/listing-capacity-policy.test.mjs` is the same suite in both: that `0` and
+the string `'0'` are refused for every field, that a blank field is `required` rather
+than `notWhole`, that fractions and exotic JSON shapes are refused instead of floored,
+that Arabic-Indic digits are read as the numbers they are, and that each refusal
+carries the code and field a client needs to localize it.
+
 ## A night costs what the host said that night costs
 
 A listing carries one `price_per_night`, but a host does not want one price. They want
@@ -652,7 +719,7 @@ say so, one day at a time.
 The rule is a ladder, and the calendar sits on top of it:
 
 ```
-listing_date_prices  →  weekend_price (Fri/Sat)  →  monthly_prices[month]  →  price_per_night
+listing_date_prices  →  weekend_price (on the listing's weekend_days)  →  monthly_prices[month]  →  price_per_night
 ```
 
 A day the host pinned beats every seasonal rule. That is the whole point: "this Thursday
@@ -726,6 +793,99 @@ All three rungs now come from `date-pricing-core.ts`, which the parity guard cov
 and TypeScript rungs inside it agree with each other. **`scripts/_verify-night-price.mjs`
 does** — it runs both against a real database over weekend/monthly/NULL/empty-array
 cases. Run it after touching either rung.
+
+### Resolved: a weekend the host chooses
+
+**Fixed 26 Aug 2026.** "Weekend" is not Friday and Saturday everywhere, and it is not
+Friday and Saturday for every property — a chalet's busy nights are not a city flat's.
+`listings.weekend_days` (`integer[]`, `0`=Sun … `6`=Sat) is what the ladder reads, and
+`NULL` means "the host never chose", which falls back to Fri+Sat.
+
+The column existed, the ladder read it, and **nothing ever wrote it.** When the two
+backends were merged this door was dropped along with `?asHost` (see
+*The host edit form reads RAW prices*):
+
+| | was | now |
+| --- | --- | --- |
+| `LISTING_COMMON_COLS` | absent — no client ever received the days | selected, in **both** projections |
+| `createListing` | absent — the create door dropped them | `weekendDays`, resolved with the rate |
+| `ListingPatch` | absent — the edit door dropped them | `weekend_days`, resolved with the rate |
+| `source` label (calendar + quote) | hardcoded `dow IN (5, 6)` | `weekendNightSql()`, the price's own expression |
+
+The symptom was silence in three directions at once. The web forms rendered day pills,
+validated them and PATCHed `weekend_days` into a route that ignored the key — and could
+not seed the pills on the edit form either, since the read never returned them, so a
+host who had chosen Thu+Fri was shown Fri+Sat every time they opened their own listing.
+Both mobile apps had no picker at all and said so in their copy ("Applied on Fri + Sat
+nights"). Nothing threw anywhere.
+
+**The rate and the days are one field with two column names**, and
+`listing-pricing-core.ts` — now byte-identical across both repos, guarded by
+`scripts/check-listing-pricing-core-parity.mjs` — is the only place that decides what a
+pair means. `resolveWeekendSchedule(rate, days)`:
+
+- **no rate** → no days, always. Clearing the weekend price clears its days at every
+  door, so weekend pricing cannot be left half-on.
+- **days absent** → on **create**, `DEFAULT_WEEKEND_DAYS`: the client never asked the
+  host, and Fri+Sat is what its own UI promised them. On **patch**, the stored set is
+  left alone — an older mobile build sends the rate by itself, and it must not stamp
+  Fri+Sat over a weekend the host moved on the web.
+- **days empty under a real rate** → refused (`noDaysChosen`). The host cleared every
+  pill, so the rate could never be charged on any night; guessing Fri+Sat back would put
+  two days back without telling them.
+- **all seven days** → refused (`wholeWeek`). That is a nightly price wearing a
+  weekend's name, and it leaves `price_per_night` applying to no night at all.
+
+Patching the days alone is allowed and reads the stored rate first to judge the pair —
+"I moved my weekend to Thu+Fri" is a whole edit on its own.
+
+`weekend_days` is in `EDITABLE_LISTING_FIELDS`, so changing it re-queues the listing for
+review exactly as changing the weekend **price** already did.
+`test/unit/listing-pricing-core.test.mjs` is the same suite in both repos and locks each
+of those four answers, including that an absent day set and an empty one are never
+squashed together.
+
+The label fix is the same class of bug one layer down: the price and the `source` badge
+beside it were built by two different expressions, and only one of them had been taught
+about `weekend_days`. A Thu+Fri host was charged the weekend rate and told the night was
+`base`. `weekendNightSql()` is now the single expression both use.
+
+### Resolved: a weekend or seasonal rate of `0`
+
+**Fixed 26 Aug 2026.** A host typed `0` into Weekend price, or into August under
+Seasonal pricing, and the listing saved. No error, no warning — and no weekend rate
+either. Reported against iOS and Android; the API was the layer that made it possible on
+every client at once.
+
+Every layer coerced the zero away instead of refusing it:
+
+| | was | now |
+| --- | --- | --- |
+| `createListing` | `cleanPrice(0)` → `null` → `weekend_price` stored NULL | `checkWeekendPrice` → **400** `Weekend price must be greater than 0` |
+| `createListing` | `cleanMonthlyPrices` kept only positive months → the month vanished | `checkMonthlyPrices` → **400**, naming the month |
+| `updateListing` | same two helpers, same silence | the same two checks, same messages |
+| iOS `SeasonalPricingFields.parseWeekend` | `nil` for anything ≤ 0 | `ListingPricingRules.checkPrice` — refused in the field and on save |
+| Android `toDoubleOrNull()?.takeIf { it > 0.0 }` | dropped | `ListingPricingRules.checkPrice` — same |
+
+`cleanPrice` and `cleanMonthlyPrices` are gone. Both doors now run
+`listing-pricing-core.ts`, which is the file the two web forms already ran before
+submitting, so the API and the website judge these fields with one file
+(`scripts/check-listing-pricing-core-parity.mjs` keeps the two copies identical).
+
+**Empty is still how a rate is cleared, and that is the half that must not break.**
+`null`, `undefined` and `''` all mean "no weekend rate" and still save; clearing the rate
+still takes its `weekend_days` with it. Nothing that reaches these doors ever meant
+"clear" by sending a zero — both mobile clients send an explicit `null`, and the web
+forms refuse a typed `0` before they submit — so refusing `0` costs no client anything.
+
+The month is **named** in the refusal (`monthPriceMessage`): a host with twelve month
+fields open needs to know which one to fix. The API says it in English; the web forms and
+both mobile apps name the month in the reader's own language from their own month
+formatter.
+
+`test/unit/listing-pricing-core.test.mjs` (both repos) locks the rules and the messages;
+`test/listing-edit.mjs` locks both doors end to end — every zero/negative/non-numeric
+shape 400s on create and on patch, and clearing still 200s.
 
 ## Listing photos live in Blob, not in the database
 
@@ -846,7 +1006,8 @@ npm run test:watch
 | `test/unit/*.test.mjs` | **Unit tests.** Offline, assertion-based, what `npm test` runs. | Yes |
 | `test/*.mjs` | **Live-HTTP smoke scripts that hit PRODUCTION** and write real rows. | **No** — run deliberately |
 | `scripts/_guardtest.mjs` | The original offline guard script (phone numbers only). Superseded by `test/unit/contentguard.test.mjs`; kept because it still passes and costs nothing. | Yes |
-| `scripts/check-*-parity.mjs` | Fail if a file duplicated across both repos has drifted. | Yes |
+| `scripts/check-*-parity.mjs` | Fail if a file duplicated across both repos has drifted. Includes `payment-flow-core.ts`, which now carries the stay-pass gate as well as the payment stages. | Yes |
+| `scripts/_verify-*.mjs` | **Database-backed proofs** of things a unit test cannot reach — that the SQL and its TypeScript twin agree, or that a whole flow behaves. They need `DATABASE_URL` and create/delete their own fixtures. | Against a LOCAL database |
 
 The scripts name `test/unit/*.test.mjs` explicitly rather than passing a directory —
 Node treats *every* file under `test/` as a test file, so a bare `node --test` would
@@ -921,6 +1082,44 @@ verification query plus the smoke scripts.
 > **There is no CI.** No `.github/`, no `vercel.json` here — Vercel only runs
 > `next build`, so a failing test cannot block a deploy. `npm run check` is a
 > **manual gate**. Wiring it into a GitHub Action is the obvious next step.
+
+## One inbox, two kinds of thread
+
+QuickIn grew two independent message stores between the same two people:
+
+| Store | What it is | Opened from |
+| --- | --- | --- |
+| `conversations` + `chat_messages` | The **pre-booking** thread — one per (listing, guest) | "Message host" on a listing |
+| `messages` (booking-scoped) | The **reservation** thread — one per booking | The reservation request, by either side |
+
+`GET /api/local/chat` read only the first one. So a host who replied inside a
+reservation request sent a message that was delivered, stored and readable — and
+completely absent from the guest's Messages screen. The only door to it was
+reopening that reservation, which a guest with an empty inbox has no reason to do.
+On top of that, `createMessage` never notified anyone, so nothing pointed at the
+reservation either. The message existed; the guest had no way to learn it did.
+
+The inbox is now the union of both stores.
+
+| Piece | What it does |
+| --- | --- |
+| `lib/local/inbox-core.ts` | The pure seam. `bookingThreadId` / `parseThreadId` namespace a reservation thread as **`booking:<uuid>`**, and `mergeInboxThreads` interleaves the two result sets by `last_message_at` (newest first, missing timestamps last, capped at `INBOX_LIMIT`). Rejecting a malformed id lives here too — the prefix would have walked straight past the `isUuid` guard the callers used to lean on |
+| `listConversations` | Runs both queries and merges them. The reservation query's `JOIN LATERAL … ON true` does double duty: it fetches the row's last-message preview **and** drops reservations nobody has spoken in, because an inner lateral join with no matching row eliminates the booking. An inbox listing every booking would be a second copy of the trips list |
+| `listChatMessages` / `postChatMessage` | Accept **either** id shape. A `booking:` id is authorized against the booking (its guest, or the listing's host — the same rule `/api/local/bookings/:id/messages` applies) and then delegates to `getBookingMessages` / `createMessage` |
+| `createMessage` | Now notifies the other party, exactly as `postChatMessage` always has |
+
+The two stores are deliberately **not** merged into one scrollback. A guest can book
+the same listing twice, and a message about the March stay does not belong in the
+August one — so each reservation keeps its own thread and earns its own inbox row,
+carrying `check_in` / `check_out` so the clients can label which stay it is about.
+
+Because the id is opaque to callers, one endpoint change fixed all three clients:
+iOS, Android and the web all hand `id` straight back. They each gained a
+"Reservation · 12 Sep – 15 Sep" line on the row, and nothing else.
+
+`test/unit/inbox-core.test.mjs` locks the namespace round-trip, the rejection of
+malformed ids, the interleaving order, and that reservation-only fields never leak
+onto a pre-booking row.
 
 ## Contact details are blocked, everywhere a user can type
 
@@ -1216,6 +1415,56 @@ The flow, unchanged in the schema: `payment_proofs.status = 'submitted'` +
 mobile apps already gate on (`payment_status == "submitted"`), so no app change was
 needed.
 
+## The stay pass waits for the money, not for the host
+
+**The defect.** A guest requested a stay, the host tapped Approve, and the reservation
+pass was live immediately — the QR, the Apple Wallet pass, the public `/stay/<code>`
+page and the host's stay guide behind it — on both the guest's screen and the host's,
+with nothing paid.
+
+**Why.** The gate everywhere read `status = 'confirmed'`. That status means *the host
+accepted the request*, nothing more: `setBookingStatus` mints `reservation_code` at
+exactly that transition (see `issueCodeSql`), and payment happens **afterwards** — a
+guest can only pay a confirmed booking, which is what `canPay` enforces. So `confirmed`
+was both the moment the pass appeared and precisely the moment it should not.
+
+**The rule.** `isLiveStayPass` in `src/lib/local/payment-flow-core.ts`:
+
+> `confirmed` **AND** the payment approved — plus `completed` unconditionally.
+
+- Payment must be **approved**, not merely submitted. A screenshot in the ops queue
+  (`submitted` / `disputed`) is not money in the account, so the rule asks
+  `paymentStageFor` rather than comparing a column.
+- `completed` keeps its pass whatever the payment columns say. The stay happened, so the
+  pass is the guest's receipt of it, and rows predating this rule don't lose it.
+- The rule says nothing about `reservation_code`. That is the *other* half of the gate
+  and each caller already owns it, so a paid stay whose code never landed still renders
+  nothing.
+
+**Where it is enforced.** One rule, five surfaces — a client-side gate alone would only
+have hidden the QR, not the pass behind it:
+
+| Surface | What the rule stops |
+|---|---|
+| `getStayByCode` | `is_live` on the payload; `guide` is withheld entirely when false, so a scan of an unpaid code can't read the gate codes |
+| `GET /api/wallet/pass/:id` | `400` instead of a signed `.pkpass` |
+| `listStayGuide` | a **guest** without a live pass gets `[]`; the host and an operator always read it |
+| Web / iOS / Android | no QR, no code, no stay link, no Wallet button — a placeholder saying the payment is what's outstanding |
+
+**The reservation code is deliberately still issued at approval.** It is the reference
+the acceptance email, the host's inbox card, the ops queues, disputes and payouts all
+quote. It just stopped being the pass. The acceptance email now says so — *"Your host
+accepted — one step left"*, with a Pay CTA — instead of "Your stay is confirmed".
+
+**The host's stay-guide editor is the one deliberate exception.** It unlocks on approval,
+not on payment, so the host can write check-in notes while the guest pays. Nothing
+reaches the guest early: their read is gated on the pass, on the server and in all three
+clients.
+
+Covered by `test/unit/stay-pass-core.test.mjs`, mirrored verbatim in the web repo and
+translated into `StayPassGateTest.kt` (Android) and `Tests/StayPassGateTests` (iOS). A
+change to the rule belongs in all four.
+
 ## How a host gets paid — the payout method
 
 Money flows *in* through Instapay (above) and *out* to whatever destination the host
@@ -1292,10 +1541,114 @@ on the web and then edits that listing from the app must not be refused over it.
 | `checkOwnershipDoc` | Returns `'missing' \| 'unsupported' \| 'too_large'` or `null`. Returns the problem instead of throwing so this repo can raise `ListingInputError` (which the routes map to 400) while the web raises a plain `Error` — both answering with the same sentence from `ownershipDocProblemMessage` |
 | `assertOwnershipDoc` (db.ts) | The edit paths: `setListingOwnershipDoc` and `updateListing`'s `ownership_doc` field. Refuses the write and tells the host why |
 | `createListing` | Deliberately does **not** refuse: an unusable document is stored as `null` and the listing still enters the moderation queue, as it always has |
+| `ownershipDocAction` | `'upload'` or `'reupload'` — which action a host's own listing card should offer, from `has_ownership_doc` alone |
+
+#### "Re-upload" is a claim, and it has to be true
+
+The document is **optional at create time** (it is not in `LISTING_REQUIRED_FIELDS`,
+and `createListing` stores an unusable one as `null`), so a listing reaches the
+moderation queue as `pending` with nothing attached. All three host dashboards used
+to label that card's button off the *approval status* — pending or rejected → "Re-upload
+ownership document" — which told hosts who had never uploaded anything to re-upload it.
+
+`LISTING_COLS_HOST` therefore carries **`has_ownership_doc`**: a boolean, never the
+document (that stays admin-only, one at a time, from the audited
+`/api/local/admin/documents/ownership/:id`). It rides on `GET /api/local/host/listings`
+and `GET /api/local/listings/:id?asHost=1`, and `ownershipDocAction` turns it into the
+label. Absent → `'upload'`: an older client's unknown must not become a claim that a
+document is already on file. The two mobile apps mirror the same rule off
+`Listing.hasOwnershipDoc`.
 
 **Kept byte-identical with the quickin-frontend copy** — both write the same Neon
 column. `scripts/check-ownership-doc-core-parity.mjs` (wired into `npm run check`)
 fails on drift.
+
+## A host removes a listing by hiding it
+
+There is no host-facing listing DELETE, and there is not going to be one.
+
+A listing id is load-bearing. `bookings`, `reviews`, `messages`, `payment_proofs`,
+`stay_guide_items`, `listing_date_prices` and `listing_blocked_dates` all point at
+it, most of them `ON DELETE CASCADE`. Deleting the row to satisfy "remove my
+listing" would take a guest's completed, paid-for stay with it — including the
+record of what they were charged and the conversation that surrounded it.
+
+So the host's *Deactivate* is a reversible unpublish: `listings.is_published`
+goes false and **not one row is deleted**. That already means something, because
+both readers were built to honour the flag long before there was a button:
+
+- `getListings()` filters on `l.is_published = true`, so search and Explore drop it.
+- `createBooking()` re-checks it, so a stale client or a deep link cannot book it.
+- `GET /api/local/listings/:id` now answers **404** for anyone but the host, so a
+  shared URL stops rendering it too.
+
+Existing bookings are untouched, on purpose. A guest with a confirmed stay keeps
+their reservation, their QR pass, their `/stay/<code>` page and their messages;
+the money and the cancellation policy were snapshotted onto the booking when it
+was made, so nothing about it depends on the listing still being live.
+
+**Requests still waiting on the host are declined**, and this is the one
+destructive thing a deactivate does. Leaving them would let a guest end up with a
+confirmed stay at a place the host has walked away from — the exact outcome the
+takedown exists to prevent. Each decline runs through the same `setBookingStatus`
+a manual decline uses, so the guest gets the ordinary "your request was declined"
+notification, push and email rather than silence. The count travels with the card
+as `pending_request_count`, so all three clients name the number in the
+confirmation dialog *before* the host commits, and the response reports what
+actually happened as `declined_requests`.
+
+### Four parties, four flags, one rule
+
+A listing can be held down by more than one party at a time, and each may only
+release its own grip:
+
+| Who | Flag | Released by |
+| --- | --- | --- |
+| The host | `unpublished_by_host` | The host, via the visibility route |
+| An account block or removal | `unpublished_by_admin` | Returning the account to active |
+| The identity gate | `unpublished_by_verification` | Verifying the host again |
+| An operator, by hand in `/ops` | *(none — deliberately)* | The same operator, by hand |
+
+The rule that keeps it honest is **a host may only re-publish what the host
+themselves hid** — which is why reactivating is gated on `unpublished_by_host`
+rather than on "is it currently unpublished". That single condition is also what
+makes the flagless operator takedown safe: `adminSetListingPublished(id, false)`
+writes no flag (a flag would make an account-unblock resurrect a listing an
+operator killed by hand), so the host sees `unpublished_by_host = false` and is
+offered nothing to reactivate.
+
+It composes in both directions. Approving a listing publishes it *unless* the
+host has taken it down (`publishOnApprovalSql`), so a host who deactivates while
+their edit sits in the queue does not have it dragged back onto the search page
+by the approval. An operator's *Show* is refused on a host-hidden listing for the
+same reason, and `/ops` labels the row "Hidden by host" instead of offering the
+button. An account restore and a re-verification each skip anything the host is
+also holding.
+
+Reactivating against another party's hold is still allowed and still useful: it
+clears the host's flag, `is_published` stays false, and the response's
+`blocked_by` / `blocked_message` say who is still holding it — so the listing
+returns the moment that reason clears instead of staying dark forever.
+
+The whole rule set is one pure module, `src/lib/local/host-visibility-core.ts`,
+unit-tested in `test/unit/host-visibility-core.test.mjs` and **byte-identical to
+the web's copy** (`scripts/check-host-visibility-core-parity.mjs`, run by `npm run
+check`). The backend enforces it on the write; the web dashboard renders the
+badge, the filter chip and the button from the same functions. If the two drifted,
+the web would offer a Reactivate on a listing the API refuses to republish — or
+badge a deactivated listing "live".
+
+### Services work the same way
+
+`services.unpublished_by_host` is the twin, behind
+`PATCH /api/local/host/services/:id/visibility`. Deactivating declines every
+pending `service_requests` row, `getServices()` drops it, `GET
+/api/local/services/:id` 404s for everyone but the host — and
+`createServiceRequest()` now refuses an unpublished service, which it did not
+before, so "removed" no longer meant "removed from the list but still taking
+requests through the back door". Services have no moderation queue and no
+identity gate, so the host's flag is the only reason one is ever down and a
+reactivate always goes live.
 
 ## Account status — blocked and removed accounts
 
@@ -1409,6 +1762,138 @@ policy on `/host/new` and `/host/:id/edit` (web), in the Details step of Add lis
 the availability manager (iOS), and in the listing editor (Android); every surface
 defaults to `moderate`, matching the column's database default.
 
+## What a cancelled reservation ENDED as, and who still owes money
+
+The reported defect: **"Cancelled" said nothing about the refund.** A guest who
+cancelled 10 days out and got everything back, one who cancelled 2 days out and got
+half, and one who cancelled on the morning of check-in and got nothing all read the
+same word — on their own screen and on the host's. The refund is the whole substance
+of a cancellation and it was the one thing the status did not say.
+
+`bookings.status` is unchanged: `cancelled` stays the single lifecycle value every
+query, filter and host inbox already speaks. Only the LABEL splits, and it is derived
+by `refundOutcomeFor` in `src/lib/local/cancellation-core.ts` (tests:
+`test/unit/cancellation-core.test.mjs`):
+
+| outcome | when | shown as |
+| --- | --- | --- |
+| `open` | not cancelled | the plain status |
+| `refunded` | `refund_percent >= 100`, guest had paid | Refunded |
+| `partially_refunded` | `0 < refund_percent < 100`, guest had paid | Partially Refunded |
+| `cancelled` | no refund earned, **or the guest never paid** | Cancelled |
+
+Two decisions:
+
+1. **An unpaid cancellation is a plain cancellation.** The ladder quotes a percentage
+   for every cancellation, paid or not, and most cancellations are pending requests
+   called off before any transfer — so the ladder happily says "100%" of nothing.
+   Labelling that "Refunded" tells a guest money came back that was never taken.
+   `payment_status = 'paid'` **or** a `paid_at` stamp is the gate.
+2. **`refund_percent IS NULL` is no refund, never an invented one** — the same rule
+   host retention already applies, for the same reason: an `/ops` cancellation and
+   every row written before the column existed have no refund recorded, and guessing
+   here is the one mistake with a cash cost.
+
+`CancellationOutcome.swift` and `CancellationOutcome.kt` are the mobile twins of this
+function, each with its own suite (`mobile/ios/Tests/run.sh`,
+`CancellationOutcomeTest.kt`). They must answer the same word for the same booking.
+
+### The refunds queue (`/ops` → Payments)
+
+There is no payment gateway. Cancelling records what the guest is **owed**
+(`refund_percent` / `refund_amount`) and stops; a human transfers the money. Until
+this queue existed nothing on this side listed who was still waiting — a guest's app
+could say "Refunded" while no operator had any record that anything was outstanding.
+
+Run `node scripts/migrate-refund-settlement.mjs` first: it adds `bookings.refunded_at`
+(NULL = still due), `refunded_by`, `refund_reference`, and the partial index the queue
+reads. It prints the backlog it finds. **Deliberately separate from `cancelled_at`** —
+the two are days apart, and reusing it would call every cancellation settled the moment
+it was made.
+
+| Route | Does |
+| --- | --- |
+| `GET /api/local/admin/refunds` | `{ due, settled }` — oldest debt first, last 100 settlements |
+| `POST /api/local/admin/refunds` `{booking_id, reference?}` | marks it sent, notifies + pushes the guest |
+
+Both are gated on the **`payments`** module, not a new one: the person who reviews
+transfer screenshots and disputes is the person who moves the money back, and a fresh
+module would need granting to every existing moderator before anyone could see the
+queue. `adminMarkRefunded` is idempotent by construction — the `UPDATE` still carries
+`refunded_at IS NULL`, so a double-click or a second moderator gets a **409**, not a
+restamped row under a second name. The POST is audited (`refund_sent`).
+
+`isRefundDue` in the core and `REFUND_DUE_SQL` in `db.ts` are twins: cancelled, refund
+earned, guest had paid, not yet settled. If they drift, a row shows as due in `/ops` and
+settled on the phone.
+
+**`adminMarkRefunded` does not touch `payment_status`.** Writing `'refunded'` there is
+the retired Paymob vocabulary that analytics reads as "this booking earned nothing"
+(`REFUNDED_SQL`) — and a *partial* refund did earn something, so it would silently erase
+the half the platform kept from every revenue figure.
+
+## What a host keeps when a booking is cancelled
+
+The mirror of the section above, and the fix for a reported bug: **cancelling a booking
+under a no-refund policy deducted 100% of the host's earnings** even though the guest was
+refunded nothing. `getHostEarnings` carried a blanket `b.status <> 'cancelled'`, so the
+moment a booking was cancelled it vanished from the host's totals — the host was charged
+for a refund that never happened. `getHostAnalytics` had the *opposite* bug: it summed
+every paid booking with no cancellation filter at all, so a fully refunded stay was
+reported as full revenue. Two screens, two contradictory wrong answers, one booking.
+
+The rule now lives once, in `src/lib/local/host-retention-core.ts`
+(tests: `test/unit/host-retention-core.test.mjs`):
+
+> A cancelled booking is worth the fraction of it that was **not** refunded, and that
+> fraction applies to **both** sides of the money — the host's raw price and the
+> platform's commission shrink together.
+
+| `refund_percent` | host keeps | platform keeps its commission on |
+| --- | --- | --- |
+| `0` / `NULL` | 100% | 100% |
+| `50` | 50% | 50% |
+| `100` | nothing (row is hidden) | nothing |
+
+Anything **not** cancelled is worth 100% of itself, so this is a no-op on almost every
+row. `payment_status` still has to be `paid` — a payment reversed to `refunded`/`voided`
+is excluded before this module sees it.
+
+Three decisions worth knowing:
+
+1. **The split is proportional, not host-absorbed.** A guest who paid 11,000 (10,000 to
+   the host, 10% markup) and is refunded 50% leaves 5,500 behind: **5,000 host, 500
+   platform**. The platform does not keep a whole commission on half a stay, and the host
+   does not absorb the entire refund out of their own side.
+2. **`refund_percent IS NULL` means *no* refund, not a full one.** `adminSetBookingStatus`
+   cancels without writing the column, and no cancellation taken before the column existed
+   has it. Reading NULL as a full refund would silently confiscate a host's earnings on
+   every `/ops` cancellation. `0` also matches what the `/ops` reports already show for
+   those rows (`COALESCE(b.refund_percent, 0)`), so the money an operator sees as "not
+   refunded" is exactly the money the host sees as earned. **Consequence: hosts with
+   historical cancellations will see their totals go up when this deploys.** No migration
+   is involved — the numbers are derived at read time.
+3. **A cancellation settles when it is cancelled.** Its retained amount is reported as
+   `paid_out`, never `upcoming` — there is no future check-out date to wait for.
+
+Callers, all reading the same builders (`sqlRetained`, `sqlRefundPercent`,
+`sqlHasRetainedValue`):
+
+| Surface | Figure |
+| --- | --- |
+| `getHostEarnings` (`GET /api/local/host/earnings`) | `totalEarned`, `paidOut`, `pending`, `guestPaid`, every `recent[].gross` / `.net` |
+| `getHostAnalytics` (`GET /api/local/host/analytics`) | `revenue`, `byMonth[].revenue`, `topListings[].revenue` |
+| `revenueReport` (`/ops` → Revenue) | `hostPayouts`, `pendingPayout`, `settledPayout` |
+
+`gross`, `commission` and `refunded` in the `/ops` revenue report are deliberately left
+alone: they record what was charged at the time, and `refunded` is the separate line that
+reverses it.
+
+Each `recent[]` row now also carries **`cancelled`** (boolean) and **`refundPercent`**
+(0–100) so a client can label the row rather than showing an unexplained part-payment.
+Both are additive; `status` keeps its two values (`paid_out` / `upcoming`) because shipped
+mobile decoders switch on it.
+
 ## Timestamps are serialised as real UTC
 
 Every `to_char(...)` that renders a timestamp for a client goes through
@@ -1444,12 +1929,84 @@ Refused when:
   or a stale client, and without the check "hide their listings" would only hide them;
 - **adults + children exceeds `max_guests`** (infants and pets are recorded but do not
   count toward the headcount);
-- the window overlaps a live booking — `status NOT IN ('cancelled', 'rejected')`, since a
-  rejected booking must not hold dates hostage — **or a range in `listing_blocked_dates`**,
-  a day the host blocked on their calendar even though no booking exists for it.
+- the window overlaps an **accepted** stay — `status IN ('confirmed', 'completed')`, see
+  *Only an accepted stay holds the dates* below — **or a range in `listing_blocked_dates`**,
+  a day the host blocked on their calendar even though no booking exists for it;
+- the same guest already has a **pending request overlapping those same nights** on that
+  listing. Rival requests from *different* guests are the point; the same guest holding two
+  live requests for one window is a double-tap, and it would put two rows in the host's
+  inbox that cancel each other out whichever one they accept.
 
 `bookings` stores `adults`/`children`/`infants`/`pets` alongside `guests`, so a reservation
 carries the same breakdown whichever client took it.
+
+## Only an accepted stay holds the dates
+
+A pending reservation is a **request**, not a claim. Any number of guests may ask for the
+same nights; the nights come off the market when the **host accepts one of them**.
+
+This was a bug, reported against all three clients. Guest A sent a request, the host had
+not looked at it yet, and Guest B was already told the dates were unavailable — for a stay
+that might never happen. Worse, the block was invisible to everyone: the host saw the
+request sitting in their inbox and had no idea it was turning other guests away, and Guest
+A could sit on the calendar indefinitely without paying anything or being accepted.
+
+The rule lives in `src/lib/local/availability-core.ts` — once, as a predicate
+(`holdsDates`) and as the SQL the queries embed (`holdsDatesSql`), written from the same
+list so the two halves cannot drift:
+
+| status | holds the nights? | |
+| --- | --- | --- |
+| `pending` | **no** | a request. Several may exist for one window. |
+| `confirmed` | yes | the host said yes. This is what takes the dates off sale. |
+| `completed` | yes | a stay that happened still owns its nights. |
+| `rejected` | no | over. |
+| `cancelled` | no | over. |
+
+Five queries in `db.ts` read that one rule, and they used to disagree with each other —
+three said "not cancelled", two said "not cancelled or rejected", so a **rejected** request
+still hid a listing from dated search and greyed out its calendar:
+
+- `searchListings` — the `checkIn`/`checkOut` filter;
+- `getListingAvailability` — the public spans the guest calendar greys out. Pending
+  requests are deliberately **absent** from this response, which is what fixes web, iOS and
+  Android at once: all three treat every span it returns as unavailable, so no client
+  change was needed;
+- the host pricing calendar's `booked` / `blocked` / `available` day status, and the guard
+  on which days a host may re-price. A day with only a pending request on it now reads
+  `available` to the host too — because it is: the guest calendar is still selling it;
+- `createBooking`'s clash check.
+
+### Accepting is a decision between rivals
+
+Because several requests can be waiting on one window, `setBookingStatus` does two things
+on the **confirm** path that it never had to before:
+
+1. **It re-checks availability under a lock on the listing row**, inside the same
+   transaction as the write. The nights were free when the guest asked; the host may since
+   have accepted a rival or blocked the range on their own calendar. It throws
+   `BookingConflictError`, and `PATCH /api/local/bookings/:id` answers **`409`** with the
+   message — nothing is broken, the answer is just no. The lock is taken on the *listing*,
+   not the booking: the contended thing is the calendar, so two clicks on two different
+   requests for the same nights have to serialise against each other.
+2. **It declines every other pending request overlapping the nights it just gave away.**
+   Leaving them would strand those guests on a request that can never be accepted and leave
+   the host an inbox where every row still looks actionable. Each decline runs through the
+   same `setBookingStatus`, so those guests get the ordinary "your request wasn't accepted"
+   notification, push and email — the same treatment the takedown sweep gives them (see
+   *A host removes a listing by hiding it*).
+
+Note what is **not** covered: `adminSetBookingStatus` is a deliberate staff override and
+still writes any status without a clash check.
+
+Covered by `test/unit/availability-core.test.mjs` for the rule itself, and end to end —
+rival requests, the calendar, dated search, the sweep, the `409` and the same-day turnover
+— by `scripts/_verify-pending-does-not-hold.mjs`, which needs a database:
+
+```bash
+DATABASE_URL='postgresql://localhost:5432/quickin_local' \
+  node --import ./scripts/_ts-resolve-hook.mjs scripts/_verify-pending-does-not-hold.mjs
+```
 
 ## /ops — the staff console
 
@@ -1548,6 +2105,7 @@ the list of record. Recent additions:
 | `migrate-date-prices.mjs` | `listing_date_prices` — one row per (listing, day) holding the RAW nightly rate a host pinned on their calendar, `PRIMARY KEY (listing_id, date)` so setting a day twice is an upsert rather than a second row whose precedence would depend on row order. The **absence** of a row is what "this day follows the listing's normal pricing" means, which is why "reset to default" deletes rather than writing the base price. Additive, and the ladder falls through to weekend/month/base if it has not run — but it **must be applied before the deploy**, since the per-night stay sum joins it on every quote and booking |
 | `dedupe-user-emails.mjs` | **Data repair, not a schema change — and the only script here that is destructive, so it reports by default and writes nothing without `--apply`.** Merges `users` rows that share an email (legal since `migrate-split-accounts.mjs` keyed uniqueness on `(lower(email), role)`), re-pointing every referencing row onto one keeper — referencing tables are read from the catalog, not hardcoded, so a table added later is not orphaned. The keeper is the row with the most linked data, then verified/active/has-a-password, then oldest. It **warns** when a discarded row holds a different password: login currently accepts either, so after the merge only the keeper's works. `--restore-unique` then re-creates `UNIQUE (lower(email))` and drops `users_email_role_uidx` — refused while any duplicate remains. Run the report against Neon before deciding anything |
 | `cleanup-implausible-ages.mjs` | **Data repair, not a schema change**, and like `dedupe-user-emails.mjs` it reports by default and writes nothing without `--apply`. Clears `users.age` values outside 13–120 — the phone numbers `PATCH /api/local/profile` used to store as ages before it checked the range (see *An age is a number, not a channel*). Sets them to NULL rather than to a guess: the age is optional, so none is honest and an invented one is not. Run it **after** the deploy — before, and the route would let a new one straight back in |
+| `migrate-host-visibility.mjs` | `listings.unpublished_by_host` and `services.unpublished_by_host` — the fourth and last reason a row can be unpublished, and the only one the host controls. Its own column rather than a reuse of `unpublished_by_admin`/`unpublished_by_verification`, for the same reason those two are separate: each party may only release its own grip. **Nothing is backfilled** — every existing unpublished row reads "the host did not hide this", which is true, since until now they could not. Also **reports** the current visibility breakdown, including how many listings are down with no flag at all (manual `/ops` takedowns). Additive, but apply it **before** the deploy: the host projection selects the column, so a database without it fails every host read |
 | `migrate-ranking-indexes.mjs` | Two indexes for the search ranking — `reviews(listing_id) INCLUDE (rating, created_at)` and `bookings(listing_id, status, check_out)`. **Pure performance, no schema change:** the ranking is correct without it, so the usual order does not apply and it can be run before or after the deploy |
 
 Apply a migration to Neon **before** deploying code that reads the new columns. The

@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS services (
 );
 CREATE INDEX IF NOT EXISTS idx_services_host ON services(host_id);
 
+-- The host's own takedown of a service (mirrors listings.unpublished_by_host).
+ALTER TABLE services ADD COLUMN IF NOT EXISTS unpublished_by_host boolean NOT NULL DEFAULT false;
+
 -- A user "subscribes"/requests a service; like a booking it goes pending -> confirmed/rejected.
 CREATE TABLE IF NOT EXISTS service_requests (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),

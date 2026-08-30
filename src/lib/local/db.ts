@@ -6,7 +6,7 @@ import { countOpenDisputes, oldestOpenDisputeAt } from './disputes'
 import { countFlaggedUsers, oldestFlaggedAt } from './moderation'
 import { countPendingIdChanges, oldestPendingIdChangeAt } from './id-changes'
 import { idChangeColumnFor, idColumnFor, statusForAction } from './document-core'
-import { canPay, outcomeFor, PaymentProofError } from './payment-flow-core'
+import { canPay, isLiveStayPass, outcomeFor, PaymentProofError } from './payment-flow-core'
 import type { PaymentReviewAction } from './payment-flow-core'
 import { branchLimit, wantsKind } from './activity-core'
 import type { ActivityFilter, AuditFilter } from './activity-core'
@@ -20,12 +20,22 @@ import {
   CANCELLATION_POLICIES,
   type CancellationPolicy,
 } from './cancellation-core'
+import { BookingConflictError, holdsDatesSql } from './availability-core'
 import { resolveResortSelection } from './resorts'
 import { normalizeResortName, validateResortName } from './resort-core'
+import {
+  PUBLISH_RESPECTING_HOST_SQL,
+  goesLiveOnReactivate,
+  publishOnApprovalSql,
+  reactivateBlock,
+} from './host-visibility-core'
+import type { ReactivateBlock, VisibilityRow } from './host-visibility-core'
 import { storeListingPhotos } from './blob-store'
 import type { PoolClient } from 'pg'
 import { randomInt } from 'node:crypto'
 import { createNotification } from './notifications'
+import { INBOX_LIMIT, bookingThreadId, mergeInboxThreads, parseThreadId } from './inbox-core'
+import type { InboxThread, InboxThreadRow } from './inbox-core'
 import { sendNotificationEmail } from './mailer'
 import { sendPush } from './push'
 import { isContactBlockedError } from './contentguard'
@@ -55,6 +65,7 @@ import {
   sqlWithDatePrice,
   stayDiscountFactorSql,
   perNightSeasonalSql,
+  weekendNightSql,
 } from './date-pricing-core'
 import type { BlockSpan, DayStatus, PriceSource } from './date-pricing-core'
 import { sqlRankingOrderBy } from './ranking-core'
@@ -67,7 +78,21 @@ import {
   MIN_LISTING_PHOTOS,
 } from './listing-completeness-policy'
 import type { ListingCurrentState } from './listing-completeness-policy'
+import {
+  checkListingCapacity,
+  listingCapacityProblemMessage,
+  parseCapacity,
+} from './listing-capacity-policy'
+import type { ListingCapacityField } from './listing-capacity-policy'
 import { checkOwnershipDoc, ownershipDocProblemMessage } from './ownership-doc-core'
+import {
+  checkMonthlyPrices,
+  checkWeekendPrice,
+  monthPriceMessage,
+  resolveWeekendSchedule,
+  weekendDaysMessage,
+  weekendPriceMessage,
+} from './listing-pricing-core'
 
 export type { PaymentConfig }
 
@@ -107,6 +132,11 @@ export interface Listing {
    *  price. See LISTING_COLS vs LISTING_COLS_HOST. */
   price_per_night: number
   weekend_price: number | null
+  /** Which weekdays `weekend_price` is charged on (0=Sun … 6=Sat), or null when
+   *  the host never chose — the ladder then falls back to DEFAULT_WEEKEND_DAYS
+   *  (Fri+Sat). NOT a price, so it is identical in both projections: a guest
+   *  needs it to preview which nights cost more, exactly as the host does. */
+  weekend_days: number[] | null
   monthly_prices: Record<string, number>
   /** The commission rate these prices were projected with (0.1 = 10%). */
   commission_rate?: number
@@ -137,6 +167,24 @@ export interface Listing {
   review_note?: string | null
   weekly_discount: number
   monthly_discount: number
+  /** Whether guests can see the listing. False covers all four takedown reasons —
+   *  the flags below say which. */
+  is_published: boolean
+  /** HOST PROJECTION ONLY. The host took this listing down themselves; the only
+   *  one of the four flags they can clear. See host-visibility-core.ts. */
+  unpublished_by_host?: boolean
+  /** HOST PROJECTION ONLY. An account block hid it. */
+  unpublished_by_admin?: boolean
+  /** HOST PROJECTION ONLY. The identity gate hid it. */
+  unpublished_by_verification?: boolean
+  /** HOST PROJECTION ONLY. Booking requests still waiting on this host — the
+   *  number a deactivate would decline. */
+  pending_request_count?: number
+  /** HOST PROJECTION ONLY. True when a proof-of-ownership document is stored —
+   *  never the document itself, which is admin-only. The ownership doc is
+   *  optional at create time, so this is what tells a host dashboard whether to
+   *  offer "Upload ownership document" or "Re-upload ownership document". */
+  has_ownership_doc?: boolean
   host_id: string | null
   host_name: string | null
   host_verified: boolean
@@ -214,6 +262,11 @@ export interface Booking {
   cancellation_policy: string
   cancelled_at: string | null
   refund_percent: number | null
+  /** The money owed back on cancellation, from `refund_amount`. `null` until cancelled. */
+  refund_amount: number | null
+  /** When that refund was actually SENT, from `refunded_at`. `null` while still due —
+   *  a cancellation records what is owed, a human in /ops settles it. */
+  refunded_at: string | null
   promo_code: string | null
   promo_discount: number | null
 }
@@ -278,6 +331,15 @@ const HOST_PRICE_COLS = `
 /** Everything that isn't a price — identical in both projections. */
 const LISTING_COMMON_COLS = `
   l.currency,
+  -- The days the weekend rate is charged on. In the COMMON block, not the price
+  -- blocks, because it is a schedule rather than money: there is no host figure
+  -- and guest figure of "which nights are dearer", and both sides need it — the
+  -- host edit form to seed its day pills (without this it always redrew Fri+Sat
+  -- over whatever the host had chosen), and the guest detail page to preview the
+  -- right nights. NULL travels as NULL rather than COALESCEing to Fri+Sat here:
+  -- "the host never chose" and "the host chose Fri+Sat" are different answers,
+  -- and only the first may be replaced by a client's own default.
+  l.weekend_days,
   l.bedrooms, l.beds, l.bathrooms, l.max_guests, l.property_type, l.region,
   l.resort_id, COALESCE((SELECT name FROM resorts WHERE id = l.resort_id), l.resort_name) AS resort,
   COALESCE(l.cancellation_policy, 'moderate') AS cancellation_policy,
@@ -287,6 +349,11 @@ const LISTING_COMMON_COLS = `
   l.host_id, (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
   COALESCE((SELECT u.verification_status = 'verified' FROM users u WHERE u.id = l.host_id), false) AS host_verified,
   l.is_guest_favorite, l.listing_code, l.lat::float8 AS lat, l.lng::float8 AS lng,
+  -- Whether guests can see this listing at all. In BOTH projections because the
+  -- guest-facing GET /listings/:id has to answer 404 on an unpublished one and
+  -- needs the flag to decide; every listing that comes back from search has it
+  -- true by construction.
+  COALESCE(l.is_published, false) AS is_published,
   to_char(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
   COALESCE(l.amenities, '{}') AS amenities,
   COALESCE((SELECT round(avg(rv.rating)::numeric, 2) FROM reviews rv WHERE rv.listing_id = l.id), 0)::float8 AS rating,
@@ -313,7 +380,28 @@ export const LISTING_COLS_HOST = `
   -- Deliberately NOT in LISTING_COMMON_COLS: the rejection note is staff-authored
   -- text about this host's listing and belongs to the host alone. Adding it to the
   -- shared block would publish it on every guest read of a listing.
-  l.review_note
+  l.review_note,
+  -- WHY the listing is down, so the host's dashboard can say so instead of
+  -- showing a card that looks live and isn't, and so it only offers "Reactivate"
+  -- on a listing the host themselves hid. Host-only for the same reason as
+  -- review_note: these are facts about this host's standing, not about the place.
+  COALESCE(l.unpublished_by_host, false) AS unpublished_by_host,
+  COALESCE(l.unpublished_by_admin, false) AS unpublished_by_admin,
+  COALESCE(l.unpublished_by_verification, false) AS unpublished_by_verification,
+  -- What a deactivate would cost right now. Deactivating declines every request
+  -- still waiting on the host, so the confirmation dialog has to be able to name
+  -- the number BEFORE the host commits — which means it travels with the card,
+  -- not from a second round trip fired while a modal is already open.
+  (SELECT count(*) FROM bookings b WHERE b.listing_id = l.id AND b.status = 'pending')::int
+    AS pending_request_count,
+  -- Whether a proof-of-ownership document is on file. A BOOLEAN, never the
+  -- document: that stays admin-only and is served one at a time from the audited
+  -- /api/local/admin/documents/ownership/:id. The flag is what lets a host card
+  -- say "Upload ownership document" instead of "Re-upload" on a listing that
+  -- never had one — the document is optional at create time (it is not in
+  -- LISTING_REQUIRED_FIELDS), so a listing sits in the queue as 'pending' with
+  -- nothing attached, and every client used to offer to re-upload it anyway.
+  (l.ownership_doc IS NOT NULL AND l.ownership_doc <> '') AS has_ownership_doc
 `
 
 export async function getListings(filters: SearchFilters = {}): Promise<Listing[]> {
@@ -382,7 +470,7 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
     const b = params.length
     where.push(`NOT EXISTS (
       SELECT 1 FROM bookings bk
-      WHERE bk.listing_id = l.id AND bk.status <> 'cancelled'
+      WHERE bk.listing_id = l.id AND ${holdsDatesSql('bk')}
         AND bk.check_in < $${a} AND bk.check_out > $${b}
     ) AND NOT EXISTS (
       SELECT 1 FROM listing_blocked_dates bd
@@ -462,8 +550,13 @@ export interface UnavailableRange {
   note: string | null
 }
 
-/** Every span a listing is NOT bookable: non-cancelled bookings + host blocks.
- *  Public (no guest data leaks — only dates). Used to grey out calendar days. */
+/** Every span a listing is NOT bookable: ACCEPTED stays (confirmed/completed) plus
+ *  host blocks. Public (no guest data leaks — only dates). Used to grey out calendar
+ *  days.
+ *
+ *  Pending requests are deliberately absent — see availability-core. A day someone
+ *  has merely ASKED for is still on sale, so the next guest sees it open and may ask
+ *  for it too; it greys out the moment the host accepts one of them. */
 export async function getListingAvailability(listingId: string): Promise<UnavailableRange[]> {
   if (!isUuid(listingId)) return []
   const { rows } = await pool.query(
@@ -472,7 +565,7 @@ export async function getListingAvailability(listingId: string): Promise<Unavail
             to_char(check_out, 'YYYY-MM-DD') AS "end",
             'booked'::text AS kind, NULL::text AS note
        FROM bookings
-      WHERE listing_id = $1 AND status <> 'cancelled'
+      WHERE listing_id = $1 AND ${holdsDatesSql('')}
      UNION ALL
      SELECT id::text AS id,
             to_char(start_date, 'YYYY-MM-DD') AS start,
@@ -597,15 +690,21 @@ export async function getListingCalendar(
             ${sqlWithCommission(PER_NIGHT_RAW_SQL)}::float8 AS guest_price,
             CASE
               WHEN ${dateOverrideExistsSql} THEN 'custom'
-              WHEN extract(dow from d)::int IN (5, 6) AND l.weekend_price IS NOT NULL THEN 'weekend'
+              -- The SAME expression the price above took, not a second guess at
+              -- it: a hardcoded dow IN (5, 6) here labelled a Thu+Fri weekend
+              -- 'base' while PER_NIGHT_RAW_SQL charged the weekend rate for it.
+              WHEN ${weekendNightSql('d')} THEN 'weekend'
               WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$' THEN 'monthly'
               ELSE 'base'
             END AS source,
             -- A booking outranks a block: if both cover the day, the host still
-            -- may not touch it, and 'booked' is the honest reason why.
+            -- may not touch it, and 'booked' is the honest reason why. 'booked'
+            -- means ACCEPTED (holdsDatesSql) — a day with only a pending request on
+            -- it reads 'available', because it is: the guest calendar is still
+            -- selling it and the host has not said yes to anyone.
             CASE
               WHEN EXISTS (SELECT 1 FROM bookings b
-                            WHERE b.listing_id = l.id AND b.status NOT IN ('cancelled', 'rejected')
+                            WHERE b.listing_id = l.id AND ${holdsDatesSql('b')}
                               AND b.check_in <= d AND b.check_out > d) THEN 'booked'
               WHEN EXISTS (SELECT 1 FROM listing_blocked_dates bd
                             WHERE bd.listing_id = l.id AND bd.start_date <= d AND bd.end_date > d) THEN 'blocked'
@@ -707,14 +806,15 @@ export async function updateListingCalendar(
       return null
     }
 
-    // Which of the selected days a reservation already owns. Read INSIDE the
-    // transaction and with the listing row locked, so a booking confirmed a
-    // moment ago cannot slip between the check and the write.
+    // Which of the selected days a reservation already owns — an ACCEPTED one; a
+    // pending request owns nothing and never froze the host's own calendar. Read
+    // INSIDE the transaction and with the listing row locked, so a booking confirmed
+    // a moment ago cannot slip between the check and the write.
     const booked = await client.query(
       `SELECT to_char(d, 'YYYY-MM-DD') AS date
          FROM unnest($2::date[]) AS d
         WHERE EXISTS (SELECT 1 FROM bookings b
-                       WHERE b.listing_id = $1 AND b.status NOT IN ('cancelled', 'rejected')
+                       WHERE b.listing_id = $1 AND ${holdsDatesSql('b')}
                          AND b.check_in <= d AND b.check_out > d)`,
       [listingId, dates]
     )
@@ -897,6 +997,11 @@ const BOOKING_COLS = `
   b.cancelled_by, b.cancelled_by_role, b.cancellation_policy AS booked_cancellation_policy,
   b.commission_rate,
   b.refund_percent,
+  -- What the cancellation actually owed, and whether anyone has sent it yet. Both
+  -- are read by the clients, which split the single 'cancelled' status into
+  -- Refunded / Partially Refunded / Cancelled -- see refundOutcomeFor().
+  b.refund_amount::float8 AS refund_amount,
+  to_char(b.refunded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS refunded_at,
   b.promo_code,
   b.promo_discount::float8 AS promo_discount,
   to_char(b.created_at, 'YYYY-MM-DD') AS created_at,
@@ -973,12 +1078,15 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
     throw new Error('Exceeds the maximum guests for this listing')
   }
 
-  // A rejected booking must not hold dates hostage — only cancelled and rejected are
-  // excluded. listing_blocked_dates is part of the same question: a day the host
-  // blocked on their calendar is unavailable even though no booking exists for it.
+  // Only an ACCEPTED stay holds the dates (holdsDatesSql). A PENDING request holds
+  // nothing: several guests may ask for the same nights and the host decides between
+  // them — the alternative gave the nights to whoever clicked first, for a stay that
+  // may never happen, and told everyone else the place was taken.
+  // listing_blocked_dates is part of the same question: a day the host blocked on
+  // their calendar is unavailable even though no booking exists for it.
   const clash = await pool.query(
     `SELECT 1 FROM bookings
-       WHERE listing_id = $1 AND status NOT IN ('cancelled', 'rejected')
+       WHERE listing_id = $1 AND ${holdsDatesSql('')}
          AND check_in < $2 AND check_out > $3
      UNION ALL
      SELECT 1 FROM listing_blocked_dates
@@ -988,6 +1096,22 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
     [listingId, checkOut, checkIn]
   )
   if (clash.rowCount && clash.rowCount > 0) throw new Error('Those dates are not available')
+
+  // The one thing the overlap check above used to catch for free: the SAME guest
+  // asking twice. Competing requests are the point now, but a guest holding two
+  // live requests for the same nights on the same listing is not competition, it is
+  // a double-tap — and it would put two rows in the host's inbox that cancel each
+  // other out whichever one they accept.
+  const dupe = await pool.query(
+    `SELECT 1 FROM bookings
+       WHERE listing_id = $1 AND user_id = $2 AND status = 'pending'
+         AND check_in < $3 AND check_out > $4
+     LIMIT 1`,
+    [listingId, userId, checkOut, checkIn]
+  )
+  if (dupe.rowCount && dupe.rowCount > 0) {
+    throw new Error('You already have a request for those dates awaiting the host')
+  }
 
   // NO reservation_code here on purpose — a booking starts 'pending' (awaiting the
   // host's approval) and a pending booking must have no code / no QR. It is issued
@@ -1300,7 +1424,10 @@ export async function getStayQuote(listingId: string, checkIn: string, checkOut:
             ${sqlWithCommission(PER_NIGHT_RAW_SQL)}::float8 AS price,
             CASE
               WHEN ${dateOverrideExistsSql} THEN 'custom'
-              WHEN extract(dow from d)::int IN (5, 6) AND l.weekend_price IS NOT NULL THEN 'weekend'
+              -- The SAME expression the price above took, not a second guess at
+              -- it: a hardcoded dow IN (5, 6) here labelled a Thu+Fri weekend
+              -- 'base' while PER_NIGHT_RAW_SQL charged the weekend rate for it.
+              WHEN ${weekendNightSql('d')} THEN 'weekend'
               WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$' THEN 'monthly'
               ELSE 'base'
             END AS source,
@@ -1360,8 +1487,7 @@ export async function listPendingListings(): Promise<
   // audits every open. No mobile client ever read this field.
   const { rows } = await pool.query(
     `SELECT ${LISTING_COLS_HOST},
-            (SELECT u.email FROM users u WHERE u.id = l.host_id) AS host_email,
-            (l.ownership_doc IS NOT NULL AND l.ownership_doc <> '') AS has_ownership_doc
+            (SELECT u.email FROM users u WHERE u.id = l.host_id) AS host_email
        FROM listings l
       WHERE COALESCE(l.approval_status, 'approved') = 'pending'
       ORDER BY l.created_at DESC`
@@ -1405,8 +1531,15 @@ export async function setListingApproval(
   // with no reason. Approving clears it: the note describes a rejection, and a stale
   // one under a live listing reads as a fresh complaint.
   const reviewNote = approve ? null : normalizeListingReviewNote(note)
+  // Approval is the one write that switches publication ON without the host
+  // asking for it, so it is the one write that has to consult the host's own
+  // takedown flag: a host who deactivated a listing while it sat in the queue
+  // must not have it dragged back onto the search page by the approval. Expressed
+  // in SQL so the check happens inside this UPDATE and cannot race a deactivate.
   const { rows } = await pool.query(
-    `UPDATE listings SET approval_status = $2, is_published = $3, review_note = $4 WHERE id = $1
+    `UPDATE listings SET approval_status = $2,
+            is_published = ${publishOnApprovalSql('$3')}, review_note = $4
+      WHERE id = $1
      RETURNING id, host_id, title`,
     [listingId, status, approve, reviewNote]
   )
@@ -1483,7 +1616,7 @@ export const EDITABLE_LISTING_FIELDS = [
   'property_type', 'max_guests', 'bedrooms', 'beds', 'bathrooms', 'amenities',
   'ownership_doc', 'images',
   // Commercial — what the host tunes day to day.
-  'price_per_night', 'weekend_price', 'monthly_prices',
+  'price_per_night', 'weekend_price', 'weekend_days', 'monthly_prices',
   'weekly_discount', 'monthly_discount', 'cancellation_policy',
 ] as const
 export type ListingEditField = (typeof EDITABLE_LISTING_FIELDS)[number]
@@ -1594,13 +1727,27 @@ function assertResortName(resortId: unknown, resortName: unknown): void {
   if (problem) throw new ListingInputError(problem)
 }
 
-/** A whole number >= min, else a per-field error. */
-function assertInt(v: unknown, label: string, min: number): number {
-  const n = Number(v)
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < min) {
-    throw new ListingInputError(`${label} must be a whole number of at least ${min}`)
-  }
-  return n
+/**
+ * One of the four capacity counts, as a whole number of at least 1.
+ *
+ * Both create and edit used to floor these at ZERO (`Math.max(0, Math.floor(…))`
+ * on create, a generic whole-number check with `min = 0` on patch), so a chalet
+ * with 0 bedrooms, 0 beds and 0 bathrooms was accepted from both mobile wizards
+ * — whose steppers went down to 0 — and published with
+ * "0 bedrooms · 0 beds · 0 baths" as the line under its card. The rule now comes
+ * from listing-capacity-policy.ts, byte-identical to the web repo's copy
+ * (check-listing-capacity-policy-parity.mjs keeps it that way), so the phone and
+ * the website cannot disagree about how small a place may claim to be.
+ *
+ * `undefined` means the client never sent the field, which is not the same as
+ * sending a zero: create falls back to its documented default, and the patch
+ * door never reaches here for a key it wasn't given.
+ */
+function assertCapacity(v: unknown, field: ListingCapacityField, fallback: number): number {
+  if (v === undefined) return fallback
+  const problem = checkListingCapacity(field, v)
+  if (problem) throw new ListingInputError(listingCapacityProblemMessage(problem))
+  return parseCapacity(v) as number
 }
 
 /** A coordinate inside its valid range, or null to clear the pin. */
@@ -1671,6 +1818,10 @@ export interface ListingPatch {
   images?: unknown
   price_per_night?: unknown
   weekend_price?: unknown
+  /** Which weekdays the weekend rate is charged on (0=Sun … 6=Sat). Omitted =
+   *  leave the stored set alone; `[]` = the host cleared every pill, which is
+   *  refused under a real rate rather than guessed at. */
+  weekend_days?: unknown
   monthly_prices?: unknown
   weekly_discount?: unknown
   monthly_discount?: unknown
@@ -1720,6 +1871,23 @@ export async function updateListingDetails(
     )
     if (!cur.length) return null
     current = cur[0] as ListingCurrentState
+  }
+  // The weekend rate and the days it is charged on are a pair (see
+  // listing-pricing-core.ts), and a patch may carry either half. Judging the days
+  // needs a rate, so when only the days arrive the stored rate is read first —
+  // otherwise "I moved my weekend to Thu+Fri" would be judged as though the
+  // listing had no weekend rate at all and would quietly store nothing.
+  const touchesWeekend = patch.weekend_price !== undefined || patch.weekend_days !== undefined
+  let storedWeekendPrice: number | null = null
+  if (touchesWeekend && patch.weekend_price === undefined) {
+    const { rows: wk } = await pool.query(
+      `SELECT weekend_price::float8 AS weekend_price FROM listings WHERE id = $1 AND host_id = $2`,
+      [listingId, hostUserId]
+    )
+    // Same as the read above: a miss is a listing that isn't theirs, and it gets
+    // the null the UPDATE would have returned.
+    if (!wk.length) return null
+    storedWeekendPrice = wk[0].weekend_price ?? null
   }
   const editProblem = checkListingEdit(patch, current)
   if (editProblem) throw new ListingInputError(listingCompletenessProblemMessage(editProblem))
@@ -1774,11 +1942,13 @@ export async function updateListingDetails(
   if (patch.lat !== undefined) put('lat', assertCoord(patch.lat, 'Latitude', 90))
   if (patch.lng !== undefined) put('lng', assertCoord(patch.lng, 'Longitude', 180))
   if (patch.property_type !== undefined) put('property_type', assertPropertyType(patch.property_type))
-  // max_guests keeps createListing's floor of 1 — a 0-guest listing can't be booked.
-  if (patch.max_guests !== undefined) put('max_guests', assertInt(patch.max_guests, 'Guests', 1))
-  if (patch.bedrooms !== undefined) put('bedrooms', assertInt(patch.bedrooms, 'Bedrooms', 0))
-  if (patch.beds !== undefined) put('beds', assertInt(patch.beds, 'Beds', 0))
-  if (patch.bathrooms !== undefined) put('bathrooms', assertInt(patch.bathrooms, 'Bathrooms', 0))
+  // The four counts, all floored at 1 by listing-capacity-policy.ts. Bedrooms,
+  // beds and bathrooms used to be floored at 0 here, so a listing created with a
+  // real capacity could be edited down to a place with nowhere to sleep.
+  if (patch.max_guests !== undefined) put('max_guests', assertCapacity(patch.max_guests, 'guests', 1))
+  if (patch.bedrooms !== undefined) put('bedrooms', assertCapacity(patch.bedrooms, 'bedrooms', 1))
+  if (patch.beds !== undefined) put('beds', assertCapacity(patch.beds, 'beds', 1))
+  if (patch.bathrooms !== undefined) put('bathrooms', assertCapacity(patch.bathrooms, 'bathrooms', 1))
   if (patch.amenities !== undefined) put('amenities', assertAmenities(patch.amenities))
   if (patch.ownership_doc !== undefined) {
     put('ownership_doc', assertOwnershipDoc(patch.ownership_doc))
@@ -1790,8 +1960,42 @@ export async function updateListingDetails(
     if (!Number.isFinite(price) || price <= 0) throw new ListingInputError('Price must be greater than 0')
     put('price_per_night', Math.round(price))
   }
-  if (patch.weekend_price !== undefined) put('weekend_price', cleanPrice(patch.weekend_price))
-  if (patch.monthly_prices !== undefined) put('monthly_prices', cleanMonthlyPrices(patch.monthly_prices), '::jsonb')
+  if (touchesWeekend) {
+    // A rate the host typed has to be money. Empty (null / '') still means "no
+    // weekend rate" and is how weekend pricing is turned off; `0` is a typo or a
+    // misread field, and cleanPrice used to turn it into the former — the edit
+    // saved, the pricing screen reopened blank, and nothing said why.
+    let rate = storedWeekendPrice
+    if (patch.weekend_price !== undefined) {
+      const checked = checkWeekendPrice(patch.weekend_price)
+      if (!checked.ok) throw new ListingInputError(weekendPriceMessage(checked.problem))
+      rate = checked.value === null ? null : Math.round(checked.value)
+      put('weekend_price', rate)
+    }
+    if (patch.weekend_days === undefined) {
+      // An omitted key keeps its current value — that is what a patch means here,
+      // and it is what keeps an OLDER mobile build (which sends the rate alone)
+      // from quietly stamping Fri+Sat over a weekend the host moved on the web.
+      // The one exception is a rate being cleared: it takes its days with it, so
+      // turning weekend pricing off leaves nothing behind to turn back on.
+      if (rate === null) put('weekend_days', null, '::int[]')
+    } else {
+      // Days the host actually chose. resolveWeekendSchedule refuses the two
+      // sets that cannot mean what they say — the whole week (which leaves
+      // price_per_night applying to no night at all) and none of it under a real
+      // rate (a rate that could never be charged).
+      const schedule = resolveWeekendSchedule(rate, patch.weekend_days)
+      if (!schedule.ok) throw new ListingInputError(weekendDaysMessage(schedule.problem))
+      put('weekend_days', schedule.days, '::int[]')
+    }
+  }
+  if (patch.monthly_prices !== undefined) {
+    // Same rule, one rung down: a blank month is cleared, a month typed as 0 is
+    // named and refused rather than quietly dropped from the map.
+    const months = checkMonthlyPrices(patch.monthly_prices)
+    if (!months.ok) throw new ListingInputError(monthPriceMessage(months.problem, months.month))
+    put('monthly_prices', JSON.stringify(months.value), '::jsonb')
+  }
   if (patch.weekly_discount !== undefined) put('weekly_discount', clampDiscount(patch.weekly_discount))
   if (patch.monthly_discount !== undefined) put('monthly_discount', clampDiscount(patch.monthly_discount))
   if (patch.cancellation_policy !== undefined) put('cancellation_policy', normalizePolicy(String(patch.cancellation_policy)))
@@ -2142,20 +2346,36 @@ async function getStayGuideItems(bookingId: string): Promise<StayGuideItem[]> {
 }
 
 /** The guide for a reservation, for the booking's guest, the listing's host, or
- *  an admin — else null (same authorization shape as getBookingProof). */
+ *  an admin — else null (same authorization shape as getBookingProof).
+ *
+ *  The GUEST additionally has to have a live pass. The guide is what the QR leads
+ *  to — gate codes, the Wi-Fi password, directions — so serving it to a guest
+ *  whose stay is confirmed but unpaid hands over the keys before the money
+ *  arrives, exactly as the QR itself did. The host and an operator always read
+ *  it: the host has to be able to write it while the guest pays. */
 export async function listStayGuide(
   bookingId: string,
   requester: { id: string; role: string },
 ): Promise<StayGuideItem[] | null> {
   if (!isUuid(bookingId)) return null
   const auth = await pool.query(
-    `SELECT b.user_id, l.host_id FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE b.id = $1`,
+    `SELECT b.user_id, l.host_id, b.status,
+            COALESCE(b.payment_status, 'unpaid') AS payment_status,
+            b.paid_at,
+            (SELECT pp.status FROM payment_proofs pp WHERE pp.booking_id = b.id
+              ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_proof_status
+       FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE b.id = $1`,
     [bookingId]
   )
   const a = auth.rows[0]
   if (!a) return null
-  const allowed = requester.role === 'admin' || requester.id === a.user_id || requester.id === a.host_id
-  if (!allowed) return null
+  const isStaff = requester.role === 'admin'
+  const isHost = requester.id === a.host_id
+  const isGuest = requester.id === a.user_id
+  if (!isStaff && !isHost && !isGuest) return null
+  // A guest with no live pass gets an empty guide, not a 403 — there is nothing
+  // wrong with the request, there is simply nothing to show them yet.
+  if (isGuest && !isHost && !isStaff && !isLiveStayPass(a)) return []
   return getStayGuideItems(bookingId)
 }
 
@@ -2265,18 +2485,29 @@ export interface StayPass {
   guests: number
   status: string
   payment_status: string
+  /** Set once the payment was APPROVED; null while the transfer is unpaid,
+   *  submitted or disputed. Half of `is_live` — exposed so the pass page can
+   *  explain *why* a pass isn't live yet without re-deriving the rule. */
+  paid_at: string | null
+  /** Latest payment_proofs.status (null when the guest hasn't uploaded one). */
+  payment_proof_status: string | null
+  /** `isLiveStayPass` evaluated server-side — confirmed AND paid, or completed.
+   *  THE flag a client should render on; the raw columns are for copy. */
+  is_live: boolean
   host_notes: string | null
   guest_name: string | null
   host_name: string | null
   image: string | null
-  /** Host-authored guide items (empty unless the stay is confirmed/completed). */
+  /** Host-authored guide items (empty unless the pass is live — see `is_live`). */
   guide: StayGuideItem[]
 }
 
 /** Normalize a code coming off a QR / URL segment. Returns null when there is no
  *  usable code — including the literal "null"/"undefined" that a client with an
  *  unconfirmed booking may have stringified into the link. A pending booking has
- *  reservation_code NULL, so it can never be reached by code at all. */
+ *  reservation_code NULL, so it can never be reached by code at all. A confirmed
+ *  but UNPAID booking does have a code; `is_live` is what stops it (see
+ *  `isLiveStayPass`). */
 export function normalizeStayCode(code: unknown): string | null {
   const c = String(code ?? '').trim().toUpperCase()
   if (!c || c === 'NULL' || c === 'UNDEFINED' || c === 'NONE') return null
@@ -2285,7 +2516,12 @@ export function normalizeStayCode(code: unknown): string | null {
 
 /** Public stay "pass" data, looked up by the reservation code embedded in the
  *  QR. Returns only non-sensitive fields (no emails/phones, no ids) so the QR
- *  link is safe to open by anyone holding the code. */
+ *  link is safe to open by anyone holding the code.
+ *
+ *  The row is returned for any status so the page can say something useful
+ *  ("waiting on your payment", "this reservation was cancelled") rather than
+ *  "not found" — but `is_live` carries the real verdict and the host's guide is
+ *  withheld unless it is true. */
 export async function getStayByCode(code: string): Promise<StayPass | null> {
   const c = normalizeStayCode(code)
   if (!c) return null
@@ -2295,6 +2531,9 @@ export async function getStayByCode(code: string): Promise<StayPass | null> {
             to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
             to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
             b.guests, b.status, COALESCE(b.payment_status, 'unpaid') AS payment_status,
+            to_char(b.paid_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS paid_at,
+            (SELECT pp.status FROM payment_proofs pp WHERE pp.booking_id = b.id
+              ORDER BY pp.submitted_at DESC LIMIT 1) AS payment_proof_status,
             b.host_notes,
             (SELECT split_part(u.full_name, ' ', 1) FROM users u WHERE u.id = b.user_id) AS guest_name,
             (SELECT u.full_name FROM users u WHERE u.id = l.host_id) AS host_name,
@@ -2303,21 +2542,31 @@ export async function getStayByCode(code: string): Promise<StayPass | null> {
       WHERE b.reservation_code IS NOT NULL AND upper(b.reservation_code) = $1 LIMIT 1`,
     [c]
   )
-  const row = rows[0] as (Omit<StayPass, 'guide'> & { id: string }) | undefined
+  const row = rows[0] as (Omit<StayPass, 'guide' | 'is_live'> & { id: string }) | undefined
   if (!row) return null
   const { id, ...pass } = row
-  // The guide belongs to a live stay: once cancelled/rejected the host's content
-  // (gate codes, directions…) stops being served. Best-effort so a dev DB without
-  // the table still renders the pass.
+  // THE gate, shared with the web / iOS / Android: confirmed AND paid, or
+  // completed. A booking the host merely approved is NOT a live pass — the code
+  // is minted at that transition but the money arrives afterwards, so serving
+  // the pass there hands out a QR for a stay nobody has paid for.
+  const is_live = isLiveStayPass({
+    status: pass.status,
+    payment_state: pass.payment_status,
+    payment_proof_status: pass.payment_proof_status,
+    paid_at: pass.paid_at,
+  })
+  // The guide belongs to a live stay: while it is unpaid — and once it is
+  // cancelled/rejected — the host's content (gate codes, directions…) stops
+  // being served. Best-effort so a dev DB without the table still renders the pass.
   let guide: StayGuideItem[] = []
-  if (pass.status === 'confirmed' || pass.status === 'completed') {
+  if (is_live) {
     try {
       guide = await getStayGuideItems(id)
     } catch (e) {
       console.error('stay guide unavailable (run the stay_guide_items migration):', e)
     }
   }
-  return { ...pass, guide }
+  return { ...pass, is_live, guide }
 }
 
 // ---- Reservation lifecycle: host listings + booking confirmation -------------
@@ -2358,6 +2607,10 @@ export interface CreateListingInput {
   weeklyDiscount?: number
   monthlyDiscount?: number
   weekendPrice?: number | null
+  /** Which weekdays the weekend rate applies to (0=Sun … 6=Sat). `undefined`
+   *  means the client never asked the host — see resolveWeekendSchedule, which
+   *  is the one place that decides what that silence means. */
+  weekendDays?: unknown
   monthlyPrices?: unknown
 }
 
@@ -2367,24 +2620,10 @@ function clampDiscount(v: unknown): number {
   return Math.max(0, Math.min(90, n))
 }
 
-/** A positive nightly price, or null. */
-function cleanPrice(v: unknown): number | null {
-  const n = Number(v)
-  return Number.isFinite(n) && n > 0 ? Math.round(n) : null
-}
-
-/** Keep only months "1".."12" → positive price. Returns a JSON string for jsonb. */
-function cleanMonthlyPrices(v: unknown): string {
-  const out: Record<string, number> = {}
-  if (v && typeof v === 'object') {
-    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      const m = Number(k)
-      const p = cleanPrice(val)
-      if (Number.isInteger(m) && m >= 1 && m <= 12 && p) out[String(m)] = p
-    }
-  }
-  return JSON.stringify(out)
-}
+// cleanPrice / cleanMonthlyPrices used to live here. Both answered "nothing" to
+// a 0 — the one behaviour this whole pair of doors was silently wrong about —
+// and checkWeekendPrice / checkMonthlyPrices in listing-pricing-core.ts replace
+// them, so the API and the web forms now judge these fields with one file.
 
 /** A host (or admin) creates a listing. Returns the full listing with images. */
 export async function createListing(hostUserId: string, input: CreateListingInput): Promise<Listing> {
@@ -2415,6 +2654,14 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
     images: input.images,
   })
   if (incomplete) throw new ListingInputError(listingCompletenessProblemMessage(incomplete))
+  // How many rooms, beds, baths and guests — floored at 1 each, because a stay
+  // with nowhere to sleep is not a stay. Judged before anything is written so a
+  // 0 is refused rather than clamped into a number the host never chose; see
+  // listing-capacity-policy.ts, which is the same file the web repo runs.
+  const bedrooms = assertCapacity(input.bedrooms, 'bedrooms', 1)
+  const beds = assertCapacity(input.beds, 'beds', 1)
+  const bathrooms = assertCapacity(input.bathrooms, 'bathrooms', 1)
+  const maxGuests = assertCapacity(input.maxGuests, 'guests', 2)
   // A number in the listing copy reaches every guest at once, so the same guard
   // the chat runs applies to the fields a host writes freely.
   await guardContent(hostUserId, title, 'listing')
@@ -2443,23 +2690,46 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   // returns it as a warning and never refuses the listing over it.
   const lat = input.lat === undefined ? null : assertCoord(input.lat, 'Latitude', 90)
   const lng = input.lng === undefined ? null : assertCoord(input.lng, 'Longitude', 180)
+  // The weekend rate and the days it is charged on, decided as ONE thing —
+  // see listing-pricing-core.ts, the same file the web forms run before they
+  // submit. A client that never mentions days (an older mobile build) gets
+  // Fri+Sat — the weekend its own UI promised the host.
+  //
+  // The rate goes through checkWeekendPrice rather than cleanPrice, which is
+  // what closes the last hole a typed `0` could still fall through. cleanPrice
+  // answered null for 0, so the listing saved as though the host had never set
+  // a weekend rate at all — no error, and a pricing screen that reopened blank.
+  // Empty is still how weekend pricing is turned off; the mobile apps send an
+  // explicit null for that and always have, so nothing that reaches this door
+  // means "clear" by sending a zero.
+  const weekendCheck = checkWeekendPrice(input.weekendPrice)
+  if (!weekendCheck.ok) throw new ListingInputError(weekendPriceMessage(weekendCheck.problem))
+  const weekendRate = weekendCheck.value === null ? null : Math.round(weekendCheck.value)
+  const weekendSchedule = resolveWeekendSchedule(weekendRate, input.weekendDays)
+  if (!weekendSchedule.ok) throw new ListingInputError(weekendDaysMessage(weekendSchedule.problem))
+  // …and the rung under it: the twelve optional per-month rates. A blank month
+  // has no opinion and falls through to price_per_night, but a month the host
+  // typed a 0 into is named and refused — cleanMonthlyPrices used to drop it,
+  // and a dropped month is indistinguishable from one that was never set.
+  const monthsCheck = checkMonthlyPrices(input.monthlyPrices)
+  if (!monthsCheck.ok) throw new ListingInputError(monthPriceMessage(monthsCheck.problem, monthsCheck.month))
   const { rows } = await pool.query(
     `INSERT INTO listings
        (host_id, title, description, location, country, price_per_night, currency,
         bedrooms, beds, bathrooms, max_guests, property_type, region, lat, lng, listing_code, is_published, amenities,
         cancellation_policy, approval_status, ownership_doc, weekly_discount, monthly_discount, weekend_price, monthly_prices,
-        resort_id, resort_name)
-     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18,$19,$20,$21,$22::jsonb,$23,$24)
+        resort_id, resort_name, weekend_days)
+     VALUES ($1,$2,$3,$4,$5,$6,'EGP',$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16,$17,'pending',$18,$19,$20,$21,$22::jsonb,$23,$24,$25)
      RETURNING id`,
     [
       hostUserId, title, input.description ?? null, input.location ?? null, input.country ?? null,
-      price, Math.max(0, Math.floor(input.bedrooms ?? 1)), Math.max(0, Math.floor(input.beds ?? 1)),
-      Math.max(0, Math.floor(input.bathrooms ?? 1)), Math.max(1, Math.floor(input.maxGuests ?? 2)),
+      price, bedrooms, beds,
+      bathrooms, maxGuests,
       input.propertyType ?? 'Apartment', resort.region, lat, lng, genReservationCode(),
       input.amenities ?? [], normalizePolicy(input.cancellationPolicy), ownershipDoc,
       clampDiscount(input.weeklyDiscount), clampDiscount(input.monthlyDiscount),
-      cleanPrice(input.weekendPrice), cleanMonthlyPrices(input.monthlyPrices),
-      resort.resort_id, resort.resort_name,
+      weekendRate, JSON.stringify(monthsCheck.value),
+      resort.resort_id, resort.resort_name, weekendSchedule.days,
     ]
   )
   const id = rows[0].id as string
@@ -2497,30 +2767,238 @@ export async function getHostListings(hostUserId: string): Promise<Listing[]> {
   return rows as Listing[]
 }
 
-/** Host confirms or rejects a PENDING booking for one of THEIR listings. Returns null if not allowed. */
+/** What `hostSetListingPublished` did, for the client's confirmation toast. */
+export interface HostVisibilityResult {
+  id: string
+  is_published: boolean
+  unpublished_by_host: boolean
+  /** Booking requests declined by a deactivate. Always 0 on a reactivate. */
+  declined_requests: number
+  /** On a reactivate that did NOT go live, who is still holding the listing
+   *  down. Null when the listing is now visible to guests. */
+  blocked_by: ReactivateBlock
+  listing: Listing | null
+}
+
+/**
+ * The host takes their own listing off the market, or puts it back.
+ *
+ * This is QuickIn's answer to "delete my listing": there is no host-facing
+ * DELETE and there is not going to be one. Bookings, reviews, payments, messages
+ * and the stay guide all hang off this listing id; deleting the row would cascade
+ * through every one of them and erase a guest's completed stay along with it. So
+ * a takedown is `is_published = false` — search stops returning it (getListings
+ * filters on the flag), createBooking refuses it, and the guest-facing detail
+ * route answers 404 — while every existing record stays exactly as it was, and
+ * the host can undo the whole thing later.
+ *
+ * DEACTIVATE also declines every booking request still waiting on this host.
+ * Leaving them would have let a guest end up with a confirmed, paid-for stay at a
+ * place the host has walked away from — the one outcome a takedown must not
+ * produce. The clients warn with the exact count first (`pending_request_count`
+ * rides along on the card) and the decline runs through the SAME setBookingStatus
+ * a manual decline uses, so each guest gets the ordinary "your request was
+ * declined" notification, push and email rather than silence.
+ *
+ * Order matters: the flag is written BEFORE the declines, so no new request can
+ * slip into the window between the two and survive the sweep.
+ *
+ * REACTIVATE clears only the host's own flag. Whether the listing actually goes
+ * live again is decided by everyone else still holding it down — an account
+ * block, the identity gate, or the moderation queue — and `blocked_by` names the
+ * first of those so the UI can say "reactivated, but it stays hidden until X"
+ * instead of claiming a listing is live when it isn't. Clearing the flag against
+ * a block is still worth doing: it means the listing returns the moment that
+ * other reason clears, rather than staying dark forever.
+ *
+ * Returns null when the listing isn't this host's (ownership is enforced in the
+ * SQL, so a stranger's listing simply matches no row).
+ */
+export async function hostSetListingPublished(
+  listingId: string,
+  hostUserId: string,
+  next: boolean,
+): Promise<HostVisibilityResult | null> {
+  if (!isUuid(listingId) || !isUuid(hostUserId)) return null
+
+  const { rows: current } = await pool.query(
+    `SELECT COALESCE(is_published, false) AS is_published,
+            COALESCE(unpublished_by_host, false) AS unpublished_by_host,
+            COALESCE(unpublished_by_admin, false) AS unpublished_by_admin,
+            COALESCE(unpublished_by_verification, false) AS unpublished_by_verification,
+            COALESCE(approval_status, 'approved') AS approval_status
+       FROM listings WHERE id = $1 AND host_id = $2`,
+    [listingId, hostUserId],
+  )
+  const row = current[0] as VisibilityRow | undefined
+  if (!row) return null
+
+  if (!next) {
+    // Take it down. `unpublished_by_host` is set even when the listing was already
+    // unpublished for some other reason — that is how a host says "do not put this
+    // back in front of guests when you approve it", and setListingApproval honours
+    // the flag when it publishes.
+    await pool.query(
+      `UPDATE listings SET is_published = false, unpublished_by_host = true
+        WHERE id = $1 AND host_id = $2`,
+      [listingId, hostUserId],
+    )
+    const { rows: pending } = await pool.query(
+      `SELECT id FROM bookings WHERE listing_id = $1 AND status = 'pending'`,
+      [listingId],
+    )
+    let declined = 0
+    for (const p of pending as { id: string }[]) {
+      // Best-effort per request: one guest's email bouncing must not leave the
+      // rest of them hanging on a listing that is already gone.
+      try {
+        if (await setBookingStatus(p.id, hostUserId, 'rejected')) declined++
+      } catch (err) {
+        console.error('deactivate: failed to decline booking', p.id, err)
+      }
+    }
+    return {
+      id: listingId,
+      is_published: false,
+      unpublished_by_host: true,
+      declined_requests: declined,
+      blocked_by: null,
+      listing: await getListingById(listingId, { asHost: true }),
+    }
+  }
+
+  // Put it back. `PUBLISH_RESPECTING_HOST_SQL` is not used here — this IS the host
+  // releasing their own grip — but every other reason still applies, so the new
+  // is_published is computed from them rather than assumed true.
+  const goesLive = goesLiveOnReactivate(row)
+  await pool.query(
+    `UPDATE listings SET unpublished_by_host = false, is_published = $3
+      WHERE id = $1 AND host_id = $2`,
+    [listingId, hostUserId, goesLive],
+  )
+  return {
+    id: listingId,
+    is_published: goesLive,
+    unpublished_by_host: false,
+    declined_requests: 0,
+    blocked_by: goesLive ? null : reactivateBlock(row),
+    listing: await getListingById(listingId, { asHost: true }),
+  }
+}
+
+/**
+ * The host's decision, as one statement. Guarded by `b.status = 'pending'`, so it is
+ * a no-op against a booking someone else already decided — which is what makes it
+ * safe to run from inside the confirm transaction and straight from the pool on the
+ * decline path.
+ *
+ * Approving is THE confirmation transition — the reservation code (and with it the
+ * guest's QR / wallet pass / stay link) is born here. Declining leaves it NULL.
+ */
+const HOST_DECIDE_SQL = `
+  UPDATE bookings b SET status = $3,
+         ${issueCodeSql(`$3 = 'confirmed'`, '$4')},
+         -- B3: the cancelled_* columns record who ENDED a booking, for any
+         -- terminal transition. A host cannot "cancel" in this system — declining
+         -- a pending request is their only termination — so it is attributed here
+         -- as role 'host'. Without this the cancellation report could never show
+         -- a host at all.
+         cancelled_at      = CASE WHEN $3 = 'rejected' THEN COALESCE(b.cancelled_at, now()) ELSE b.cancelled_at END,
+         cancelled_by      = CASE WHEN $3 = 'rejected' THEN $2::text ELSE b.cancelled_by END,
+         cancelled_by_role = CASE WHEN $3 = 'rejected' THEN 'host' ELSE b.cancelled_by_role END
+    FROM listings l
+   WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2 AND b.status = 'pending'`
+
+/**
+ * Host confirms or rejects a PENDING booking for one of THEIR listings. Returns
+ * null if not allowed (not their listing, or it is no longer pending).
+ *
+ * ACCEPTING is now a decision between rivals, not a rubber stamp. Since a pending
+ * request holds no dates (see availability-core), several guests can be waiting on
+ * the same nights, so confirming does two things the old one-request-per-window
+ * world never had to:
+ *
+ *   1. It RE-CHECKS availability under a lock on the listing row. The nights were
+ *      free when the guest asked; between then and now the host may have accepted a
+ *      rival request or blocked the range on their own calendar. Throws
+ *      BookingConflictError — a `409`, not a `500`: nothing is broken, the answer is
+ *      just no.
+ *   2. It DECLINES every other pending request overlapping the nights it just gave
+ *      away. Leaving them would strand those guests on a request that can never be
+ *      accepted, and would leave the host an inbox of rows that all look actionable.
+ *      Each decline runs through this same function, so those guests get the
+ *      ordinary "your request wasn't accepted" notification, push and email rather
+ *      than silence — the same treatment a takedown gives them (see
+ *      hostSetListingPublished).
+ */
 export async function setBookingStatus(
   bookingId: string,
   hostUserId: string,
   status: 'confirmed' | 'rejected'
 ): Promise<Booking | null> {
   if (!isUuid(bookingId) || !isUuid(hostUserId)) return null
-  // Approving is THE confirmation transition — the reservation code (and with it the
-  // guest's QR / wallet pass / stay link) is born here. Declining leaves it NULL.
-  await pool.query(
-    `UPDATE bookings b SET status = $3,
-            ${issueCodeSql(`$3 = 'confirmed'`, '$4')},
-            -- B3: the cancelled_* columns record who ENDED a booking, for any
-            -- terminal transition. A host cannot "cancel" in this system — declining
-            -- a pending request is their only termination — so it is attributed here
-            -- as role 'host'. Without this the cancellation report could never show
-            -- a host at all.
-            cancelled_at      = CASE WHEN $3 = 'rejected' THEN COALESCE(b.cancelled_at, now()) ELSE b.cancelled_at END,
-            cancelled_by      = CASE WHEN $3 = 'rejected' THEN $2::text ELSE b.cancelled_by END,
-            cancelled_by_role = CASE WHEN $3 = 'rejected' THEN 'host' ELSE b.cancelled_by_role END
-       FROM listings l
-      WHERE b.id = $1 AND b.listing_id = l.id AND l.host_id = $2 AND b.status = 'pending'`,
-    [bookingId, hostUserId, status, genReservationCode()]
-  )
+
+  // The window this acceptance is about, captured before the write so the sweep
+  // below knows which rivals it displaced. Only set on the confirm path.
+  let accepted: { listingId: string; checkIn: string; checkOut: string } | null = null
+
+  if (status === 'confirmed') {
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      // Lock the LISTING, not the booking: the thing being contended is the
+      // calendar, and two hosts' clicks on two different requests for the same
+      // nights have to serialise against each other, not against themselves.
+      const { rows: pend } = await client.query(
+        `SELECT b.listing_id::text AS listing_id,
+                to_char(b.check_in, 'YYYY-MM-DD')  AS check_in,
+                to_char(b.check_out, 'YYYY-MM-DD') AS check_out
+           FROM bookings b
+           JOIN listings l ON l.id = b.listing_id AND l.host_id = $2
+          WHERE b.id = $1 AND b.status = 'pending'
+            FOR UPDATE OF l`,
+        [bookingId, hostUserId]
+      )
+      const req = pend[0] as { listing_id: string; check_in: string; check_out: string } | undefined
+      if (!req) {
+        await client.query('ROLLBACK')
+        return null
+      }
+      const { rowCount } = await client.query(
+        `SELECT 1 FROM bookings
+           WHERE listing_id = $1 AND id <> $2 AND ${holdsDatesSql('')}
+             AND check_in < $3 AND check_out > $4
+         UNION ALL
+         SELECT 1 FROM listing_blocked_dates
+           WHERE listing_id = $1
+             AND start_date < $3 AND end_date > $4
+         LIMIT 1`,
+        [req.listing_id, bookingId, req.check_out, req.check_in]
+      )
+      if (rowCount && rowCount > 0) {
+        await client.query('ROLLBACK')
+        throw new BookingConflictError(
+          'Those nights are already taken — another reservation or a block on your calendar covers them'
+        )
+      }
+      // Written INSIDE the same transaction as the check, under the same lock. A
+      // COMMIT here and an UPDATE afterwards would reopen the very race the lock
+      // was taken to close.
+      await client.query(HOST_DECIDE_SQL, [bookingId, hostUserId, status, genReservationCode()])
+      await client.query('COMMIT')
+      accepted = { listingId: req.listing_id, checkIn: req.check_in, checkOut: req.check_out }
+    } catch (err) {
+      try { await client.query('ROLLBACK') } catch { /* already rolled back */ }
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  // Rejecting needs none of that machinery — a decline contends with nothing.
+  if (status !== 'confirmed') {
+    await pool.query(HOST_DECIDE_SQL, [bookingId, hostUserId, status, genReservationCode()])
+  }
   const { rows } = await pool.query(
     `SELECT ${BOOKING_COLS} FROM bookings b JOIN listings l ON l.id = b.listing_id
       WHERE b.id = $1 AND l.host_id = $2`,
@@ -2532,28 +3010,37 @@ export async function setBookingStatus(
     const confirmed = status === 'confirmed'
     await createNotification(updated.user_id, {
       type: `booking_${status}`,
-      title: confirmed ? 'Reservation confirmed' : 'Reservation declined',
-      body: `Your stay at ${updated.title}`,
+      title: confirmed ? 'Reservation accepted' : 'Reservation declined',
+      body: confirmed
+        ? `${updated.title} — send your payment to confirm the stay`
+        : `Your stay at ${updated.title}`,
       link: `/reservation/${updated.id}`,
     })
     await sendPush(updated.user_id, {
-      title: confirmed ? 'Reservation confirmed 🎉' : 'Reservation update',
-      body: confirmed ? `Your stay at ${updated.title} is confirmed` : `Your request for ${updated.title} wasn’t accepted`,
+      title: confirmed ? 'Reservation accepted 🎉' : 'Reservation update',
+      body: confirmed
+        ? `${updated.title} — pay now to confirm your stay`
+        : `Your request for ${updated.title} wasn’t accepted`,
       link: `/reservation/${updated.id}`,
     })
     const guestEmail = await userEmail(updated.user_id)
     if (guestEmail) {
       if (confirmed) {
+        // The code goes out here because it is the reference a guest quotes to
+        // support — but it is NOT the pass, and this mail must not read as if the
+        // stay were settled. Payment comes next, and the QR only appears once we
+        // have confirmed the transfer (see isLiveStayPass).
         await sendNotificationEmail(
           guestEmail,
-          'Your reservation is confirmed 🎉 — QuickIn',
-          'Your stay is confirmed',
+          'Your host accepted your reservation 🎉 — QuickIn',
+          'Your host accepted — one step left',
           [
-            `Your reservation at <strong>${updated.title}</strong> is confirmed.`,
+            `Your host accepted your reservation at <strong>${updated.title}</strong>.`,
             `Dates: ${updated.check_in} → ${updated.check_out}.`,
             `Reservation code: <strong>${updated.reservation_code ?? ''}</strong>.`,
+            'To lock the stay in, send your payment now. Your QR stay pass appears as soon as we have confirmed the transfer.',
           ],
-          { label: 'View reservation', url: `${WEB_URL}/reservation/${updated.id}` }
+          { label: 'Pay for your stay', url: `${WEB_URL}/reservation/${updated.id}` }
         )
       } else {
         await sendNotificationEmail(
@@ -2569,21 +3056,61 @@ export async function setBookingStatus(
       }
     }
   }
+
+  // The nights are spoken for now, so the rivals for them cannot be accepted by
+  // anyone, ever. Decline them rather than leaving guests waiting on an answer that
+  // can never come — and rather than leaving the host an inbox where every row still
+  // looks like a live choice. Each one goes through this same function, so those
+  // guests get the ordinary decline notification, push and email.
+  if (accepted && updated) {
+    const { rows: losers } = await pool.query(
+      `SELECT id::text AS id FROM bookings
+        WHERE listing_id = $1 AND id <> $2 AND status = 'pending'
+          AND check_in < $3 AND check_out > $4`,
+      [accepted.listingId, bookingId, accepted.checkOut, accepted.checkIn]
+    )
+    for (const l of losers as { id: string }[]) {
+      // Best-effort per request, exactly as the takedown sweep is: one guest's
+      // email bouncing must not leave the rest of them hanging on a request the
+      // host can no longer act on.
+      try {
+        await setBookingStatus(l.id, hostUserId, 'rejected')
+      } catch (err) {
+        console.error('confirm: failed to decline displaced request', l.id, err)
+      }
+    }
+  }
   return updated
+}
+
+/** A booking as the HOST sees it: the shared projection plus the two host-only
+ *  columns — what they are owed, and who is asking. */
+export interface HostBookingRow extends Booking {
+  host_payout: number
+  /** The guest's full name; null when the account is gone or never set one. */
+  guest_name: string | null
 }
 
 /** All bookings across a host's listings (host "requests" view). Host-only, so
  *  it also carries `host_payout` — the raw amount this host is owed, which the
- *  shared projection deliberately withholds. */
-export async function getHostBookings(hostUserId: string): Promise<Booking[]> {
+ *  shared projection deliberately withholds — and `guest_name`, which the shared
+ *  projection also withholds because a guest reading their own booking has no
+ *  business seeing it. A host deciding Approve/Decline does: "a request from
+ *  someone" is not something anyone can act on. */
+export async function getHostBookings(hostUserId: string): Promise<HostBookingRow[]> {
   if (!isUuid(hostUserId)) return []
   const { rows } = await pool.query(
-    `SELECT ${BOOKING_COLS}, b.total_price::float8 AS host_payout
-       FROM bookings b JOIN listings l ON l.id = b.listing_id
+    // LEFT JOIN, not JOIN: a deleted guest account must not delete the host's
+    // record of the stay — the row stays, the name reads null.
+    `SELECT ${BOOKING_COLS}, b.total_price::float8 AS host_payout,
+            gu.full_name AS guest_name
+       FROM bookings b
+       JOIN listings l ON l.id = b.listing_id
+       LEFT JOIN users gu ON gu.id = b.user_id
       WHERE l.host_id = $1 ORDER BY b.created_at DESC`,
     [hostUserId]
   )
-  return rows as Booking[]
+  return rows as HostBookingRow[]
 }
 
 /** A single reservation (for the detail card / QR / wallet pass). */
@@ -3410,6 +3937,24 @@ export async function createMessage(bookingId: string, senderId: string, body: s
        FROM ins JOIN users u ON u.id = ins.sender_id`,
     [bookingId, senderId, text]
   )
+
+  // Tell the other side, exactly as the pre-booking thread does. This thread sent
+  // nothing at all until now: the message landed in the database and the
+  // recipient learned about it only by reopening the reservation. `/messages` is
+  // a real destination for it since the inbox started listing reservations.
+  const other = await pool.query(
+    `SELECT CASE WHEN b.user_id = $2 THEN l.host_id ELSE b.user_id END AS recipient_id
+       FROM bookings b JOIN listings l ON l.id = b.listing_id
+      WHERE b.id = $1`,
+    [bookingId, senderId]
+  )
+  await createNotification(other.rows[0]?.recipient_id as string | undefined, {
+    type: 'message',
+    title: 'New message',
+    body: text.slice(0, 80),
+    link: '/messages',
+  })
+
   return rows[0] as Message
 }
 
@@ -3449,20 +3994,17 @@ export async function getPlaceSuggestions(q: string): Promise<string[]> {
   return out.slice(0, 8)
 }
 
-// ---- Pre-booking chat (guest ⇄ host, before a booking exists) ---------------
-// Uses the shared conversations + chat_messages tables (created by the web via
-// xmig6). Distinct from the per-booking `messages` table above.
+// ---- The Messages inbox (guest ⇄ host) --------------------------------------
+// Two stores, one list. `conversations` + `chat_messages` hold the PRE-BOOKING
+// thread (one per listing+guest, opened by "Message host"); the `messages` table
+// above holds the PER-RESERVATION thread (one per booking, opened from a
+// reservation request). This section reads both — see inbox-core.ts for why they
+// are namespaced instead of merged, and for the `booking:<uuid>` id shape every
+// function below accepts wherever it used to take a bare conversation id.
 
-export interface ConversationSummary {
-  id: string
-  listing_id: string | null
-  listing_title: string | null
-  listing_image: string | null
-  other_name: string | null
-  last_message: string | null
-  last_message_at: string
-  is_host: boolean
-}
+/** One inbox row. `kind`/`booking_id`/`check_in`/`check_out`/`booking_status`
+ *  are present on reservation threads and null on pre-booking ones. */
+export type ConversationSummary = InboxThread
 
 export interface ChatThreadMessage {
   id: string
@@ -3493,9 +4035,30 @@ export async function getOrCreateConversation(
   return { id: rows[0].id as string, host_id: listing.host_id, listing_title: listing.title }
 }
 
-/** All threads a user is part of (as guest or host), newest activity first. */
+/**
+ * Every thread a user is part of, as guest or host, newest activity first —
+ * PRE-BOOKING conversations and RESERVATION threads together.
+ *
+ * The reservation half is why this function exists in this shape. It used to
+ * read `conversations` alone, so a host replying inside a reservation request
+ * sent a message that reached the guest's screen only if the guest thought to
+ * reopen that reservation; the inbox said they had no messages at all.
+ *
+ * A reservation only appears once somebody has actually said something in it —
+ * the inner join to its latest message is what enforces that. An inbox listing
+ * every booking as an empty thread would be a second copy of the trips list.
+ */
 export async function listConversations(userId: string): Promise<ConversationSummary[]> {
   if (!isUuid(userId)) return []
+  const [listingThreads, bookingThreads] = await Promise.all([
+    listListingThreads(userId),
+    listBookingThreads(userId),
+  ])
+  return mergeInboxThreads(listingThreads, bookingThreads, INBOX_LIMIT)
+}
+
+/** The pre-booking half of the inbox: one row per (listing, guest) conversation. */
+async function listListingThreads(userId: string): Promise<InboxThreadRow[]> {
   const { rows } = await pool.query(
     `SELECT c.id, c.listing_id,
             l.title AS listing_title,
@@ -3510,10 +4073,55 @@ export async function listConversations(userId: string): Promise<ConversationSum
        LEFT JOIN users hu ON hu.id = c.host_id
       WHERE c.guest_id = $1 OR c.host_id = $1
       ORDER BY c.last_message_at DESC
-      LIMIT 200`,
+      LIMIT ${INBOX_LIMIT}`,
     [userId]
   )
-  return rows as ConversationSummary[]
+  return rows as InboxThreadRow[]
+}
+
+/**
+ * The reservation half of the inbox: one row per booking that has at least one
+ * message, for either side of it.
+ *
+ * `JOIN LATERAL … ON true` does double duty — it fetches the latest message for
+ * the row preview AND drops silent reservations, because an inner lateral join
+ * with no matching row eliminates the booking. The host side reads `l.host_id`
+ * rather than a column on `bookings`: the listing owns the host, and that is the
+ * same rule `/api/local/bookings/:id/messages` authorizes against, so a thread
+ * can never appear in an inbox its owner would be refused entry to.
+ */
+async function listBookingThreads(userId: string): Promise<InboxThreadRow[]> {
+  const { rows } = await pool.query(
+    `SELECT b.id::text AS booking_id,
+            b.listing_id,
+            l.title AS listing_title,
+            (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS listing_image,
+            CASE WHEN b.user_id = $1 THEN hu.full_name ELSE gu.full_name END AS other_name,
+            lm.body AS last_message,
+            to_char(lm.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last_message_at,
+            (l.host_id = $1) AS is_host,
+            to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+            to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+            b.status AS booking_status
+       FROM bookings b
+       JOIN listings l ON l.id = b.listing_id
+       LEFT JOIN users gu ON gu.id = b.user_id
+       LEFT JOIN users hu ON hu.id = l.host_id
+       JOIN LATERAL (
+         SELECT m.body, m.created_at
+           FROM messages m
+          WHERE m.booking_id = b.id
+          ORDER BY m.created_at DESC
+          LIMIT 1
+       ) lm ON true
+      WHERE b.user_id = $1 OR l.host_id = $1
+      ORDER BY lm.created_at DESC
+      LIMIT ${INBOX_LIMIT}`,
+    [userId]
+  )
+  // The inbox id is minted here, not in SQL, so the `booking:` namespace has one
+  // definition and it is the one parseThreadId reads back.
+  return rows.map((r) => ({ ...r, id: bookingThreadId(String(r.booking_id)) })) as InboxThreadRow[]
 }
 
 async function conversationForUser(userId: string, conversationId: string) {
@@ -3525,9 +4133,38 @@ async function conversationForUser(userId: string, conversationId: string) {
   return rows[0] as { id: string; listing_id: string | null; guest_id: string; host_id: string } | undefined
 }
 
-/** Messages in a thread, oldest first. Only members can read. */
-export async function listChatMessages(userId: string, conversationId: string): Promise<ChatThreadMessage[]> {
-  if (!isUuid(userId) || !isUuid(conversationId)) throw new Error('Invalid id')
+/**
+ * Membership check for a reservation thread — the booking's guest, or the host
+ * of the listing it is on. Same rule as the booking-messages route; kept next to
+ * `conversationForUser` because they are the two halves of one question.
+ */
+async function bookingThreadForUser(userId: string, bookingId: string) {
+  const { rows } = await pool.query(
+    `SELECT b.id, b.listing_id, b.user_id AS guest_id, l.host_id
+       FROM bookings b JOIN listings l ON l.id = b.listing_id
+      WHERE b.id = $1 AND (b.user_id = $2 OR l.host_id = $2)`,
+    [bookingId, userId]
+  )
+  return rows[0] as { id: string; listing_id: string; guest_id: string; host_id: string | null } | undefined
+}
+
+/** Messages in a thread, oldest first. Only members can read. Accepts either
+ *  inbox id shape — a conversation uuid or `booking:<uuid>`. */
+export async function listChatMessages(userId: string, threadId: string): Promise<ChatThreadMessage[]> {
+  const ref = parseThreadId(threadId)
+  if (!isUuid(userId) || !ref) throw new Error('Invalid id')
+
+  if (ref.kind === 'booking') {
+    if (!(await bookingThreadForUser(userId, ref.id))) throw new Error('Conversation not found')
+    const { rows } = await pool.query(
+      `SELECT id, sender_id, body, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+         FROM messages WHERE booking_id = $1 ORDER BY messages.created_at ASC LIMIT 500`,
+      [ref.id]
+    )
+    return (rows as ChatThreadMessage[]).map((m) => ({ ...m, mine: m.sender_id === userId }))
+  }
+
+  const conversationId = ref.id
   const convo = await conversationForUser(userId, conversationId)
   if (!convo) throw new Error('Conversation not found')
   const { rows } = await pool.query(
@@ -3539,9 +4176,29 @@ export async function listChatMessages(userId: string, conversationId: string): 
 }
 
 /** Post a message. Contact details are blocked (contentguard), including ones
- *  split across the sender's recent messages. Notifies the other party. */
-export async function postChatMessage(userId: string, conversationId: string, rawBody: string): Promise<ChatThreadMessage> {
-  if (!isUuid(userId) || !isUuid(conversationId)) throw new Error('Invalid id')
+ *  split across the sender's recent messages. Notifies the other party.
+ *  Accepts either inbox id shape — a conversation uuid or `booking:<uuid>`. */
+export async function postChatMessage(userId: string, threadId: string, rawBody: string): Promise<ChatThreadMessage> {
+  const ref = parseThreadId(threadId)
+  if (!isUuid(userId) || !ref) throw new Error('Invalid id')
+
+  // A reservation thread is written by exactly one function, whichever door the
+  // sender came through — createMessage runs the content guards, the insert and
+  // the recipient's notification. Replying from the inbox and replying from the
+  // reservation screen must not be two different code paths.
+  if (ref.kind === 'booking') {
+    if (!(await bookingThreadForUser(userId, ref.id))) throw new Error('Conversation not found')
+    const sent = await createMessage(ref.id, userId, rawBody)
+    return {
+      id: sent.id,
+      sender_id: sent.sender_id,
+      body: sent.body,
+      created_at: new Date(sent.created_at).toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      mine: true,
+    }
+  }
+
+  const conversationId = ref.id
   const body = String(rawBody || '').trim().slice(0, 2000)
   if (!body) throw new Error('Message is empty')
   await guardContent(userId, body, 'chat', { type: 'conversation', id: conversationId })
@@ -3727,6 +4384,7 @@ export async function adminGetUserDetail(id: string): Promise<AdminUserDetail | 
       `SELECT l.id, l.title, COALESCE(l.is_published, false) AS is_published,
               COALESCE(l.approval_status, 'approved') AS approval_status,
               COALESCE(l.unpublished_by_admin, false) AS unpublished_by_admin,
+              COALESCE(l.unpublished_by_host, false) AS unpublished_by_host,
               COALESCE(l.price_per_night, 0)::float8 AS price_per_night,
               COALESCE(l.currency, 'USD') AS currency,
               to_char(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
@@ -3840,6 +4498,9 @@ export async function adminListListings(): Promise<AdminListingRow[]> {
             ${sqlWithCommission('l.price_per_night')}::float8 AS price_per_night,
             l.price_per_night::float8 AS host_price_per_night,
             l.is_published,
+            -- Why it is down, so the console can say "Hidden by host" rather than
+            -- offering a Show button that the write layer will refuse.
+            COALESCE(l.unpublished_by_host, false) AS unpublished_by_host,
             COALESCE(l.approval_status, 'approved') AS approval_status,
             (l.ownership_doc IS NOT NULL AND l.ownership_doc <> '') AS has_ownership_doc,
             l.host_id, u.full_name AS host_name, l.region,
@@ -3926,6 +4587,159 @@ export async function adminListPendingProofs(): Promise<PendingProofRow[]> {
       ORDER BY pp.submitted_at ASC`
   )
   return rows as PendingProofRow[]
+}
+
+// ---- Refunds (the /ops queue that actually pays a cancelled guest back) ------
+//
+// Cancelling stamps what the guest is OWED and stops. There is no gateway, so the
+// money moves when a human transfers it — and until this queue existed nothing
+// listed who was still waiting. A guest could be told "Refunded" by their app while
+// no one on this side had any record that anything was outstanding.
+//
+// Membership is the SQL twin of isRefundDue() in cancellation-core.ts: cancelled,
+// a refund earned, the guest had actually paid, not yet settled. The two must agree
+// or a row will show as due in /ops and settled on the phone.
+
+/** One line of the refunds queue — who is owed what, and on which booking. */
+export interface RefundRow {
+  booking_id: string
+  reservation_code: string | null
+  title: string | null
+  guest_id: string
+  guest_name: string | null
+  guest_email: string | null
+  /** Where to send it. Guests are refunded by hand, so this is the whole point of the row. */
+  guest_phone: string | null
+  /** Commission-inclusive total the guest paid — what the percentage is OF. */
+  total_price: number
+  refund_percent: number
+  /** Money owed, as stamped at cancel time. Never recomputed here: the ladder may
+   *  have changed since, and the guest was quoted this number. */
+  refund_amount: number
+  cancelled_at: string | null
+  /** 'guest' | 'host' — who called the stay off. */
+  cancelled_by_role: string | null
+  check_in: string
+  check_out: string
+  /** Null while due; the settlement stamp once someone has sent the money. */
+  refunded_at: string | null
+  refund_reference: string | null
+}
+
+const REFUND_ROW_COLS = `
+  b.id AS booking_id, b.reservation_code, l.title,
+  b.user_id AS guest_id,
+  gu.full_name AS guest_name, gu.email AS guest_email, gu.phone AS guest_phone,
+  ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS total_price,
+  COALESCE(b.refund_percent, 0)::int AS refund_percent,
+  COALESCE(b.refund_amount, 0)::float8 AS refund_amount,
+  to_char(b.cancelled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS cancelled_at,
+  b.cancelled_by_role,
+  to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+  to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+  to_char(b.refunded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS refunded_at,
+  b.refund_reference
+`
+
+/** Cancelled, owed money, guest had paid, nobody has sent it. The SQL twin of
+ *  isRefundDue(). LEFT JOIN on users so a deleted guest account still shows the
+ *  debt — the money is owed whether or not the account survives. */
+const REFUND_DUE_SQL = `
+  b.status = 'cancelled'
+  AND b.refunded_at IS NULL
+  AND COALESCE(b.refund_percent, 0) > 0
+  AND (b.payment_status = 'paid' OR b.paid_at IS NOT NULL)
+`
+
+/**
+ * The queue, oldest first — a guest who has been waiting longest is paid first.
+ * `settled` returns the other half instead: the last 100 refunds actually sent, so
+ * the operator can check their own work and answer "did you refund me?".
+ */
+export async function adminListRefunds(): Promise<{ due: RefundRow[]; settled: RefundRow[] }> {
+  const [due, settled] = await Promise.all([
+    pool.query(
+      `SELECT ${REFUND_ROW_COLS}
+         FROM bookings b
+         JOIN listings l ON l.id = b.listing_id
+         LEFT JOIN users gu ON gu.id = b.user_id
+        WHERE ${REFUND_DUE_SQL}
+        ORDER BY b.cancelled_at ASC NULLS LAST`
+    ),
+    pool.query(
+      `SELECT ${REFUND_ROW_COLS}
+         FROM bookings b
+         JOIN listings l ON l.id = b.listing_id
+         LEFT JOIN users gu ON gu.id = b.user_id
+        WHERE b.status = 'cancelled' AND b.refunded_at IS NOT NULL
+        ORDER BY b.refunded_at DESC
+        LIMIT 100`
+    ),
+  ])
+  return { due: due.rows as RefundRow[], settled: settled.rows as RefundRow[] }
+}
+
+/** How many guests are still owed money, and how much — for the /ops badge counts. */
+export async function countRefundsDue(): Promise<{ count: number; total: number }> {
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS count, COALESCE(sum(b.refund_amount), 0)::float8 AS total
+       FROM bookings b WHERE ${REFUND_DUE_SQL}`
+  )
+  return rows[0] as { count: number; total: number }
+}
+
+/**
+ * Mark a refund as sent. Idempotent by construction: the WHERE still carries
+ * `refunded_at IS NULL`, so a double-click — or two moderators working the queue at
+ * once — settles the row once and the second call answers null rather than
+ * restamping it under a second name.
+ *
+ * Does NOT touch payment_status. 'refunded' there is the retired Paymob vocabulary
+ * that analytics reads as "this booking earned nothing" (REFUNDED_SQL), and a
+ * PARTIAL refund did earn something — writing it would silently erase the half the
+ * platform kept from every revenue figure.
+ */
+export async function adminMarkRefunded(
+  bookingId: string,
+  adminId: string,
+  reference: string | null = null
+): Promise<Booking | null> {
+  if (!isUuid(bookingId)) return null
+  const { rows } = await pool.query(
+    `WITH upd AS (
+       UPDATE bookings b SET
+         refunded_at = now(),
+         refunded_by = $2,
+         refund_reference = NULLIF(btrim(COALESCE($3, '')), '')
+       WHERE b.id = $1 AND b.status = 'cancelled' AND b.refunded_at IS NULL
+         AND COALESCE(b.refund_percent, 0) > 0
+       RETURNING b.*
+     )
+     SELECT ${BOOKING_COLS} FROM upd b JOIN listings l ON l.id = b.listing_id`,
+    [bookingId, String(adminId).slice(0, 64), reference ? String(reference).slice(0, 120) : null]
+  )
+  const booking = (rows[0] as Booking) ?? null
+  if (!booking) return null
+  // The guest is the only person who can confirm the money landed, so they are the
+  // one who has to be told it was sent.
+  await createNotification(booking.user_id, {
+    type: 'refund_sent',
+    title: 'Refund sent',
+    body: `${booking.title} — ${fmtEgp(booking.refund_amount)} has been refunded to you.`,
+    link: `/reservation/${booking.id}`,
+  })
+  await sendPush(booking.user_id, {
+    title: 'Refund sent',
+    body: `${fmtEgp(booking.refund_amount)} for ${booking.title}`,
+    link: `/reservation/${booking.id}`,
+  })
+  return booking
+}
+
+/** "EGP 5,500" — the one place a refund figure is worded for a human. */
+function fmtEgp(amount: number | null): string {
+  const n = Number(amount)
+  return `EGP ${Number.isFinite(n) ? Math.round(n).toLocaleString('en-US') : '0'}`
 }
 
 /**
@@ -4231,10 +5045,12 @@ export async function adminSetAccountStatus(
     } else if (!hidesListings(next) && hidesListings(previous)) {
       const shown = await client.query(
         // Not the ones verification took down — those come back only when the
-        // host is verified again.
+        // host is verified again — and not the ones the host took down
+        // themselves, which only the host may put back.
         `UPDATE listings SET is_published = true, unpublished_by_admin = false
           WHERE host_id = $1 AND unpublished_by_admin = true
             AND COALESCE(unpublished_by_verification, false) = false
+            AND COALESCE(unpublished_by_host, false) = false
             AND COALESCE(approval_status, 'approved') = 'approved'`,
         [id],
       )
@@ -4346,8 +5162,12 @@ export async function adminSetListingApproval(
   // editor now read `review_note` back. Approving clears it: the note describes a
   // rejection, and a stale one under a live listing reads as a fresh complaint.
   const reviewNote = action === 'reject' ? normalizeListingReviewNote(note) : null
+  // Same guard as setListingApproval: approving must not republish a listing its
+  // own host has taken down. See host-visibility-core.ts.
   const { rows } = await pool.query(
-    `UPDATE listings SET approval_status = $2, is_published = $3, review_note = $4 WHERE id = $1
+    `UPDATE listings SET approval_status = $2,
+            is_published = ${publishOnApprovalSql('$3')}, review_note = $4
+      WHERE id = $1
      RETURNING host_id, title`,
     [id, status, action === 'approve', reviewNote],
   )
@@ -4383,7 +5203,14 @@ export async function adminSetListingPublished(id: string, published: boolean): 
   if (!isUuid(id)) throw new Error('Invalid listing')
   await pool.query(
     published
-      ? `UPDATE listings SET is_published = true, unpublished_by_admin = false WHERE id = $1`
+      // An operator pressing "Show" is undoing a STAFF decision, and a listing the
+      // HOST took down is not a staff decision to undo — publishing it would
+      // silently overrule them. /ops labels such a row "Hidden by host" and offers
+      // no button, but the guard lives in the write because the API is reachable
+      // without the console. The admin flag is cleared either way: whatever
+      // happens to visibility, this listing is no longer "hidden by a block".
+      ? `UPDATE listings SET is_published = ${PUBLISH_RESPECTING_HOST_SQL},
+                             unpublished_by_admin = false WHERE id = $1`
       : `UPDATE listings SET is_published = false WHERE id = $1`,
     [id],
   )
@@ -5081,7 +5908,8 @@ export async function reviewVerification(
       const shown = await client.query(
         `UPDATE listings SET is_published = true, unpublished_by_verification = false
           WHERE host_id = $1 AND unpublished_by_verification = true
-            AND COALESCE(unpublished_by_admin, false) = false`,
+            AND COALESCE(unpublished_by_admin, false) = false
+            AND COALESCE(unpublished_by_host, false) = false`,
         [uid],
       )
       listingsRestored = shown.rowCount ?? 0
@@ -5239,6 +6067,10 @@ export interface AdminListingRow {
   /** The host's raw price, before the platform commission. */
   host_price_per_night: number
   is_published: boolean
+  /** The host took this listing down themselves. Staff cannot put it back —
+   *  adminSetListingPublished refuses — so the console shows "Hidden by host"
+   *  in place of the Show button. */
+  unpublished_by_host: boolean
   approval_status: string
   host_id: string | null
   host_name: string | null
@@ -5416,6 +6248,9 @@ export interface AdminUserListing {
   /** True when a block/removal took this listing down — so /ops can say WHY it's
    *  hidden rather than leaving the operator guessing. */
   unpublished_by_admin: boolean
+  /** True when the HOST took it down themselves. Staff cannot undo this one —
+   *  the write layer refuses — so the console shows it instead of a Show button. */
+  unpublished_by_host: boolean
   price_per_night: number
   currency: string
   created_at: string

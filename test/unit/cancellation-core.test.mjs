@@ -16,6 +16,7 @@ import assert from 'node:assert/strict'
 import {
   CANCELLATION_POLICIES, normalizePolicy,
   refundPercentFor, refundAmountFor, isCancellable,
+  refundOutcomeFor, isRefundDue, REFUND_OUTCOMES,
 } from '../../src/lib/local/cancellation-core.ts'
 
 describe('normalizePolicy', () => {
@@ -145,3 +146,93 @@ describe('isCancellable', () => {
   })
 })
 
+
+// The reported defect: **a cancelled reservation did not say what happened to the
+// money.** A guest who cancelled 10 days out and got everything back, one who
+// cancelled 2 days out and got half, and one who cancelled on the morning of
+// check-in and got nothing all read "Cancelled" — on their own screen and on the
+// host's. refundOutcomeFor is the one rule the iOS and Android badges now run
+// (CancellationOutcome.swift / CancellationOutcome.kt are its twins).
+describe('refundOutcomeFor', () => {
+  const paid = { status: 'cancelled', payment_status: 'paid' }
+
+  test('a booking that is not cancelled has no outcome to show', () => {
+    for (const status of ['pending', 'confirmed', 'completed', 'rejected', null, undefined]) {
+      assert.equal(refundOutcomeFor({ status, refund_percent: 100, payment_status: 'paid' }), 'open')
+    }
+  })
+
+  test('100% back reads as refunded, anything between as partially refunded', () => {
+    assert.equal(refundOutcomeFor({ ...paid, refund_percent: 100 }), 'refunded')
+    assert.equal(refundOutcomeFor({ ...paid, refund_percent: 50 }), 'partially_refunded')
+    assert.equal(refundOutcomeFor({ ...paid, refund_percent: 1 }), 'partially_refunded')
+    assert.equal(refundOutcomeFor({ ...paid, refund_percent: 99 }), 'partially_refunded')
+  })
+
+  test('nothing back reads as a plain cancellation', () => {
+    // The day-of-check-in floor, and strict inside 7 days.
+    assert.equal(refundOutcomeFor({ ...paid, refund_percent: 0 }), 'cancelled')
+  })
+
+  test('an UNPAID cancellation is plain "cancelled", whatever the ladder quoted', () => {
+    // The ladder quotes a percentage for every cancellation, paid or not. Most
+    // cancellations are pending requests called off before any transfer — telling
+    // that guest they were "Refunded" claims money came back that was never taken.
+    assert.equal(refundOutcomeFor({ status: 'cancelled', refund_percent: 100 }), 'cancelled')
+    assert.equal(
+      refundOutcomeFor({ status: 'cancelled', refund_percent: 100, payment_status: 'unpaid' }),
+      'cancelled'
+    )
+    assert.equal(
+      refundOutcomeFor({ status: 'cancelled', refund_percent: 50, payment_status: 'submitted' }),
+      'cancelled'
+    )
+  })
+
+  test('paid_at alone proves payment — payment_status may be a legacy value', () => {
+    assert.equal(
+      refundOutcomeFor({ status: 'cancelled', refund_percent: 100, paid_at: '2026-08-01T00:00:00Z' }),
+      'refunded'
+    )
+  })
+
+  test('a missing refund_percent is no refund, never an invented one', () => {
+    // Admin cancellations and rows written before the column existed. Guessing here
+    // is the one mistake with a cash cost.
+    for (const pct of [null, undefined, NaN, 'abc']) {
+      assert.equal(refundOutcomeFor({ ...paid, refund_percent: pct }), 'cancelled', `for ${String(pct)}`)
+    }
+  })
+
+  test('status matching is case- and whitespace-insensitive', () => {
+    assert.equal(refundOutcomeFor({ status: ' Cancelled ', refund_percent: 100, payment_status: 'PAID' }), 'refunded')
+  })
+
+  test('the vocabulary is the four the clients switch on', () => {
+    assert.deepEqual(REFUND_OUTCOMES, ['open', 'cancelled', 'partially_refunded', 'refunded'])
+  })
+})
+
+// The /ops queue's membership test. There is no gateway: a human transfers the
+// money and marks the row, so "owed" and "sent" are two different facts.
+describe('isRefundDue', () => {
+  const owed = { status: 'cancelled', refund_percent: 50, payment_status: 'paid' }
+
+  test('cancelled, earned and paid but not yet sent is due', () => {
+    assert.equal(isRefundDue(owed), true)
+    assert.equal(isRefundDue({ ...owed, refund_percent: 100 }), true)
+  })
+
+  test('once settled it is no longer due', () => {
+    assert.equal(isRefundDue({ ...owed, refunded_at: '2026-08-26T10:00:00Z' }), false)
+  })
+
+  test('nothing is due when nothing was earned or nothing was paid', () => {
+    assert.equal(isRefundDue({ ...owed, refund_percent: 0 }), false)
+    assert.equal(isRefundDue({ ...owed, payment_status: 'unpaid', paid_at: null }), false)
+  })
+
+  test('a live booking is never due — only a cancellation can owe a refund', () => {
+    assert.equal(isRefundDue({ ...owed, status: 'confirmed' }), false)
+  })
+})

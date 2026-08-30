@@ -180,3 +180,81 @@ export function assertProofImage(value: unknown): string {
   }
   return raw
 }
+
+// ---- The stay pass ----------------------------------------------------------
+
+/**
+ * What `isLiveStayPass` reads. Extends `PaymentFlowBooking` with the alias a raw
+ * `bookings` row uses, so a row can be handed straight in without remapping:
+ * the column is `payment_status`, while `PaymentFlowBooking` calls it
+ * `payment_state`. Either is accepted; `payment_state` wins when both are set.
+ */
+export interface StayPassBooking extends PaymentFlowBooking {
+  /** Raw `bookings.payment_status`, accepted as an alias for `payment_state`. */
+  payment_status?: string | null
+}
+
+/**
+ * THE rule for "this reservation has a live stay pass" — the QR, the Apple
+ * Wallet pass, the public `/stay/<code>` page and the host-authored guide behind
+ * it. One definition for the backend, the web, iOS and Android (mirrored as
+ * `ReservationDetail.isLiveStayPass` in Swift and `Reservation.isLiveStayPass`
+ * in Kotlin), so one reservation looks the same on every surface.
+ *
+ * The rule is `confirmed AND paid`, plus `completed` unconditionally:
+ *
+ *   • `confirmed` alone is NOT enough. It only means the host accepted the
+ *     request — the reservation code is minted at that transition, and payment
+ *     happens afterwards (the guest can only pay a confirmed booking). A pass
+ *     issued here is a pass handed out before any money arrived, which is
+ *     exactly the bug this rule exists to prevent: the host tapped Approve and
+ *     both sides immediately saw a QR for an unpaid stay.
+ *   • Payment must be APPROVED, not merely submitted. A transfer screenshot
+ *     sitting in the ops queue (`submitted`/`disputed`) is not money in the
+ *     account, so `paymentStageFor` — not a hand-rolled status test — decides.
+ *   • `completed` keeps its pass whatever the payment columns say. The stay
+ *     already happened, so the pass is the guest's receipt of it, and historical
+ *     rows that predate this rule must not lose it retroactively.
+ *   • `pending` never had a code; `cancelled`/`rejected` keep the code they were
+ *     issued but the pass is dead.
+ *
+ * Note this deliberately says nothing about `reservation_code`. That is the
+ * other half of the gate and every caller already owns it (`stayPassPath` on
+ * web, `stayCode` on iOS, `ShareLinks.stay` on Android) — a confirmed-and-paid
+ * booking whose code somehow never landed still renders nothing.
+ */
+export function isLiveStayPass(b: StayPassBooking): boolean {
+  const status = String(b.status ?? '').trim().toLowerCase()
+  // The stay happened — the pass is a receipt now, not an entitlement.
+  if (status === 'completed') return true
+  if (status !== 'confirmed') return false
+  return paymentStageFor({ ...b, payment_state: b.payment_state ?? b.payment_status }) === 'paid'
+}
+
+/**
+ * Whether money ever reached us on this booking — which is NOT the question
+ * `paymentStageFor` answers. That one asks "can this be paid now?", and the two part
+ * company on exactly the rows that matter: a cancelled booking is `not_payable`
+ * whatever was paid for it, and a refunded one has had its paid marker wiped.
+ *
+ * ⚠️ THE paid_at TRAP (the same one analytics-core.ts warns about). A refund sets
+ * `paid_at = NULL`, so `paid_at IS NOT NULL` answers "never paid" for exactly the
+ * bookings a refund question is about. The payment column is checked first here, and
+ * `paid_at` only ever adds to the answer — it can never be the thing that denies it.
+ *
+ * `refunded` and `voided` are terminal states from the retired Paymob path: money went
+ * out and came back, so it certainly arrived first.
+ *
+ * This exists because `bookings.refund_percent` is stamped from the listing's
+ * cancellation policy whenever a guest cancels, WITHOUT regard to whether anything was
+ * ever paid (see cancelBooking / getCancellationQuote in db.ts). So a never-paid
+ * booking cancelled a fortnight out carries `refund_percent = 100`, and any UI that
+ * splits a cancellation on that column alone will call it "Refunded" — money back that
+ * was never money in. Ask this first.
+ */
+export function everPaid(b: StayPassBooking): boolean {
+  const state = normalizePaymentState(b.payment_state ?? b.payment_status)
+  if (state === 'paid' || state === 'refunded' || state === 'voided') return true
+  if (normalizeProofStatus(b.payment_proof_status) === 'approved') return true
+  return !!b.paid_at
+}

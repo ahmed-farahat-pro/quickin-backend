@@ -9,6 +9,17 @@
 //   node quickin-backend/scripts/check-listing-title-policy-parity.mjs
 //
 // Exits 1 on drift. Run it before deploying either project (npm run check does).
+//
+// TWO MORE COPIES this script cannot see, because you cannot byte-compare across
+// languages: `ListingTitlePolicy` in quickin-mono/mobile/android/.../ListingTitlePolicy.kt
+// and in quickin-mono/mobile/ios/Sources/AddListingView.swift. Both are updated
+// by hand, and MIN_TITLE_LETTERS / MAX_TITLE_LENGTH are the contract between all
+// four files — change the rule here and they need changing there in the same
+// breath, or a title is refused on the website and published from a phone.
+// Android's copy is guarded by ListingTitlePolicyTest.kt, which mirrors
+// test/unit/listing-title-policy.test.mjs case for case (`./gradlew
+// testDebugUnitTest`). The Swift copy is guarded by nothing — that project has
+// no test target — so it is the one to check by eye.
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 

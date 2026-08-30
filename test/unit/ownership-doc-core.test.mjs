@@ -18,6 +18,7 @@ import {
   checkOwnershipDoc,
   isOwnershipDocSrc,
   isPdfDataUrl,
+  ownershipDocAction,
   ownershipDocProblemMessage,
 } from '../../src/lib/local/ownership-doc-core.ts'
 
@@ -122,5 +123,37 @@ describe('ownershipDocProblemMessage', () => {
 describe('OWNERSHIP_DOC_ACCEPT', () => {
   test('offers images and PDF to the file picker, and nothing else', () => {
     assert.equal(OWNERSHIP_DOC_ACCEPT, 'image/*,application/pdf')
+  })
+})
+
+describe('ownershipDocAction', () => {
+  test('a listing with a document on file is offered a re-upload', () => {
+    assert.equal(ownershipDocAction(true), 'reupload')
+  })
+
+  test('a listing that never had one is offered an UPLOAD, not a re-upload', () => {
+    // The bug this function exists for: the ownership document is optional at
+    // create time, so a listing sits in the queue as 'pending' with nothing
+    // attached — and all three host dashboards labelled the button off the
+    // moderation status, telling the host to "re-upload" a document they had
+    // never uploaded.
+    assert.equal(ownershipDocAction(false), 'upload')
+  })
+
+  test('an absent flag reads as "no document", so the host is invited to attach one', () => {
+    // A client on an older backend gets no `has_ownership_doc` at all. "Upload"
+    // is the honest answer to an unknown: it invites the document either way,
+    // where "Re-upload" would claim one is already on file.
+    assert.equal(ownershipDocAction(undefined), 'upload')
+    assert.equal(ownershipDocAction(null), 'upload')
+  })
+
+  test('only a real boolean true counts — a truthy JSON value does not', () => {
+    // The flag is a Postgres boolean projected straight into JSON. Anything else
+    // arriving here means the payload is not what we think it is, and guessing
+    // "yes" from it is how a host is told to re-upload nothing again.
+    assert.equal(ownershipDocAction('true'), 'upload')
+    assert.equal(ownershipDocAction(1), 'upload')
+    assert.equal(ownershipDocAction({}), 'upload')
   })
 })

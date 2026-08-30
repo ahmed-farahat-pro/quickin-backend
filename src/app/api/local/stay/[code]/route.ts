@@ -12,6 +12,11 @@ import { getStayByCode, normalizeStayCode } from '@/lib/local/db'
 // isn't a lookup failure but a client that built a link it shouldn't have:
 // answer 400 `missing_code` so the page can say "no reservation code yet"
 // instead of "we couldn't find that reservation".
+//
+// A code alone is NOT the pass. Host approval mints the code while the booking is
+// still unpaid, so the payload carries `is_live` (confirmed AND paid, or
+// completed) and the host's stay guide is empty unless it is true. Render on
+// `is_live`, never on `status` alone.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',

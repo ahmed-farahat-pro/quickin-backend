@@ -3,9 +3,10 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PKPass } from 'passkit-generator'
 import { getBookingById } from '@/lib/local/db'
+import { isLiveStayPass } from '@/lib/local/payment-flow-core'
 import { getUserFromRequest } from '@/lib/local/auth'
 
-// Signed Apple Wallet pass for a confirmed reservation.
+// Signed Apple Wallet pass for a confirmed AND PAID reservation.
 //   GET     /api/wallet/pass/:bookingId  → application/vnd.apple.pkpass (a signed .pkpass)
 //
 // The pass embeds the reservation code — the credential that resolves /stay/<code> —
@@ -121,12 +122,21 @@ export async function GET(req: Request, ctx: { params: Promise<{ bookingId: stri
     if (booking.user_id !== user.id && booking.host_id !== user.id && user.role !== 'admin') {
       return NextResponse.json({ error: 'Not allowed' }, { status: 403, headers: CORS })
     }
-    // No pass for an unconfirmed booking: the QR on the pass is the reservation
-    // code, and a code only exists once the stay is confirmed. Never fall back to
-    // the booking id — that would print a QR pointing at a /stay/<uuid> that can
-    // never resolve.
-    if (booking.status !== 'confirmed' || !booking.reservation_code) {
+    // No pass until the stay is confirmed AND PAID (or already completed) — the
+    // shared `isLiveStayPass` rule, identical on the web, iOS and Android. Host
+    // approval alone is not enough: it mints the reservation code but the guest
+    // pays afterwards, so signing a pass here would put a working QR in both
+    // parties' Wallets for a stay nobody has paid for. Never fall back to the
+    // booking id either — that would print a QR pointing at a /stay/<uuid> that
+    // can never resolve.
+    if (!booking.reservation_code) {
       return NextResponse.json({ error: 'Reservation must be confirmed first' }, { status: 400, headers: CORS })
+    }
+    if (!isLiveStayPass(booking)) {
+      return NextResponse.json(
+        { error: 'Reservation must be paid and confirmed first' },
+        { status: 400, headers: CORS }
+      )
     }
 
     const reservationCode = booking.reservation_code

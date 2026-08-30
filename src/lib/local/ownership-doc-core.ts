@@ -88,3 +88,26 @@ export function ownershipDocProblemMessage(problem: OwnershipDocProblem): string
     ? 'That file is too large'
     : 'Please attach a photo or PDF of the document'
 }
+
+/**
+ * Which action a host's own listing should offer for its ownership document.
+ *
+ * The document is OPTIONAL at create time — it is not in
+ * LISTING_REQUIRED_FIELDS — so a listing reaches the moderation queue with
+ * nothing attached, and "pending or rejected" is NOT the same question as "a
+ * document is on file". Every client used to answer the first and label the
+ * button from it, which offered a host a "Re-upload" of a document they had
+ * never uploaded. The flag that answers the second is `has_ownership_doc` on the
+ * HOST listing projection (a boolean; the document itself stays admin-only).
+ *
+ * `hasDoc` is `unknown` because it arrives off a JSON payload: an older backend
+ * that does not send the field yields 'upload', which is the safer of the two —
+ * it invites the host to attach the document either way, where the wrong
+ * "Re-upload" implies one is already on file and can be silently trusted.
+ *
+ * Mirrored, not imported, by the two mobile dashboards (Swift
+ * `Listing.hasOwnershipDoc`, Kotlin `HostListing.hasOwnershipDoc`).
+ */
+export function ownershipDocAction(hasDoc: unknown): 'upload' | 'reupload' {
+  return hasDoc === true ? 'reupload' : 'upload'
+}

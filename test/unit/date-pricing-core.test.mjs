@@ -40,6 +40,9 @@ import {
   expandBlocks,
   mergeBlockedDays,
   stayDiscountPercent, WEEKLY_DISCOUNT_MIN_NIGHTS, MONTHLY_DISCOUNT_MIN_NIGHTS,
+  weekendDaysSql,
+  weekendNightSql,
+  perNightSeasonalSql,
 } from '../../src/lib/local/date-pricing-core.ts'
 
 // The brief's own worked example, used as the end-to-end assertion below.
@@ -410,6 +413,49 @@ describe('SQL builders', () => {
     const sql = sqlWithDatePrice('d', ladder)
     assert.ok(sql.includes(ladder))
     assert.equal((sql.match(/COALESCE/g) || []).length, 1)
+  })
+})
+
+// The weekend rung reads a per-listing day set, and the whole reason these two
+// helpers are exported is that the PRICE and the LABEL are built by different
+// queries. They used to be written out twice, and the second copy hardcoded
+// Fri/Sat — so a host with a Thu+Fri weekend was charged the weekend rate and
+// told the night was 'base'.
+describe('SQL builders — which nights are the weekend', () => {
+  test('weekendDaysSql falls back to the default for NULL and for an empty set', () => {
+    const sql = weekendDaysSql()
+    // NULLIF first, so `{}` (a row predating the write rules) is treated as
+    // "never chose" rather than as "no day is a weekend".
+    assert.match(sql, /NULLIF\(l\.weekend_days, '\{\}'\)/)
+    assert.ok(sql.includes(`ARRAY[${DEFAULT_WEEKEND_DAYS.join(', ')}]`))
+  })
+
+  test('weekendDaysSql honours another table alias', () => {
+    assert.match(weekendDaysSql('li'), /NULLIF\(li\.weekend_days/)
+    assert.ok(!weekendDaysSql('li').includes('l.weekend_days'))
+  })
+
+  test('weekendNightSql needs BOTH a rate and a matching day', () => {
+    const sql = weekendNightSql('d')
+    // Without the rate check, a listing with no weekend price would label every
+    // Friday 'weekend' while being charged the base rate.
+    assert.match(sql, /l\.weekend_price IS NOT NULL/)
+    assert.match(sql, /EXTRACT\(DOW FROM \(d\)\)::int = ANY\(/)
+  })
+
+  test('weekendNightSql asks the listing which days those are, never Fri\/Sat directly', () => {
+    const sql = weekendNightSql('d')
+    assert.ok(sql.includes(weekendDaysSql('l')))
+    // The literal the two hardcoded CASEs used to carry. It may only appear
+    // inside the ARRAY[...] fallback, never as a bare dow comparison.
+    assert.ok(!/IN \(5, 6\)/.test(sql))
+  })
+
+  test('the price rung and the label are built from the same expression', () => {
+    // perNightSeasonalSql is the price; weekendNightSql is what the calendar and
+    // the stay quote label with. If these ever stop overlapping, a host sees a
+    // badge that contradicts the number beside it.
+    assert.ok(perNightSeasonalSql('d').includes(weekendNightSql('d', 'l')))
   })
 })
 

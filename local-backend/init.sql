@@ -77,6 +77,11 @@ CREATE INDEX IF NOT EXISTS idx_bookings_listing ON bookings(listing_id);
 -- the booking is pending and is assigned ONCE, at the confirmation transition —
 -- no code ⇒ no QR, no wallet pass, no /stay/<code> page.
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS host_id uuid REFERENCES users(id);
+-- The host's own takedown — QuickIn has no host-facing DELETE, so "remove my
+-- listing" is a reversible unpublish. Its own flag because four parties can hold
+-- a listing down (host, operator, account block, identity gate) and each may only
+-- release its own grip. See src/lib/local/host-visibility-core.ts.
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS unpublished_by_host boolean NOT NULL DEFAULT false;
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reservation_code text;
 ALTER TABLE bookings ALTER COLUMN status SET DEFAULT 'pending';
 CREATE INDEX IF NOT EXISTS idx_listings_host ON listings(host_id);

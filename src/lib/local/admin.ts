@@ -200,12 +200,23 @@ export async function adminSetListingPublished(
   isPublished: boolean
 ): Promise<{ updated: boolean; is_published: boolean }> {
   if (!isUuid(id)) throw new Error('Invalid id')
+  // Activating must not overrule the HOST's own takedown: a listing they hid is
+  // theirs to put back, not staff's. Deactivating writes no flag on purpose (see
+  // db.ts adminSetListingPublished). host-visibility-core.ts has the full rule.
   const { rows } = await pool.query(
-    `UPDATE listings SET is_published = $2 WHERE id = $1 RETURNING host_id, title`,
+    `UPDATE listings
+        SET is_published = ($2 AND NOT COALESCE(unpublished_by_host, false))
+      WHERE id = $1 RETURNING host_id, title, is_published`,
     [id, isPublished]
   )
-  const row = rows[0] as { host_id: string | null; title: string } | undefined
-  if (row?.host_id) {
+  const row = rows[0] as { host_id: string | null; title: string; is_published: boolean } | undefined
+  // What the row ACTUALLY ended up as, which is not always what was asked: the
+  // guard above refuses to publish a listing its host took down. Everything below
+  // — the return value and the three "your listing is live" messages — reports
+  // the real state, because telling a host their listing is back up when it is
+  // still hidden is worse than not telling them anything.
+  const applied = row?.is_published ?? isPublished
+  if (row?.host_id && applied === isPublished) {
     await createNotification(row.host_id, {
       type: isPublished ? 'listing_approved' : 'listing_deactivated',
       title: isPublished ? 'Your listing is approved' : 'Your listing was deactivated',
@@ -235,7 +246,7 @@ export async function adminSetListingPublished(
       )
     }
   }
-  return { updated: rows.length > 0, is_published: isPublished }
+  return { updated: rows.length > 0, is_published: applied }
 }
 
 /**

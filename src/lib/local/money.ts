@@ -1,5 +1,6 @@
 import { pool } from './pool'
 import { COMMISSION_RATE_SQL, parseRate, sqlWithCommission } from './commission-core'
+import { sqlHasRetainedValue, sqlRefundPercent, sqlRetained } from './host-retention-core'
 
 // Money views (S9) — derived (no real gateway, no payout rails).
 //
@@ -152,19 +153,41 @@ export interface HostEarnings {
     title: string
     check_in: string
     check_out: string
-    /** What the guest paid (commission-inclusive). */
+    /** What the guest paid and did NOT get back (commission-inclusive). */
     gross: number
-    /** What this host earns — under the markup model, their full raw price. */
+    /** What this host earns — their full raw price, less any refunded share. */
     net: number
+    /** Kept to two values on purpose: shipped mobile decoders switch on it.
+     *  A cancellation the host kept money on reads 'paid_out' — the stay will
+     *  never happen, so nothing is left to wait for — and is distinguished by
+     *  the `cancelled` flag below rather than by a third status string. */
     status: 'paid_out' | 'upcoming'
     paid_at: string | null
+    /** True when this booking was cancelled and the host still kept something.
+     *  Additive — older clients that don't decode it just see the row. */
+    cancelled: boolean
+    /** How much of the guest's money went back, 0–100. Non-zero only on a
+     *  cancelled row; lets a client render "cancelled — 50% refunded". */
+    refundPercent: number
   }[]
 }
 
-/** A host's earnings: the FULL raw price of each paid booking. The platform's
- *  commission is charged on top of it to the guest, never withheld from the
- *  host, so net === the host's own price. A stay whose checkout has passed
- *  counts as "paid out"; otherwise it's pending. */
+/**
+ * A host's earnings: the FULL raw price of each paid booking. The platform's
+ * commission is charged on top of it to the guest, never withheld from the host,
+ * so net === the host's own price. A stay whose checkout has passed counts as
+ * "paid out"; otherwise it's pending.
+ *
+ * CANCELLATIONS are worth what was not refunded, not zero. This query used to
+ * carry a blanket `b.status <> 'cancelled'`, which meant a cancellation under a
+ * no-refund policy — the guest got nothing back and the platform kept every
+ * pound — still erased the whole booking from the host's earnings. The host was
+ * charged for a refund that never happened. host-retention-core now scales both
+ * sides of the money by the surviving fraction, so a 0%-refund cancellation
+ * leaves the host whole, a 50% one halves both host and commission, and only a
+ * 100% refund drops the row (sqlHasRetainedValue) so it isn't listed as a 0 EGP
+ * line inflating bookingsCount.
+ */
 export async function getHostEarnings(hostId: string): Promise<HostEarnings> {
   const rate = await getCommissionRate()
   if (!isUuid(hostId)) {
@@ -174,12 +197,17 @@ export async function getHostEarnings(hostId: string): Promise<HostEarnings> {
     `SELECT b.id AS booking_id, l.title,
             to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
             to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
-            ${sqlWithCommission('b.total_price', BOOKING_RATE_SQL)}::float8 AS gross,
-            b.total_price::float8 AS net,
-            (b.check_out < now()) AS stay_over,
+            ${sqlRetained(sqlWithCommission('b.total_price', BOOKING_RATE_SQL))}::float8 AS gross,
+            ${sqlRetained('b.total_price')}::float8 AS net,
+            (b.status = 'cancelled') AS cancelled,
+            ${sqlRefundPercent()}::int AS refund_percent,
+            -- A cancelled booking settles at cancellation: the stay will never
+            -- happen, so its retained amount is never "upcoming".
+            (b.status = 'cancelled' OR b.check_out < now()) AS stay_over,
             to_char(b.paid_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS paid_at
        FROM bookings b JOIN listings l ON l.id = b.listing_id
-      WHERE l.host_id = $1 AND COALESCE(b.payment_status, 'unpaid') = 'paid' AND b.status <> 'cancelled'
+      WHERE l.host_id = $1 AND COALESCE(b.payment_status, 'unpaid') = 'paid'
+        AND ${sqlHasRetainedValue()}
       ORDER BY b.paid_at DESC NULLS LAST`,
     [hostId]
   )
@@ -193,7 +221,12 @@ export async function getHostEarnings(hostId: string): Promise<HostEarnings> {
     guestPaid += gross
     const status: 'paid_out' | 'upcoming' = r.stay_over ? 'paid_out' : 'upcoming'
     if (status === 'paid_out') paidOut += net
-    return { booking_id: r.booking_id, title: r.title, check_in: r.check_in, check_out: r.check_out, gross, net, status, paid_at: r.paid_at }
+    return {
+      booking_id: r.booking_id, title: r.title, check_in: r.check_in, check_out: r.check_out,
+      gross, net, status, paid_at: r.paid_at,
+      cancelled: r.cancelled === true,
+      refundPercent: Number(r.refund_percent) || 0,
+    }
   })
   return {
     currency: 'EGP',
@@ -247,7 +280,7 @@ export async function getHostAnalytics(hostId: string): Promise<HostAnalytics> {
        (SELECT count(*) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1)::int AS total_bookings,
        (SELECT count(*) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1 AND COALESCE(b.payment_status,'unpaid') = 'paid')::int AS paid_bookings,
        (SELECT count(*) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1 AND b.status = 'cancelled')::int AS cancelled_bookings,
-       COALESCE((SELECT sum(b.total_price) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1 AND COALESCE(b.payment_status,'unpaid') = 'paid'), 0)::float8 AS gross_revenue,
+       COALESCE((SELECT sum(${sqlRetained('b.total_price')}) FROM bookings b JOIN listings l ON l.id = b.listing_id WHERE l.host_id = $1 AND COALESCE(b.payment_status,'unpaid') = 'paid'), 0)::float8 AS gross_revenue,
        COALESCE((SELECT round(avg(r.rating)::numeric, 2) FROM reviews r JOIN listings l ON l.id = r.listing_id WHERE l.host_id = $1), 0)::float8 AS avg_rating,
        (SELECT count(*) FROM reviews r JOIN listings l ON l.id = r.listing_id WHERE l.host_id = $1)::int AS review_count`,
     [hostId]
@@ -257,7 +290,7 @@ export async function getHostAnalytics(hostId: string): Promise<HostAnalytics> {
   const monthly = await pool.query(
     `SELECT to_char(date_trunc('month', b.paid_at), 'YYYY-MM') AS month,
             count(*)::int AS bookings,
-            COALESCE(sum(b.total_price), 0)::float8 AS revenue
+            COALESCE(sum(${sqlRetained('b.total_price')}), 0)::float8 AS revenue
        FROM bookings b JOIN listings l ON l.id = b.listing_id
       WHERE l.host_id = $1 AND COALESCE(b.payment_status,'unpaid') = 'paid' AND b.paid_at IS NOT NULL
         AND b.paid_at > now() - interval '6 months'
@@ -266,10 +299,14 @@ export async function getHostAnalytics(hostId: string): Promise<HostAnalytics> {
   )
 
   const top = await pool.query(
+    // The join no longer excludes cancellations, because a cancelled booking the
+    // host kept money on still earned that listing revenue. The count keeps its
+    // old meaning via the FILTER — it counts stays, and a cancellation is not one.
     `SELECT l.title,
-            count(b.id)::int AS bookings,
-            COALESCE(sum(CASE WHEN COALESCE(b.payment_status,'unpaid') = 'paid' THEN b.total_price ELSE 0 END), 0)::float8 AS revenue
-       FROM listings l LEFT JOIN bookings b ON b.listing_id = l.id AND b.status <> 'cancelled'
+            count(b.id) FILTER (WHERE b.status <> 'cancelled')::int AS bookings,
+            COALESCE(sum(CASE WHEN COALESCE(b.payment_status,'unpaid') = 'paid'
+                              THEN ${sqlRetained('b.total_price')} ELSE 0 END), 0)::float8 AS revenue
+       FROM listings l LEFT JOIN bookings b ON b.listing_id = l.id
       WHERE l.host_id = $1
       GROUP BY l.id, l.title ORDER BY revenue DESC, bookings DESC LIMIT 5`,
     [hostId]
@@ -279,7 +316,11 @@ export async function getHostAnalytics(hostId: string): Promise<HostAnalytics> {
   const paidBookings = Number(h.paid_bookings)
   // Revenue = host net, consistent with the earnings view. Under the markup
   // model that IS the raw total_price the queries above already sum: the
-  // commission is added on top for the guest, not withheld from the host.
+  // commission is added on top for the guest, not withheld from the host —
+  // less the refunded share of any cancellation (host-retention-core). Before
+  // that, this figure had the opposite bug to getHostEarnings: it applied no
+  // cancellation filter at all, so a fully refunded stay counted as full revenue
+  // here while a no-refund cancellation counted as nothing there.
   return {
     currency: 'EGP',
     listings: Number(h.listings),

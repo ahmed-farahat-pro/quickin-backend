@@ -77,7 +77,7 @@ export async function POST(req: Request) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('POST /api/local/bookings failed:', msg)
     // Availability / validation problems are client errors.
-    const status = /available|after check-in|Invalid|required|screenshot|too large|already paid/i.test(msg) ? 400 : 500
+    const status = /available|after check-in|Invalid|required|screenshot|too large|already paid|already have a request/i.test(msg) ? 400 : 500
     return NextResponse.json({ error: msg }, { status, headers: CORS })
   }
 }

@@ -7,6 +7,7 @@
 // analytics-core.ts and is unit-tested; this file is the thin SQL layer.
 import { pool } from './pool'
 import { bookingCommissionSql, bookingRateSql, sqlWithCommission } from './commission-core'
+import { sqlRetained } from './host-retention-core'
 import {
   ACTIVE_SQL,
   MONEY_AT_SQL,
@@ -172,6 +173,9 @@ export interface RevenueReport {
  *    every web-originated cancellation and can never be trusted. A refund returns a
  *    percentage of what the GUEST paid, so it is a percentage of the marked-up
  *    figure.
+ *  - Host payouts are net of that refund (host-retention-core). `gross` and
+ *    `commission` are deliberately NOT — they record what was charged at the
+ *    time, and `refunded` is the separate line that reverses it.
  *
  * "Pending payout" is a DERIVED ESTIMATE, not a ledger: there is no payouts table.
  * It is simply the host's price on paid bookings whose stay has not ended. Label it
@@ -182,7 +186,11 @@ export async function revenueReport(f: ReportFilter): Promise<RevenueReport> {
   const bucket = bucketSql(f.granularity, MONEY_AT_SQL)
   const GUEST = GUEST_SQL
   const GROSS = `COALESCE(sum(${GUEST}) FILTER (WHERE ${PAID_SQL}), 0)::float8`
-  const HOST_PAYOUTS = `COALESCE(sum(b.total_price) FILTER (WHERE ${PAID_SQL}), 0)::float8`
+  // Host payouts (and the pending/settled split below) are the platform's mirror
+  // of what /api/local/host/earnings shows the host, so they read the SAME
+  // retention rule — otherwise a cancelled-but-unrefunded booking would be a full
+  // payout here and, before the fix, nothing at all on the host's own screen.
+  const HOST_PAYOUTS = `COALESCE(sum(${sqlRetained('b.total_price')}) FILTER (WHERE ${PAID_SQL}), 0)::float8`
   const COMMISSION = `COALESCE(sum(${bookingCommissionSql()}) FILTER (WHERE ${PAID_SQL}), 0)::float8`
   const REFUNDED = `COALESCE(sum(${GUEST} * COALESCE(b.refund_percent, 0) / 100.0) FILTER (WHERE ${REFUNDED_SQL} OR b.refund_percent > 0), 0)::float8`
 
@@ -196,10 +204,12 @@ export async function revenueReport(f: ReportFilter): Promise<RevenueReport> {
               count(*) FILTER (WHERE ${REFUNDED_SQL})::int AS "refundedCount",
               -- Derived estimate only: no payouts table exists. The host is owed
               -- their raw price in full — the markup was never theirs to lose.
-              COALESCE(sum(b.total_price)
-                FILTER (WHERE ${PAID_SQL} AND b.check_out >= CURRENT_DATE), 0)::float8 AS "pendingPayout",
-              COALESCE(sum(b.total_price)
-                FILTER (WHERE ${PAID_SQL} AND b.check_out < CURRENT_DATE), 0)::float8 AS "settledPayout"
+              -- A cancellation settles when it is cancelled, not on a check-out
+              -- date the stay will never reach — so it never sits in "pending".
+              COALESCE(sum(${sqlRetained('b.total_price')})
+                FILTER (WHERE ${PAID_SQL} AND b.status <> 'cancelled' AND b.check_out >= CURRENT_DATE), 0)::float8 AS "pendingPayout",
+              COALESCE(sum(${sqlRetained('b.total_price')})
+                FILTER (WHERE ${PAID_SQL} AND (b.status = 'cancelled' OR b.check_out < CURRENT_DATE)), 0)::float8 AS "settledPayout"
          ${FROM_SQL} WHERE ${w.sql}`,
       w.params
     ),

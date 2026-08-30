@@ -707,16 +707,42 @@ export function stayDiscountFactorSql(
 export function perNightSeasonalSql(dateExpr: string, listingAlias = 'l'): string {
   const l = listingAlias
   const month = `EXTRACT(MONTH FROM (${dateExpr}))::int::text`
-  // NULLIF('{}') so an empty array falls back to the default rather than matching
-  // nothing — mirrors `weekendDays.length > 0` in resolveNightPrice.
-  const weekendDays = `COALESCE(NULLIF(${l}.weekend_days, '{}'), ARRAY[${DEFAULT_WEEKEND_DAYS.join(', ')}])`
   return `
   CASE
-    WHEN ${l}.weekend_price IS NOT NULL
-         AND EXTRACT(DOW FROM (${dateExpr}))::int = ANY(${weekendDays})
+    WHEN ${weekendNightSql(dateExpr, l)}
       THEN ${l}.weekend_price
     WHEN (${l}.monthly_prices ->> ${month}) ~ '^[0-9.]+$'
       THEN (${l}.monthly_prices ->> ${month})::numeric
     ELSE ${l}.price_per_night
   END`
+}
+
+/**
+ * SQL for the day set a listing charges its weekend rate on: the host's stored
+ * `weekend_days`, or DEFAULT_WEEKEND_DAYS when they never chose.
+ *
+ * NULLIF('{}') so an EMPTY array falls back to the default rather than matching
+ * nothing — mirrors `weekendDays.length > 0` in resolveNightPrice. (The write
+ * doors store NULL rather than `{}` for "no weekend rate", but a row predating
+ * them can still hold an empty array and must price the same either way.)
+ */
+export function weekendDaysSql(listingAlias = 'l'): string {
+  return `COALESCE(NULLIF(${listingAlias}.weekend_days, '{}'), ARRAY[${DEFAULT_WEEKEND_DAYS.join(', ')}])`
+}
+
+/**
+ * SQL for "this night is charged at the weekend rate" — a rate exists AND the
+ * night falls on one of the listing's weekend days.
+ *
+ * Exported because the price and its LABEL are two different queries: the
+ * calendar and the stay quote each re-derive `source` in a CASE beside the price,
+ * and both used to hardcode `dow IN (5, 6)`. A host with a Thu+Fri weekend was
+ * therefore charged correctly by the ladder above and told the night was 'base'
+ * — the badge on their own calendar contradicting the number next to it. One
+ * expression, used by the price and the label, is the only way those two cannot
+ * disagree.
+ */
+export function weekendNightSql(dateExpr: string, listingAlias = 'l'): string {
+  return `${listingAlias}.weekend_price IS NOT NULL
+         AND EXTRACT(DOW FROM (${dateExpr}))::int = ANY(${weekendDaysSql(listingAlias)})`
 }

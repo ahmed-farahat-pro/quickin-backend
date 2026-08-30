@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getBookingById, setBookingStatus, setBookingNotes } from '@/lib/local/db'
+import { BookingConflictError } from '@/lib/local/availability-core'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // Single reservation.
@@ -70,6 +71,12 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     }
     return NextResponse.json(updated, { headers: CORS })
   } catch (err) {
+    // Two guests may hold pending requests for the same nights, so accepting one can
+    // legitimately fail: the host already gave those nights away, or blocked them.
+    // That is a 409 with a message worth showing — not a 500.
+    if (err instanceof BookingConflictError) {
+      return NextResponse.json({ error: err.message }, { status: 409, headers: CORS })
+    }
     return NextResponse.json({ error: 'Failed to update reservation', detail: String(err) }, { status: 500, headers: CORS })
   }
 }

@@ -89,3 +89,85 @@ export function isCancellable(status: string | null | undefined): boolean {
   const s = String(status ?? '').trim().toLowerCase()
   return s === 'pending' || s === 'confirmed'
 }
+
+// ---- What a cancelled reservation actually ENDED as --------------------------
+//
+// `bookings.status` collapses three very different endings into one word. A guest
+// who cancelled a week out and got everything back, a guest who cancelled two days
+// out and got half, and a guest who cancelled on the morning of check-in and got
+// nothing all read as "Cancelled" — on their own screen, and on the host's. The
+// refund is the whole substance of a cancellation and it was the one thing the
+// status did not say.
+//
+// The ending is DERIVED, never stored as a status: `cancelled` stays the single
+// lifecycle value every query, filter and host inbox already speaks. Only the label
+// splits.
+
+/**
+ * How a reservation ended, for display.
+ *
+ *   open                — not cancelled at all; the caller shows the plain status.
+ *   cancelled           — cancelled with no money coming back.
+ *   partially_refunded  — cancelled, some of what the guest paid comes back.
+ *   refunded            — cancelled, all of it comes back.
+ */
+export const REFUND_OUTCOMES = ['open', 'cancelled', 'partially_refunded', 'refunded'] as const
+export type RefundOutcome = (typeof REFUND_OUTCOMES)[number]
+
+export interface CancelledBooking {
+  /** bookings.status. */
+  status?: string | null
+  /** bookings.refund_percent — 0–100, stamped at cancel time. Null on rows an admin
+   *  cancelled by hand, and on every booking cancelled before the column existed. */
+  refund_percent?: number | null
+  /** bookings.payment_status. */
+  payment_status?: string | null
+  /** bookings.paid_at. */
+  paid_at?: string | null
+}
+
+/**
+ * Whether the guest's money ever reached us. There is nothing to give back if it
+ * did not, and most cancellations are exactly that case: a pending request called
+ * off before any transfer. Deliberately NOT `paymentStageFor` — that function
+ * answers `not_payable` for anything cancelled, which is true of the booking and
+ * useless here.
+ */
+function wasPaid(b: CancelledBooking): boolean {
+  return String(b.payment_status ?? '').trim().toLowerCase() === 'paid' || Boolean(b.paid_at)
+}
+
+/**
+ * The ending to LABEL a reservation with.
+ *
+ * Two things have to be true before a refund word is used: the policy owed the
+ * guest something, and the guest had actually paid. The ladder quotes a percentage
+ * for every cancellation, paid or not — so a guest calling off an unpaid request
+ * 10 days out is owed "100%" of nothing. Calling that "Refunded" would tell them
+ * money was returned that was never taken, which is worse than saying too little.
+ *
+ * A null `refund_percent` reads as no refund on purpose: it means nobody recorded
+ * one (an admin cancellation, or a legacy row), and inventing a refund for a row
+ * that has no evidence of one is the one mistake with a cash cost.
+ */
+export function refundOutcomeFor(b: CancelledBooking): RefundOutcome {
+  if (String(b.status ?? '').trim().toLowerCase() !== 'cancelled') return 'open'
+  const pct = Number(b.refund_percent)
+  if (!Number.isFinite(pct) || pct <= 0 || !wasPaid(b)) return 'cancelled'
+  return pct >= 100 ? 'refunded' : 'partially_refunded'
+}
+
+/**
+ * Money we still owe this guest: cancelled, refund earned, guest had paid, and
+ * nobody has settled it yet. This is the /ops refunds queue's whole membership
+ * test — there is no gateway, so a human transfers the money and marks the row.
+ *
+ * `refunded_at` is the settlement stamp, separate from `cancelled_at`: the two are
+ * days apart in practice, and conflating them would call every cancellation paid
+ * back the instant it happened.
+ */
+export function isRefundDue(b: CancelledBooking & { refunded_at?: string | null }): boolean {
+  if (b.refunded_at) return false
+  const outcome = refundOutcomeFor(b)
+  return outcome === 'refunded' || outcome === 'partially_refunded'
+}
