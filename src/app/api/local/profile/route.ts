@@ -3,9 +3,12 @@ import { getUserFromRequest, getFullProfile, updateProfile } from '@/lib/local/a
 import { isContactBlockedError } from '@/lib/local/contentguard'
 import { canonicalDocumentNumber } from '@/lib/local/id-change-core'
 import { checkName, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
-import { ageProblemMessage, checkAge, parseAge } from '@/lib/local/profile-core'
+import { ageProblemMessage, bioProblemMessage, checkAge, checkBio, normalizeBio, parseAge } from '@/lib/local/profile-core'
+import { normalizePhone } from '@/lib/local/phone-core'
+import { MAX_AVATAR_URL_CHARS, readProfilePatch } from '@/lib/local/profile-patch-core'
 
-// Profile of the signed-in user.
+// Profile of the signed-in user. The ONE door that writes these columns — the web
+// account page, iOS and Android all PATCH here.
 //   GET   /api/local/profile           → { id, email, full_name, role, age, id_document, phone, … }
 //   PATCH /api/local/profile {fields}  → update name / age / phone / bio / avatar / country
 // phone is only ever returned here (to the user themselves), never on a listing/booking.
@@ -78,6 +81,12 @@ export async function PATCH(req: Request) {
       }
     }
 
+    // Which fields were actually submitted, and whether each was set or CLEARED.
+    // The distinction cannot be made from the values — see profile-patch-core —
+    // and getting it wrong is why "remove my photo" used to do nothing.
+    const patch = readProfilePatch(b)
+    const fields: Parameters<typeof updateProfile>[1] = {}
+
     // A name is checked here, not only at signup. Signup has refused `12345`
     // since name-policy.ts landed, but this endpoint took whatever string arrived
     // — so a guest could sign up as `Layla` and rename themselves to `0100` a
@@ -85,17 +94,11 @@ export async function PATCH(req: Request) {
     // what a host reads next to a booking request and what an operator matches
     // against an ID document, so the rule has to hold on every door that sets it.
     //
-    // A body with no name at all is left alone: `updateProfile` writes with
-    // COALESCE, so null means "leave the column". Both apps save the avatar
-    // through this same endpoint, and a save carrying no name must not be
-    // refused for not carrying one — only a name actually submitted is judged.
-    // Both spellings are read because both are in the wild (`fullName` from
-    // older Android builds), and a non-string counts as absent, as it always did.
-    const rawName =
-      typeof b.full_name === 'string' ? b.full_name : typeof b.fullName === 'string' ? b.fullName : null
-    let fullName: string | null = null
-    if (rawName !== null) {
-      const name = normalizeName(rawName)
+    // A name is also the one field that never clears: everyone has one. A save
+    // carrying no name (both apps save the avatar through this same endpoint) is
+    // left alone rather than refused for not carrying one.
+    if (patch.full_name.kind === 'set') {
+      const name = normalizeName(patch.full_name.value)
       const nameProblem = checkName(name)
       if (nameProblem) {
         return NextResponse.json(
@@ -104,7 +107,7 @@ export async function PATCH(req: Request) {
         )
       }
       // Stored normalized, so one name is one name wherever it is read.
-      fullName = name
+      fields.fullName = name
     }
 
     // The age is a number in a plausible range, decided here and not only in the
@@ -115,25 +118,72 @@ export async function PATCH(req: Request) {
     // is an integer, and the digits are not text by the time they arrive), so the
     // range is what closes that door. iOS's `AgeRules` and Android's input filter
     // say the same thing at the field; this is what makes it true of every client.
-    const ageRaw = b.age ?? b.Age
-    const ageProblem = checkAge(ageRaw)
-    if (ageProblem) {
-      return NextResponse.json(
-        { error: ageProblemMessage(ageProblem), field: 'age', ageProblem },
-        { status: 400, headers: CORS },
-      )
+    if (patch.age.kind === 'set') {
+      const ageProblem = checkAge(patch.age.value)
+      if (ageProblem) {
+        return NextResponse.json(
+          { error: ageProblemMessage(ageProblem), field: 'age', ageProblem },
+          { status: 400, headers: CORS },
+        )
+      }
+      fields.age = parseAge(patch.age.value)
+    } else if (patch.age.kind === 'cleared') {
+      fields.age = null
     }
 
-    const updated = await updateProfile(user.id, {
-      fullName,
-      // Blank stays null — `updateProfile` writes with COALESCE, so a save that
-      // carries no age leaves the column alone, as it always has.
-      age: parseAge(ageRaw),
-      phone: b.phone ?? null,
-      bio: typeof b.bio === 'string' ? b.bio : null,
-      avatarUrl: b.avatar_url ?? b.avatarUrl ?? null,
-      country: typeof b.country === 'string' ? b.country : null,
-    })
+    // Phone, through the same module the host application and the host onboarding
+    // use, so the same mobile typed as `+20 10…`, `0020 10…` or `010…` is one
+    // number on the row rather than three ways of writing it. This check came
+    // across from the `/api/local/users/:id` route the backend merge deleted —
+    // without it, moving the web account page here would have dropped it.
+    if (patch.phone.kind === 'set') {
+      const phone = normalizePhone(patch.phone.value)
+      if (!phone) {
+        return NextResponse.json(
+          { error: 'Enter a valid phone number, like 010 1234 5678', field: 'phone' },
+          { status: 400, headers: CORS },
+        )
+      }
+      fields.phone = phone
+    } else if (patch.phone.kind === 'cleared') {
+      fields.phone = null
+    }
+
+    // Bio. Stored normalized, so what the length was judged on is what is kept.
+    // The contact guard runs on it in updateProfile — see the note there. The
+    // length check also came from the deleted route.
+    if (patch.bio.kind === 'set') {
+      const bioProblem = checkBio(patch.bio.value)
+      if (bioProblem) {
+        return NextResponse.json(
+          { error: bioProblemMessage(bioProblem), field: 'bio', bioProblem },
+          { status: 400, headers: CORS },
+        )
+      }
+      fields.bio = normalizeBio(patch.bio.value)
+    } else if (patch.bio.kind === 'cleared') {
+      fields.bio = null
+    }
+
+    // A data: URL and an https:// URL are both legal here, so the guard is a size
+    // cap rather than a shape check — see MAX_AVATAR_URL_CHARS.
+    if (patch.avatar_url.kind === 'set') {
+      const avatar = String(patch.avatar_url.value)
+      if (avatar.length > MAX_AVATAR_URL_CHARS) {
+        return NextResponse.json(
+          { error: 'That photo is too large — please choose a smaller one', field: 'avatar_url' },
+          { status: 400, headers: CORS },
+        )
+      }
+      fields.avatarUrl = avatar
+    } else if (patch.avatar_url.kind === 'cleared') {
+      fields.avatarUrl = null
+    }
+
+    if (patch.country.kind === 'set') fields.country = String(patch.country.value).trim()
+    else if (patch.country.kind === 'cleared') fields.country = null
+
+    const updated = await updateProfile(user.id, fields)
     return NextResponse.json(updated, { headers: CORS })
   } catch (err) {
     // A name or bio carrying contact details is the user's input to fix, so it

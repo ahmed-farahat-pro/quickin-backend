@@ -287,25 +287,34 @@ export async function updateProfile(
   // purpose: it is the user's own number, only ever returned to themselves.
   if (fields.fullName != null) await guardContent(id, fields.fullName, 'profile')
   if (fields.bio != null) await guardContent(id, fields.bio, 'profile')
-  await pool.query(
-    `UPDATE users SET
-        full_name   = COALESCE($2, full_name),
-        age         = COALESCE($3, age),
-        phone       = COALESCE($4, phone),
-        bio         = COALESCE($5, bio),
-        avatar_url  = COALESCE($6, avatar_url),
-        country     = COALESCE($7, country)
-      WHERE id = $1`,
-    [
-      id,
-      fields.fullName ?? null,
-      fields.age ?? null,
-      fields.phone ?? null,
-      fields.bio ?? null,
-      fields.avatarUrl ?? null,
-      fields.country ?? null,
-    ]
-  )
+
+  // Only the columns actually submitted are written, and a submitted null CLEARS.
+  //
+  // Every column here used to be written as `COALESCE($n, col)`, which reads NULL
+  // as "leave this alone" — so there was no way to say "remove it". Both mobile
+  // apps send an explicit null meaning exactly that (see readProfilePatch), and
+  // the SQL quietly ignored them: removing your photo or clearing your bio was a
+  // no-op on every client. Building the SET list from the keys present is what
+  // lets absent and cleared mean two different things.
+  const sets: string[] = []
+  const values: unknown[] = [id]
+  const set = (column: string, value: unknown) => {
+    values.push(value)
+    sets.push(`${column} = $${values.length}`)
+  }
+  // A name is the one column that never clears — everyone has one, and
+  // name-policy refuses an empty one before it reaches here.
+  if (fields.fullName != null) set('full_name', fields.fullName)
+  if (fields.age !== undefined) set('age', fields.age)
+  if (fields.phone !== undefined) set('phone', fields.phone)
+  if (fields.bio !== undefined) set('bio', fields.bio)
+  if (fields.avatarUrl !== undefined) set('avatar_url', fields.avatarUrl)
+  if (fields.country !== undefined) set('country', fields.country)
+
+  // A save that submitted nothing writable is not an error — it just reads back.
+  if (sets.length) {
+    await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $1`, values)
+  }
   return getFullProfile(id)
 }
 

@@ -24,6 +24,8 @@ npm run dev        # API at http://localhost:4000
 | PATCH | `/api/local/listings/[id]` | The host edits their listing. Carries the same **`pin_warning`** field, for the same reason — a pin can be dragged into the wrong country from the editor too |
 | GET  | `/api/local/listings/[id]/calendar` | The listing's day-by-day calendar, `?start=&end=` (**inclusive** of both ends, ≤400 days; defaults to today → +92d). `{ listing_id, currency, commission_rate, base_price, start, end, days[] }` where each day is `{ date, price, source, status }`. `source` is which rung priced the night — `custom` \| `weekend` \| `monthly` \| `base`; `status` is `available` \| `blocked` \| `booked`. **Public, but money-aware:** the listing's host gets their RAW rates plus a `guest_price` companion and the block `note`; everyone else gets only the commission-inclusive figure |
 | PUT  | `/api/local/listings/[id]/calendar` | The host prices or opens/closes a set of days: `{ dates: ["YYYY-MM-DD" \| {start,end}], price?, blocked?, note? }` → `{ updated, skipped, calendar }`. `price: <n>` pins that nightly rate, `price: null` **resets** those days to the listing's normal pricing (deletes the rows), and omitting `price` leaves prices alone; `blocked: true/false` closes or opens them. Days held by a reservation come back in **`skipped`** rather than failing the request. 401 unsigned, 403 not the host, 400 on a bad date or price |
+| GET  | `/api/local/profile` | The signed-in user's own profile → `{ id, email, full_name, role, age, id_document, phone, bio, avatar_url, country, … }`. **`phone` is only ever returned here**, to the person themselves — never on a listing or a booking |
+| PATCH | `/api/local/profile` | **The one door that writes these columns** — the web account page, iOS and Android all save through it. Any subset of `{ full_name, age, phone, bio, avatar_url, country }`; `fullName` / `avatarUrl` / `Age` are accepted as aliases. **A field you don't send is left alone; a field you send as `null` or `''` is CLEARED** — that is how "remove my photo" works, and see *Absent is not the same as cleared*. `id_document` is read-only (400 `{code:'id_change_required'}` on an attempt to change it); refusals name the input as `field` so a form can put the reason under it |
 | GET  | `/api/local/profile/id-change` | The signed-in user's ID number and the state of any request to change it → `{ current, request, can_request, available }`. The request half **degrades**: if `id_change_requests` has not been migrated onto this database the read still answers with the number on file, `request: null` and `available: false`, rather than taking the Edit Profile row down with it |
 | POST | `/api/local/profile/id-change` | File a change request: `{ requested_value, doc_type, front, back?, reason? }`. **`front` is required** — without a document the reviewer has nothing to check the number against. Resubmitting replaces a request still awaiting review. **503 `{ code: 'id_change_unavailable' }`** when the table has not been migrated onto this database — not a 500, because nothing about the request is wrong and "try again later" is true |
 | DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
@@ -1282,6 +1284,48 @@ Neon rows, so `contentguard.ts` is duplicated byte-for-byte and guarded by
 drifted, the weaker one would become the way around the policy for everyone. Edit one,
 copy it over the other verbatim, and add cases to `test/unit/contentguard.test.mjs` —
 the false-positive half of that file matters as much as the block half.
+
+## Absent is not the same as cleared
+
+`updateProfile` wrote every column it touched as `COALESCE($n, col)`, which reads SQL
+NULL as *leave this alone*. Both mobile apps, meanwhile, send an explicit `null` to
+mean *I removed this* — iOS says so in as many words ("explicit null when removed"),
+and Android sends `JSONObject.NULL`. The two halves disagreed and the SQL won:
+**removing your profile photo or clearing your bio silently did nothing, on every
+client.** The save returned 200 and the old value came straight back.
+
+No value can carry that distinction, because the value for "cleared" is the same shape
+as the value for "not mentioned". Only the **presence of the key** can, so
+`src/lib/local/profile-patch-core.ts` classifies each field before any SQL runs —
+`absent` | `cleared` | `set` — and `updateProfile` builds its `SET` list from the
+fields that were actually submitted. Blank covers **both** `null` and `''`, because
+the clients disagree about which they send for an emptied field (iOS nulls it, Android
+trims it to `''`, the web form posts `''`); one absent bio should look like every other
+absent bio in the column.
+
+A **name** is the one field that never clears — everyone has one, and `name-policy`
+refuses an empty one anyway. A save that carries no name at all is left alone rather
+than refused, because both apps save the avatar through this same endpoint.
+
+The core has **no imports**, which is what makes it loadable by
+`test/unit/profile-patch-core.test.mjs` — see *Testing*.
+
+## The web account page saves here too
+
+`quickin-frontend`'s /account used to PATCH `/api/local/users/:id`, a near-identical
+second writer that the backend merge deleted along with the rest of the web API. The
+path stayed in the client, so **every profile save from the website answered 405** and
+the form reported a generic failure. Both callers (the profile form and the avatar
+picker) now use `PATCH /api/local/profile`, which takes the user from the session —
+there is no id in the path to get wrong, and no way to aim an edit at someone else.
+
+That deleted route validated the **phone** and the **bio** where this one did not, so
+those checks moved across rather than being lost with it: `normalizePhone` (so one
+number is one number however it was typed) and `checkBio`. The avatar gained a size
+cap — a `data:` URL and an `https://` URL are both legal, so there is no shape check
+that accepts both, and an unbounded string in a column read on every request is the
+actual hazard.
+
 
 ## An age is a number, not a channel
 
