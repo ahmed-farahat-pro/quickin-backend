@@ -1739,13 +1739,24 @@ function assertResortName(resortId: unknown, resortName: unknown): void {
  * (check-listing-capacity-policy-parity.mjs keeps it that way), so the phone and
  * the website cannot disagree about how small a place may claim to be.
  *
+ * The count is also judged from ABOVE, which is what a Studio with 27,373
+ * bedrooms slipped through for want of. Bedrooms are capped per property type,
+ * so `propertyType` is the type the listing will HAVE once this write lands —
+ * the patched value when the host is changing it, the stored one otherwise.
+ * The other three fields ignore it and take their blanket ceiling.
+ *
  * `undefined` means the client never sent the field, which is not the same as
  * sending a zero: create falls back to its documented default, and the patch
  * door never reaches here for a key it wasn't given.
  */
-function assertCapacity(v: unknown, field: ListingCapacityField, fallback: number): number {
+function assertCapacity(
+  v: unknown,
+  field: ListingCapacityField,
+  fallback: number,
+  propertyType?: unknown
+): number {
   if (v === undefined) return fallback
-  const problem = checkListingCapacity(field, v)
+  const problem = checkListingCapacity(field, v, propertyType)
   if (problem) throw new ListingInputError(listingCapacityProblemMessage(problem))
   return parseCapacity(v) as number
 }
@@ -1877,6 +1888,36 @@ export async function updateListingDetails(
   // needs a rate, so when only the days arrive the stored rate is read first —
   // otherwise "I moved my weekend to Thu+Fri" would be judged as though the
   // listing had no weekend rate at all and would quietly store nothing.
+  // The bedroom count and the property type are a PAIR — the cap on one comes
+  // from the other — and a patch may carry either half, or both. Whichever half
+  // is missing is read from the row, the same way the pin and the weekend rate
+  // are read above, and the pair that RESULTS from this save is what gets
+  // judged. All three shapes have to be caught, because each is a real edit:
+  //
+  //   { bedrooms: 40 }                      → judged against the stored type
+  //   { property_type: 'Cabin' }            → the stored 8 bedrooms are now a
+  //                                           Cabin's, and 8 is not a Cabin
+  //   { property_type: 'Cabin', bedrooms }  → judged against the new type
+  //
+  // The middle one is the one a client cannot be trusted to catch: it changes no
+  // number at all, so a patch built from "only the fields the host edited" sends
+  // the type by itself and nothing on this door would have looked at bedrooms.
+  const touchesBedroomPair = patch.bedrooms !== undefined || patch.property_type !== undefined
+  let patchPropertyType: unknown = patch.property_type
+  let bedroomsToJudge: unknown = patch.bedrooms
+  if (touchesBedroomPair && (patch.bedrooms === undefined || patch.property_type === undefined)) {
+    const { rows: pair } = await pool.query(
+      `SELECT property_type, bedrooms FROM listings WHERE id = $1 AND host_id = $2`,
+      [listingId, hostUserId]
+    )
+    // Same as the reads around it: a miss is a listing that isn't theirs, and it
+    // gets the null the UPDATE would have returned.
+    if (!pair.length) return null
+    if (patch.property_type === undefined) patchPropertyType = pair[0].property_type ?? null
+    // A NULL stored count is a question nobody answered — there is nothing to
+    // refuse, and the type edit passes through untouched.
+    if (patch.bedrooms === undefined) bedroomsToJudge = pair[0].bedrooms ?? undefined
+  }
   const touchesWeekend = patch.weekend_price !== undefined || patch.weekend_days !== undefined
   let storedWeekendPrice: number | null = null
   if (touchesWeekend && patch.weekend_price === undefined) {
@@ -1942,11 +1983,22 @@ export async function updateListingDetails(
   if (patch.lat !== undefined) put('lat', assertCoord(patch.lat, 'Latitude', 90))
   if (patch.lng !== undefined) put('lng', assertCoord(patch.lng, 'Longitude', 180))
   if (patch.property_type !== undefined) put('property_type', assertPropertyType(patch.property_type))
-  // The four counts, all floored at 1 by listing-capacity-policy.ts. Bedrooms,
-  // beds and bathrooms used to be floored at 0 here, so a listing created with a
-  // real capacity could be edited down to a place with nowhere to sleep.
+  // The four counts, floored at 1 and capped from above by
+  // listing-capacity-policy.ts. Bedrooms, beds and bathrooms used to be floored
+  // at 0 here, so a listing created with a real capacity could be edited down to
+  // a place with nowhere to sleep — and nothing capped them at all, so the same
+  // door could edit a Cabin UP to 40 bedrooms. Bedrooms carry the property type
+  // resolved above; the other three take their blanket ceiling.
   if (patch.max_guests !== undefined) put('max_guests', assertCapacity(patch.max_guests, 'guests', 1))
-  if (patch.bedrooms !== undefined) put('bedrooms', assertCapacity(patch.bedrooms, 'bedrooms', 1))
+  // Judged even when the patch carries no bedroom count of its own — see
+  // touchesBedroomPair above. `assertCapacity` returns the number rather than
+  // writing it; only a bedroom count the host actually SENT is written back,
+  // because re-writing the stored one would mark the column as edited (and this
+  // table's edits send a listing back for review).
+  if (touchesBedroomPair) {
+    const bedrooms = assertCapacity(bedroomsToJudge, 'bedrooms', 1, patchPropertyType)
+    if (patch.bedrooms !== undefined) put('bedrooms', bedrooms)
+  }
   if (patch.beds !== undefined) put('beds', assertCapacity(patch.beds, 'beds', 1))
   if (patch.bathrooms !== undefined) put('bathrooms', assertCapacity(patch.bathrooms, 'bathrooms', 1))
   if (patch.amenities !== undefined) put('amenities', assertAmenities(patch.amenities))
@@ -2655,10 +2707,14 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
   })
   if (incomplete) throw new ListingInputError(listingCompletenessProblemMessage(incomplete))
   // How many rooms, beds, baths and guests — floored at 1 each, because a stay
-  // with nowhere to sleep is not a stay. Judged before anything is written so a
-  // 0 is refused rather than clamped into a number the host never chose; see
-  // listing-capacity-policy.ts, which is the same file the web repo runs.
-  const bedrooms = assertCapacity(input.bedrooms, 'bedrooms', 1)
+  // with nowhere to sleep is not a stay, and capped from above, because a Cabin
+  // with 40 bedrooms is not a cabin. Judged before anything is written so a 0 or
+  // a 27,373 is refused rather than clamped into a number the host never chose;
+  // see listing-capacity-policy.ts, which is the same file the web repo runs.
+  // The bedroom cap depends on the property type, so it is judged against the
+  // value that will actually be STORED below — including that `?? 'Apartment'`.
+  const propertyType = input.propertyType ?? 'Apartment'
+  const bedrooms = assertCapacity(input.bedrooms, 'bedrooms', 1, propertyType)
   const beds = assertCapacity(input.beds, 'beds', 1)
   const bathrooms = assertCapacity(input.bathrooms, 'bathrooms', 1)
   const maxGuests = assertCapacity(input.maxGuests, 'guests', 2)
@@ -2725,7 +2781,7 @@ export async function createListing(hostUserId: string, input: CreateListingInpu
       hostUserId, title, input.description ?? null, input.location ?? null, input.country ?? null,
       price, bedrooms, beds,
       bathrooms, maxGuests,
-      input.propertyType ?? 'Apartment', resort.region, lat, lng, genReservationCode(),
+      propertyType, resort.region, lat, lng, genReservationCode(),
       input.amenities ?? [], normalizePolicy(input.cancellationPolicy), ownershipDoc,
       clampDiscount(input.weeklyDiscount), clampDiscount(input.monthlyDiscount),
       weekendRate, JSON.stringify(monthsCheck.value),

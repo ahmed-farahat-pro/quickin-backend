@@ -665,7 +665,7 @@ no pin while `0,0` is a real coordinate, that a non-array `images` value is zero
 photos rather than an exemption — and, for the edit door, that clearing any required
 field is refused while a field the patch never mentions is left alone.
 
-## A place has to have somewhere to sleep
+## A place has to have somewhere to sleep — and not twenty of them
 
 Bedrooms, beds and bathrooms were floored at **zero** on both doors: `createListing`
 wrote `Math.max(0, Math.floor(value ?? 1))` straight into the row, the patch door
@@ -681,21 +681,48 @@ max_guests`) — the other three simply never got one.
 
 | Door | What it does |
 | --- | --- |
-| `createListing` | Judges `bedrooms`, `beds`, `bathrooms` and `max_guests`. An **omitted** field still falls back to its documented default (1/1/1/2) — a client that never asks the question is not the same as a host answering zero — but a value that IS sent must clear the floor. Throws `ListingInputError`, so the create route answers **400** |
-| `updateListingDetails` | Same floor on each of the four capacity branches, so a listing created with a real capacity cannot be edited down to nothing |
+| `createListing` | Judges `bedrooms`, `beds`, `bathrooms` and `max_guests`. An **omitted** field still falls back to its documented default (1/1/1/2) — a client that never asks the question is not the same as a host answering zero — but a value that IS sent must clear the floor and the ceiling. Bedrooms are judged against the property type the row will actually store, `?? 'Apartment'` included. Throws `ListingInputError`, so the create route answers **400** |
+| `updateListingDetails` | Same rule on each of the four capacity branches, so a listing created with a real capacity cannot be edited down to nothing — or up to forty bedrooms. `bedrooms` and `property_type` are judged as a **pair**, because the cap on one comes from the other and a patch may carry either half: whichever half is absent is read from the row (the way the pin and the weekend rate are read) and the pair that RESULTS from the save is what gets judged. That includes `{ property_type: 'Cabin' }` **on its own** — it changes no number, but it makes the stored 8 bedrooms a Cabin's, and 8 is not a Cabin. A patch that touches neither reads nothing extra |
 
-The rule is deliberately dull: each count is a **whole number of at least
-`MIN_CAPACITY` (1)**. There is no upper bound — an unusually large villa is not an
-error, and a cap invented here would start refusing edits to rows that already exist.
+Each count is a **whole number of at least `MIN_CAPACITY` (1)**.
+
+### …and not more than a place of that kind can hold
+
+There was no upper bound at all, on any door. The mobile steppers stopped at 20
+bedrooms because that is as far as the control scrolled, not because anything refused
+a bigger number, and the API refused nothing — so Neon carries a **Studio with 27,373
+bedrooms** and a **Chalet with 12**. Numbers like that mean nothing to a guest, sort to
+the top of a bedrooms filter, and read as a broken product rather than as a typo.
+
+Two ceilings, because "too many" only means something once you know what the place is:
+
+| What | Ceiling |
+| --- | --- |
+| `bedrooms` | **Per property type** — `MAX_BEDROOMS_BY_PROPERTY_TYPE`: Apartment 5, House 6, Villa 8, Cabin 3, Studio 1, Loft 3, Chalet 6, Cottage 4, Guest suite 2. A type the table does not name (`Guest House`, or anything a later release adds) gets `DEFAULT_MAX_BEDROOMS` (8) |
+| `beds`, `bathrooms`, `guests` | One blanket ceiling each — `MAX_CAPACITY`: 30, 20, 32. No per-type table, but the same keypad types into them, so leaving them open would move 27,373 one field to the right |
+
+`DEFAULT_MAX_BEDROOMS` is the **most permissive** number in the table on purpose: a
+type product has not ruled on must never be judged harder than one they have. For the
+same reason the error sentence names the type only when the table actually carries it
+— "a Guest House can have at most 8 bedrooms" would state a rule that does not exist.
+
+The ceilings apply to the **edit** door too, so a stored row that exceeds them is shown
+as it is and blocks Save until the host corrects it — the same treatment a stored `0`
+already got. Four rows on Neon are in that state today (a Studio at 27,373, a Chalet at
+12, two Apartments at 0); all four are unpublished, and no published listing is affected.
+
 `parseCapacity` is strict where `Math.floor(Number(v))` was lenient: `2.5`, `1e3`,
 `0x2`, `true` and `['2']` are refused rather than silently rounded into a number
 nobody typed, and Arabic-Indic digits (`٣`) are folded to ASCII first, because these
 values arrive as JSON from the mobile apps where no browser number input is involved.
-`required` is reported before `notWhole`, so an empty field hears "you skipped this"
-rather than being told that nothing is not a whole number.
+`required` is reported before `notWhole` and `tooFew` before `tooMany`, so an empty
+field hears "you skipped this" rather than being told that nothing is not a whole
+number, and a value is only measured against the ceiling once it is known to be one.
 
-**A studio is entered as 1 bedroom, not 0.** The property type already says "Studio",
-and a capacity line reading zeroes tells a guest nothing. If studios should instead be
+**A studio has exactly 1 bedroom.** Product's table says a studio "must be 0", meaning
+it has no separate bedroom; `MIN_CAPACITY` is 1. The two statements are the same
+statement — the single room IS the bedroom — so a studio's floor and ceiling are both
+1: it may not claim a second, and it may not claim none. If studios should instead be
 modelled with 0 bedrooms, `MIN_CAPACITY` is the one constant to change (and
 `test/unit/listing-capacity-policy.test.mjs` the one suite to update).
 
@@ -706,8 +733,18 @@ only one of them means "0 beds" is refused on the website and created from the p
 `test/unit/listing-capacity-policy.test.mjs` is the same suite in both: that `0` and
 the string `'0'` are refused for every field, that a blank field is `required` rather
 than `notWhole`, that fractions and exotic JSON shapes are refused instead of floored,
-that Arabic-Indic digits are read as the numbers they are, and that each refusal
-carries the code and field a client needs to localize it.
+that Arabic-Indic digits are read as the numbers they are, that each refusal carries
+the code, field and bound a client needs to localize it, and — transcribing product's
+table so a change to the module has to be a deliberate change to the test too — that
+every type accepts its maximum and refuses one more, that the type is matched however
+a client cased or spaced it, and that ordinary listings (a 3-bedroom chalet, a
+2-bedroom apartment) still save, which is the half a badly chosen cap would break.
+
+The two mobile apps carry the same rule again, by hand, in
+`mobile/ios/Sources/ListingCapacityPolicy.swift` and Android's
+`ListingCapacityPolicy.kt` — each with its own mirror of this suite
+(`mobile/ios/Tests/run.sh`, `./gradlew testDebugUnitTest`). A change to
+`MIN_CAPACITY` or to the bedroom table belongs in all four files.
 
 ## A night costs what the host said that night costs
 

@@ -10,10 +10,26 @@
 // and compares on, and `max_guests` at 0 makes a listing that cannot be booked
 // at all (bookings check `guests <= max_guests`).
 //
-// The rule is deliberately dull: each of the four counts is a whole number of at
-// least one. There is no upper bound here — an unusually large villa is not an
-// error, and a cap invented in this module would start refusing edits to rows
-// that already exist.
+// The floor is deliberately dull: each of the four counts is a whole number of
+// at least one.
+//
+// The CEILING is the other half, and it was missing. Nothing refused a number
+// from above, so a host could publish a Studio with **27,373 bedrooms** (a real
+// row on Neon) or a Cabin with 40 — numbers that mean nothing, sort to the top
+// of a bedrooms filter, and read as a broken product rather than a typo. Two
+// kinds of ceiling now sit here:
+//
+//   - Bedrooms are capped PER PROPERTY TYPE (see MAX_BEDROOMS_BY_PROPERTY_TYPE),
+//     because "too many" only means something once you know what the place is:
+//     8 bedrooms is an ordinary villa and an impossible guest suite.
+//   - Beds, bathrooms and guests get one blanket sanity ceiling each. They have
+//     no per-type table, but the same keypad types into them, so leaving them
+//     unbounded would just move 27,373 one field to the right.
+//
+// The ceilings are the numbers product asked for, not physics, and they are
+// enforced on the edit door as well as on create — a stored row that exceeds
+// them (there are a handful, all unpublished) is shown as it is and blocks Save
+// until the host corrects it. That is the same treatment a stored 0 already got.
 //
 // Pure logic, no imports, so the same code runs in `db.ts`, in the three host
 // forms and under `node --test` — see README → Testing. Callers import the core,
@@ -40,19 +56,78 @@ export type ListingCapacityField = (typeof CAPACITY_FIELDS)[number]
 export const MIN_CAPACITY = 1
 
 /**
+ * The most bedrooms each property type may claim.
+ *
+ * Product's table, keyed by the stored English property_type lowercased (the
+ * value is stored in English on purpose — clients translate the label only — so
+ * a case-insensitive key is the whole normalisation this needs).
+ *
+ * **Studio is 1, not 0.** Product wrote "must be 0", meaning a studio is a
+ * single room with no separate bedroom. MIN_CAPACITY is 1, and the two
+ * statements are the same statement: the one room IS the bedroom. Writing 0
+ * here would make every studio unpublishable, so the intent is expressed as an
+ * exact 1 — a studio has one bedroom and may not claim two.
+ */
+export const MAX_BEDROOMS_BY_PROPERTY_TYPE: Readonly<Record<string, number>> = {
+  apartment: 5,
+  house: 6,
+  villa: 8,
+  cabin: 3,
+  studio: 1,
+  loft: 3,
+  chalet: 6,
+  cottage: 4,
+  'guest suite': 2,
+}
+
+/**
+ * The bedroom ceiling for a type the table above does not name.
+ *
+ * Set to the most permissive number product gave (Villa's 8) on purpose: an
+ * unlisted type — 'Guest House', which the API accepts and the Android picker
+ * offers, or anything a future release adds — should never be judged HARDER
+ * than a type product has actually ruled on. Add the type to the table to
+ * tighten it.
+ */
+export const DEFAULT_MAX_BEDROOMS = 8
+
+/**
+ * The blanket ceiling on the three counts with no per-type table.
+ *
+ * These are the ceilings the mobile steppers have offered all along, promoted
+ * from "as far as the control scrolls" to an actual rule so the API refuses
+ * what the stepper could never have produced. Bedrooms is absent — it is
+ * per-type, and `maxListingCapacity` is what resolves it.
+ */
+export const MAX_CAPACITY: Readonly<Record<Exclude<ListingCapacityField, 'bedrooms'>, number>> = {
+  beds: 30,
+  bathrooms: 20,
+  guests: 32,
+}
+
+/**
  * Why a count was refused.
  *
  * Structured like `ListingTitleProblem` and for the same reason: the API echoes
  * the code and the field so a client can localize the reason without
- * re-deciding it.
+ * re-deciding it. `max` travels with every problem alongside `min` so a message
+ * can name the bound it missed without importing the tables.
  */
-export type ListingCapacityProblemCode = 'required' | 'notWhole' | 'tooFew'
+export type ListingCapacityProblemCode = 'required' | 'notWhole' | 'tooFew' | 'tooMany'
 
 export interface ListingCapacityProblem {
   code: ListingCapacityProblemCode
   field: ListingCapacityField
   /** The floor that was missed — so a message can name it without importing it. */
   min: number
+  /** The ceiling that was exceeded, resolved for this field and property type. */
+  max: number
+  /**
+   * The property type the ceiling came from, canonical-cased for a sentence, or
+   * null when the field has no per-type rule (beds, bathrooms, guests) or the
+   * caller never said what the place was.
+   */
+  propertyType: string | null
 }
 
 // Invisible characters people paste in without meaning to — the same set
@@ -98,25 +173,83 @@ export function parseCapacity(v: unknown): number | null {
 }
 
 /**
+ * The property type as MAX_BEDROOMS_BY_PROPERTY_TYPE keys it, or null when the
+ * caller said nothing usable.
+ *
+ * Lowercased, invisible characters stripped, and inner runs of whitespace
+ * collapsed — 'Guest  suite' and 'guest suite' are the same type, and only one
+ * of them would otherwise find the table.
+ */
+export function normalizePropertyTypeKey(v: unknown): string | null {
+  if (v === null || v === undefined) return null
+  const key = String(v).replace(INVISIBLE, '').trim().replace(/\s+/g, ' ').toLowerCase()
+  return key === '' ? null : key
+}
+
+/**
+ * The ceiling for one field, given what the place is.
+ *
+ * Bedrooms read the per-type table and fall back to DEFAULT_MAX_BEDROOMS for a
+ * type nobody has ruled on; the other three ignore `propertyType` entirely.
+ */
+export function maxListingCapacity(field: ListingCapacityField, propertyType?: unknown): number {
+  if (field !== 'bedrooms') return MAX_CAPACITY[field]
+  const key = normalizePropertyTypeKey(propertyType)
+  if (key === null) return DEFAULT_MAX_BEDROOMS
+  const max = MAX_BEDROOMS_BY_PROPERTY_TYPE[key]
+  return max === undefined ? DEFAULT_MAX_BEDROOMS : max
+}
+
+/**
+ * How the property type is spelled in an error sentence, or null when it has no
+ * bearing on this field's ceiling.
+ *
+ * Only a type the table actually names is echoed: telling a host "a Guest House
+ * can have at most 8 bedrooms" would state a rule that does not exist for their
+ * type, so an unlisted one falls back to the impersonal sentence.
+ */
+function propertyTypeForMessage(field: ListingCapacityField, propertyType?: unknown): string | null {
+  if (field !== 'bedrooms') return null
+  const key = normalizePropertyTypeKey(propertyType)
+  if (key === null || MAX_BEDROOMS_BY_PROPERTY_TYPE[key] === undefined) return null
+  return key.replace(/\b[a-z]/, (c) => c.toUpperCase())
+}
+
+/**
  * Decide one count. Returns the problem, or null when it is acceptable.
  *
  * Order matters, same as everywhere else in this codebase: an empty field hears
- * `required` rather than being told that nothing is not a whole number.
+ * `required` rather than being told that nothing is not a whole number, and a
+ * value is only measured against the ceiling once it is known to be a number.
+ *
+ * `propertyType` is what the listing says it is — the value being saved, not
+ * the one already stored, because a host who retypes a 6-bedroom Villa as a
+ * Cabin is changing both halves of the rule at once. Omit it and bedrooms are
+ * judged against DEFAULT_MAX_BEDROOMS.
  */
 export function checkListingCapacity(
   field: ListingCapacityField,
-  v: unknown
+  v: unknown,
+  propertyType?: unknown
 ): ListingCapacityProblem | null {
-  if (isBlankCapacity(v)) return { code: 'required', field, min: MIN_CAPACITY }
+  const max = maxListingCapacity(field, propertyType)
+  const named = propertyTypeForMessage(field, propertyType)
+  const base = { field, min: MIN_CAPACITY, max, propertyType: named }
+  if (isBlankCapacity(v)) return { code: 'required', ...base }
   const n = parseCapacity(v)
-  if (n === null) return { code: 'notWhole', field, min: MIN_CAPACITY }
-  if (n < MIN_CAPACITY) return { code: 'tooFew', field, min: MIN_CAPACITY }
+  if (n === null) return { code: 'notWhole', ...base }
+  if (n < MIN_CAPACITY) return { code: 'tooFew', ...base }
+  if (n > max) return { code: 'tooMany', ...base }
   return null
 }
 
 /** True when `checkListingCapacity` has nothing to say — the gate on a submit button. */
-export function isValidListingCapacity(field: ListingCapacityField, v: unknown): boolean {
-  return checkListingCapacity(field, v) === null
+export function isValidListingCapacity(
+  field: ListingCapacityField,
+  v: unknown,
+  propertyType?: unknown
+): boolean {
+  return checkListingCapacity(field, v, propertyType) === null
 }
 
 /** How each field is named in a sentence, singular and plural. */
@@ -135,6 +268,7 @@ const FIELD_WORDS: Record<ListingCapacityField, { one: string; many: string }> =
 export function listingCapacityProblemMessage(problem: ListingCapacityProblem): string {
   const words = FIELD_WORDS[problem.field]
   const noun = problem.min === 1 ? words.one : words.many
+  const capNoun = problem.max === 1 ? words.one : words.many
   switch (problem.code) {
     case 'required':
       return problem.field === 'guests'
@@ -148,14 +282,26 @@ export function listingCapacityProblemMessage(problem: ListingCapacityProblem): 
       return problem.field === 'guests'
         ? `A listing has to sleep at least ${problem.min} ${noun}`
         : `A listing needs at least ${problem.min} ${noun}`
+    case 'tooMany':
+      if (problem.field === 'guests') return `A listing can sleep at most ${problem.max} ${capNoun}`
+      // A studio's ceiling equals its floor, so "at most 1 bedroom" is true but
+      // reads like a cap the host could work under. Say the actual shape of the
+      // place instead.
+      if (problem.propertyType && problem.max === MIN_CAPACITY) {
+        return `A ${problem.propertyType} is a single room — it has exactly ${problem.max} ${capNoun}`
+      }
+      return problem.propertyType
+        ? `A ${problem.propertyType} can have at most ${problem.max} ${capNoun}`
+        : `A listing can have at most ${problem.max} ${capNoun}`
   }
 }
 
 /** One-shot: the message to show, or null when the count is acceptable. */
 export function validateListingCapacity(
   field: ListingCapacityField,
-  v: unknown
+  v: unknown,
+  propertyType?: unknown
 ): string | null {
-  const problem = checkListingCapacity(field, v)
+  const problem = checkListingCapacity(field, v, propertyType)
   return problem ? listingCapacityProblemMessage(problem) : null
 }
