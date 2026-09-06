@@ -973,6 +973,70 @@ refetches it — so a trimmed list would leave a tapped card showing one photo
 instead of ten. At ~100 bytes a URL the full set costs ~1 KB per listing; trimming
 was only ever a workaround for the base64 bloat this section removes.
 
+## A listing's photos arrive in more than one request
+
+`POST /api/local/listings` used to be handed the whole listing at once, photos
+included, and a host who attached the ten the wizard offers got:
+
+```
+Couldn't create the listing (413).
+```
+
+Nothing in this codebase produced that. The backend runs as a Vercel function and
+the platform refuses a request body over **~4.5 MB before the function is invoked**,
+so there was no route, no validation and no `{"error"}` — just a bare 413 the app
+could only render as a number. Measured against the deployed backend:
+
+| body | answer |
+| --- | --- |
+| 4.19 MB | `401 {"error":"Please sign in"}` — reached the function |
+| 4.61 MB | `413` — never did |
+
+A phone photo re-encoded to 1600 px at quality 0.8 is 300–700 KB once base64 has
+added its third, so ten of them is 3–7 MB: sometimes under the wall, sometimes over
+it, which is why this looked intermittent.
+
+**The clients now split the upload**, and the endpoints for it already existed:
+
+1. `POST /api/local/listings` — the fields, the cover photo, and as many more
+   photos as fit under the budget. At least one photo always travels with it,
+   because `checkListingCompleteness` refuses a listing with none.
+2. `POST /api/local/listings/:id/images` — the rest, one budgeted batch per
+   request, appended in order.
+3. `PATCH /api/local/listings/:id { ownership_doc }` — only when the document was
+   too big to share a body with the photos (its own cap is 3.5M chars).
+
+iOS decides the split in `ListingPhotoUpload.swift` (`mobile/ios`, unit-tested by
+`Tests/ListingPhotoUploadTests`) with a 3.5 MB ceiling per request — well under the
+wall, because the margin costs one extra round trip and being wrong costs a host
+their listing. Photo quality is deliberately untouched: re-encoding smaller was the
+other way to make ten photos fit, and it would degrade every listing on the site to
+serve a limit that has nothing to do with photos.
+
+**Nothing changed server-side about what is accepted** — `MAX_LISTING_PHOTOS` is
+still 10 per listing and `MAX_IMAGE_CHARS` still 3.5M per photo, counted across the
+create and the appends alike.
+
+### …so a create must not announce itself three times
+
+Appending photos is a host edit, and every host edit re-queues the listing and says
+so: the host gets "Listing back under review — hidden from guests until approved"
+and every admin gets "…was edited by its host and is waiting for approval". True of
+a listing that was live; nonsense about a listing created seconds ago that has never
+left the queue — and it now arrived once per batch.
+
+`listing-requeue-core.ts` (`shouldAnnounceRequeue`, unit-tested by
+`test/unit/listing-requeue-core.test.mjs`) gates the announcement on the row as it
+stood **before** the edit: a listing already `pending` and unpublished has nothing
+to announce. `addListingImages`, `deleteListingImage` and `reorderListingImages`
+read that state under the same row lock ownership takes, before the re-queue
+overwrites the answer.
+
+The re-queue UPDATE itself is untouched — it is idempotent, and skipping it would
+leave a stale `review_note` on the row. Only the notifications are gated, and only
+for a listing that was already in the queue: editing a live listing still tells the
+host why it disappeared and still pings /ops.
+
 ## Environment
 
 | Var | Required | Purpose |

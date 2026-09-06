@@ -30,6 +30,7 @@ import {
   reactivateBlock,
 } from './host-visibility-core'
 import type { ReactivateBlock, VisibilityRow } from './host-visibility-core'
+import { shouldAnnounceRequeue } from './listing-requeue-core'
 import { storeListingPhotos } from './blob-store'
 import type { PoolClient } from 'pg'
 import { randomInt } from 'node:crypto'
@@ -2110,6 +2111,21 @@ async function ownsListing(client: PoolClient, listingId: string, hostUserId: st
   return (rowCount ?? 0) > 0
 }
 
+/** The listing's review state as it stands NOW — read before an edit re-queues it,
+ *  because that is the only moment it can be told from the state the edit produces.
+ *  Decides whether the edit is announced; see listing-requeue-core.ts. */
+async function reviewStateBefore(
+  client: PoolClient,
+  listingId: string,
+  hostUserId: string
+): Promise<{ approval_status: string | null; is_published: boolean | null } | null> {
+  const { rows } = await client.query(
+    `SELECT approval_status, is_published FROM listings WHERE id = $1 AND host_id = $2`,
+    [listingId, hostUserId]
+  )
+  return (rows[0] as { approval_status: string | null; is_published: boolean | null }) ?? null
+}
+
 /** Re-queue for admin review inside an open transaction. Ownership re-checked. */
 async function requeueListing(client: PoolClient, listingId: string, hostUserId: string): Promise<void> {
   await client.query(`UPDATE listings SET ${REQUEUE_SET} WHERE id = $1 AND host_id = $2`, [listingId, hostUserId])
@@ -2140,12 +2156,19 @@ export async function addListingImages(
   const photos = await storeListingPhotos(listingId, validated)
 
   const client = await pool.connect()
+  // Whether the host and the admins hear about this. Decided from the row as it
+  // stands before the re-queue overwrites the answer — a listing already sitting
+  // in the queue has nothing to announce, and the phones append a new listing's
+  // photos a batch at a time, so without this a 10-photo create sent three
+  // "back under review" pushes about a listing that had never been live.
+  let announce = false
   try {
     await client.query('BEGIN')
     if (!(await ownsListing(client, listingId, hostUserId))) {
       await client.query('ROLLBACK')
       return null
     }
+    announce = shouldAnnounceRequeue(photosRequeue(), await reviewStateBefore(client, listingId, hostUserId))
     const { rows } = await client.query(
       `SELECT count(*)::int AS count, COALESCE(max("order"), -1)::int AS max_order
          FROM listing_images WHERE listing_id = $1`,
@@ -2171,7 +2194,7 @@ export async function addListingImages(
   }
 
   const updated = await getListingById(listingId, { asHost: true })
-  if (updated && photosRequeue()) await notifyListingRequeued(updated)
+  if (updated && announce) await notifyListingRequeued(updated)
   return updated
 }
 
@@ -2185,8 +2208,11 @@ export async function deleteListingImage(
   if (!isUuid(listingId) || !isUuid(hostUserId) || !isUuid(imageId)) return null
 
   const client = await pool.connect()
+  // See addListingImages: read before the edit, or it always reads 'pending'.
+  let announce = false
   try {
     await client.query('BEGIN')
+    announce = shouldAnnounceRequeue(photosRequeue(), await reviewStateBefore(client, listingId, hostUserId))
     // Ownership via a join back to listings.host_id — the image id alone proves nothing.
     const { rowCount } = await client.query(
       `DELETE FROM listing_images li
@@ -2230,7 +2256,7 @@ export async function deleteListingImage(
   }
 
   const updated = await getListingById(listingId, { asHost: true })
-  if (updated && photosRequeue()) await notifyListingRequeued(updated)
+  if (updated && announce) await notifyListingRequeued(updated)
   return updated
 }
 
@@ -2248,12 +2274,15 @@ export async function reorderListingImages(
   if (new Set(ids).size !== ids.length) throw new ListingInputError('Each photo can appear only once in the order')
 
   const client = await pool.connect()
+  // See addListingImages: read before the edit, or it always reads 'pending'.
+  let announce = false
   try {
     await client.query('BEGIN')
     if (!(await ownsListing(client, listingId, hostUserId))) {
       await client.query('ROLLBACK')
       return null
     }
+    announce = shouldAnnounceRequeue(photosRequeue(), await reviewStateBefore(client, listingId, hostUserId))
     const { rows } = await client.query(`SELECT id FROM listing_images WHERE listing_id = $1`, [listingId])
     const current = new Set((rows as { id: string }[]).map((r) => r.id))
     if (current.size !== ids.length || ids.some((id) => !current.has(id))) {
@@ -2272,7 +2301,7 @@ export async function reorderListingImages(
   }
 
   const updated = await getListingById(listingId, { asHost: true })
-  if (updated && photosRequeue()) await notifyListingRequeued(updated)
+  if (updated && announce) await notifyListingRequeued(updated)
   return updated
 }
 
