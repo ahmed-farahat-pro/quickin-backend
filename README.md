@@ -824,14 +824,48 @@ All three rungs now come from `date-pricing-core.ts`, which the parity guard cov
 
 - `perNightSeasonalSql(dateExpr, alias)` — weekend → month → base, the SQL twin of
   `resolveNightPrice`.
-- `stayDiscountFactorSql(checkIn, checkOut, alias)` and its twin `stayDiscountPercent()`
-  — `weekly_discount` from 7 nights, `monthly_discount` from 28, whichever applies
-  (they never compound), clamped at 100% so a stay total can never go negative.
+- `stayDiscountPercentSql(checkIn, checkOut, alias)`, `stayDiscountFactorSql(...)` built
+  on top of it, and their twin `stayDiscountPercent()` — `weekly_discount` from 7
+  nights, `monthly_discount` from 28, whichever applies (they never compound), clamped
+  at 100% so a stay total can never go negative. The percent is a builder of its own
+  because the quote SHOWS it while the booking CHARGES with it; see *the discount the
+  web never showed* below.
 
 `npm run check` proves the file is identical across the repos; it cannot prove the SQL
 and TypeScript rungs inside it agree with each other. **`scripts/_verify-night-price.mjs`
 does** — it runs both against a real database over weekend/monthly/NULL/empty-array
 cases. Run it after touching either rung.
+
+### Resolved: the length-of-stay discount the web never showed
+
+**Fixed 15 Sep 2026.** A host set a weekly or monthly discount, saved it, and a guest
+booking on the **web** was quoted the full undiscounted total — then charged the
+discounted one. The discount was never missing from the money; it was missing from the
+page, which is the worse half of the two: the number a guest agrees to is the number
+they are shown.
+
+Nothing was wrong in this repo's arithmetic. `createBooking` had discounted the stay
+since the ladders were unified (above), and `getStayQuote` returned `discountPercent`
+and a discounted `total` all along. The web simply never asked:
+`explore/[id]/reserve-panel.tsx` summed the per-night list from
+`GET /api/local/listings/:id/calendar` — an endpoint that prices **nights**, and a
+night has no idea how many other nights are beside it. The discount comes off the
+**stay**, so no amount of summing nights could ever produce it. iOS had been reading
+`/quote` and showing a discount row for the same listing the whole time.
+
+| | was (web) | now (web) |
+| --- | --- | --- |
+| Price source | `GET .../calendar`, summed client-side | `GET .../quote`, the same figure the booking is priced against |
+| Length-of-stay discount | **never applied, never shown** | its own line in the breakdown, subtotal → discount → total |
+| Offline/pre-quote estimate | base + weekend rungs only | the same, plus `stayDiscountPercent()` on the listing's two rates |
+
+The web-side fix is in `quickin-frontend`. What changed **here** is the one thing that
+let the bug recur quietly: `getStayQuote` had derived `discount_percent` from a CASE
+hand-copied out of `stayDiscountFactorSql` rather than from the shared builder, so an
+edit to `WEEKLY_DISCOUNT_MIN_NIGHTS` / `MONTHLY_DISCOUNT_MIN_NIGHTS` would have moved
+what a guest is charged without moving what they are told. Both now come from
+`stayDiscountPercentSql()`, and `stayDiscountFactorSql()` is expressed in terms of it —
+there is one CASE in the codebase, and the quote and the booking read the same one.
 
 ### Resolved: a weekend the host chooses
 
@@ -1559,6 +1593,32 @@ The flow, unchanged in the schema: `payment_proofs.status = 'submitted'` +
 `bookings.payment_status = 'submitted'` is the pending-confirmation state that both
 mobile apps already gate on (`payment_status == "submitted"`), so no app change was
 needed.
+
+### The guest must be told WHY a transfer was turned down
+
+**The defect (web).** Rejecting a payment sent the reservation back to the payment
+stage with the button relabelled "Upload a new screenshot" — and nothing else. The
+guest was asked to fix something without being told what, so the obvious move was to
+re-upload the same unreadable photo. iOS and Android had shown the reviewer's words
+since the feature shipped; only the web never read them.
+
+**Not a data problem.** `/ops` has always *required* a non-empty reason to reject
+(`POST /api/local/admin/payments` answers `400 "A reason is required when rejecting"`),
+`adminReviewProof` stores it on the latest proof, and `BOOKING_COLS` has always carried
+it out as `payment_reject_reason` on every booking both guest readers return
+(`getUserBookings`, `getBookingById`). The column was shipped and simply never rendered.
+
+| Piece | Rule |
+| --- | --- |
+| `rejectReasonText` | The READ half of `normalizeRejectReason`. Trims, and collapses blank **and the literal `"null"` / `"undefined"`** to `null` — a client that stringified a missing value on the way in would otherwise show the guest "null" as the reason. Mirrors `PaymentFlowRules.rejectReasonText` on iOS and Android |
+| `paymentRejectionFor` | Gates the reason on `paymentStageFor` being `rejected`, **never on the column alone**. `payment_reject_reason` is the *latest proof's* reason and it outlives the rejection: a guest who re-uploaded and was approved still has one on the row, so reading the column bare puts "your transfer wasn't accepted" next to a payment that has since gone through. Same trap `setListingApproval` NULLs its way out of for listing review notes |
+| No reason ≠ no card | A rejection with an empty reason is still announced, under a generic line (`instapay.rejected.noReason`). Dispute outcomes carry no reason at all (`adminResolveDispute` passes an optional note), and "we couldn't confirm your transfer" is still far more than the guest used to be told |
+
+The copy is three keys — `instapay.rejected.title` / `.noReason` / `.subtitle`, in all
+four locales, worded to match the iOS/Android `pay.rejected.*` strings — so a guest
+reads the identical explanation on `/reservations`, on `/pay/:id` and in both apps. The
+admin's reason itself is shown **verbatim**: it is free text a human typed for this
+guest, and translating or paraphrasing it would defeat the point of demanding one.
 
 ## The stay pass waits for the money, not for the host
 

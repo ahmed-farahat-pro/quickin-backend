@@ -40,6 +40,7 @@ import {
   expandBlocks,
   mergeBlockedDays,
   stayDiscountPercent, WEEKLY_DISCOUNT_MIN_NIGHTS, MONTHLY_DISCOUNT_MIN_NIGHTS,
+  stayDiscountPercentSql, stayDiscountFactorSql,
   weekendDaysSql,
   weekendNightSql,
   perNightSeasonalSql,
@@ -638,5 +639,59 @@ describe('stayDiscountPercent — the length-of-stay discount', () => {
     assert.equal(stayDiscountPercent(0, 10, 25), 0)
     assert.equal(stayDiscountPercent(NaN, 10, 25), 0)
     assert.equal(stayDiscountPercent(10, undefined, undefined), 0)
+  })
+})
+
+describe('stayDiscountPercentSql / stayDiscountFactorSql — the same rule, as SQL', () => {
+  test('the percent builder uses the SAME thresholds as stayDiscountPercent', () => {
+    // The whole point of the builder: an edit to the constants moves the SQL
+    // too. A hand-copied CASE is how getStayQuote came to show a guest a
+    // discount the booking did not charge (and, before that, none at all).
+    const sql = stayDiscountPercentSql('$2', '$3')
+    assert.ok(sql.includes(`>= ${MONTHLY_DISCOUNT_MIN_NIGHTS}`))
+    assert.ok(sql.includes(`>= ${WEEKLY_DISCOUNT_MIN_NIGHTS}`))
+    assert.match(sql, /monthly_discount/)
+    assert.match(sql, /weekly_discount/)
+  })
+
+  test('the monthly rung is tested BEFORE the weekly one, so it supersedes it', () => {
+    // Same non-compounding rule stayDiscountPercent enforces: a 30-night stay
+    // takes the monthly rate, not the weekly one, and never both.
+    const sql = stayDiscountPercentSql('$2', '$3')
+    assert.ok(sql.indexOf('monthly_discount') < sql.indexOf('weekly_discount'))
+  })
+
+  test('nights are counted checkOut − checkIn, never the other way round', () => {
+    const sql = stayDiscountPercentSql('$2', '$3')
+    assert.ok(sql.includes('(($3)::date - ($2)::date)'))
+  })
+
+  test('the percent is clamped to 0..100, so no stay is priced below nothing', () => {
+    const sql = stayDiscountPercentSql('$2', '$3')
+    assert.match(sql, /LEAST\(GREATEST\(/)
+    assert.ok(sql.includes(', 0), 100)'))
+  })
+
+  test('a NULL discount reads as no discount rather than NULL-ing the total', () => {
+    const sql = stayDiscountPercentSql('$2', '$3')
+    assert.match(sql, /COALESCE\(l\.monthly_discount, 0\)/)
+    assert.match(sql, /COALESCE\(l\.weekly_discount, 0\)/)
+  })
+
+  test('the factor is the percent, and nothing but the percent', () => {
+    // Expressed in terms of the percent builder rather than repeating its CASE,
+    // so what the guest is SHOWN and what they are CHARGED cannot disagree.
+    const pct = stayDiscountPercentSql('$3', '$4')
+    const factor = stayDiscountFactorSql('$3', '$4')
+    assert.ok(factor.includes(pct))
+    assert.ok(factor.startsWith('(1 - ('))
+    assert.ok(factor.endsWith(')::numeric / 100)'))
+  })
+
+  test('both honour another table alias, so neither hardcodes `l`', () => {
+    for (const sql of [stayDiscountPercentSql('$2', '$3', 'li'), stayDiscountFactorSql('$2', '$3', 'li')]) {
+      assert.match(sql, /li\.monthly_discount/)
+      assert.ok(!sql.includes('l.monthly_discount'))
+    }
   })
 })

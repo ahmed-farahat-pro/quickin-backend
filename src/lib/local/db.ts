@@ -65,6 +65,7 @@ import {
   isIsoDate,
   sqlWithDatePrice,
   stayDiscountFactorSql,
+  stayDiscountPercentSql,
   perNightSeasonalSql,
   weekendNightSql,
 } from './date-pricing-core'
@@ -1432,9 +1433,12 @@ export async function getStayQuote(listingId: string, checkIn: string, checkOut:
               WHEN (l.monthly_prices ->> extract(month from d)::int::text) ~ '^[0-9.]+$' THEN 'monthly'
               ELSE 'base'
             END AS source,
-            (CASE WHEN ($3::date - $2::date) >= 28 THEN COALESCE(l.monthly_discount, 0)
-                  WHEN ($3::date - $2::date) >= 7  THEN COALESCE(l.weekly_discount, 0)
-                  ELSE 0 END)::int AS discount_percent,
+            -- The SAME builder createBooking discounts the charge with, not a
+            -- second copy of its CASE: the quote is what the guest is SHOWN and
+            -- the booking is what they are CHARGED, and the two thresholds
+            -- drifting apart is exactly how a guest gets quoted one price and
+            -- billed another.
+            (${stayDiscountPercentSql('$2', '$3')})::int AS discount_percent,
             (l.weekend_price IS NOT NULL OR l.monthly_prices <> '{}'::jsonb) AS has_seasonal,
             l.currency
        FROM listings l,

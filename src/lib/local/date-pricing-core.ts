@@ -671,6 +671,33 @@ export function stayDiscountPercent(
 }
 
 /**
+ * The same rule as SQL, as the whole percent itself — what a guest is SHOWN
+ * ("10% off"), and the single number the factor below takes off the total.
+ * `checkInExpr`/`checkOutExpr` are SQL date expressions (typically the bound
+ * parameters `$3` and `$4`); `listingAlias` is the aliased `listings` row.
+ *
+ * It is a builder of its own rather than a detail of the factor because the two
+ * questions are asked in different places: createBooking wants the multiplier,
+ * getStayQuote wants the percent to put in the breakdown. getStayQuote used to
+ * answer its half with a CASE hand-copied out of the factor, which is the drift
+ * this file exists to prevent — a thresholds edit here would have moved what the
+ * guest is charged without moving what they were told.
+ */
+export function stayDiscountPercentSql(
+  checkInExpr: string,
+  checkOutExpr: string,
+  listingAlias = 'l',
+): string {
+  const nights = `((${checkOutExpr})::date - (${checkInExpr})::date)`
+  // Clamped the same way stayDiscountPercent() clamps: never below 0, never
+  // above 100, so no stay is ever priced below nothing.
+  return `LEAST(GREATEST(CASE
+      WHEN ${nights} >= ${MONTHLY_DISCOUNT_MIN_NIGHTS} THEN COALESCE(${listingAlias}.monthly_discount, 0)
+      WHEN ${nights} >= ${WEEKLY_DISCOUNT_MIN_NIGHTS}  THEN COALESCE(${listingAlias}.weekly_discount, 0)
+      ELSE 0 END, 0), 100)`
+}
+
+/**
  * The same rule as SQL: a multiplier to apply to the summed nightly total.
  * `checkInExpr`/`checkOutExpr` are SQL date expressions (typically the bound
  * parameters `$3` and `$4`); `listingAlias` is the aliased `listings` row.
@@ -680,11 +707,7 @@ export function stayDiscountFactorSql(
   checkOutExpr: string,
   listingAlias = 'l',
 ): string {
-  const nights = `((${checkOutExpr})::date - (${checkInExpr})::date)`
-  return `(1 - (LEAST(GREATEST(CASE
-      WHEN ${nights} >= ${MONTHLY_DISCOUNT_MIN_NIGHTS} THEN COALESCE(${listingAlias}.monthly_discount, 0)
-      WHEN ${nights} >= ${WEEKLY_DISCOUNT_MIN_NIGHTS}  THEN COALESCE(${listingAlias}.weekly_discount, 0)
-      ELSE 0 END, 0), 100))::numeric / 100)`
+  return `(1 - (${stayDiscountPercentSql(checkInExpr, checkOutExpr, listingAlias)})::numeric / 100)`
 }
 
 /**

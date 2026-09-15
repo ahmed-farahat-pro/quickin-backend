@@ -152,6 +152,43 @@ export function normalizeRejectReason(value: unknown): string | null {
   return v.length > MAX_REJECT_REASON ? v.slice(0, MAX_REJECT_REASON) : v
 }
 
+/**
+ * The reviewer's own words, as they should be READ back to the guest — the other
+ * half of `normalizeRejectReason`, which is about WRITING one.
+ *
+ * Shown verbatim: it is free text an admin typed for this guest, and paraphrasing
+ * it would defeat the point of asking for it. `null` means there is nothing worth
+ * showing and the caller should fall back to its generic line — which covers the
+ * empty string, whitespace, and the literal "null"/"undefined" a JSON column can
+ * hand back when a client stringified a missing value on the way in.
+ *
+ * Mirrors `PaymentFlowRules.rejectReasonText` on iOS and Android, so a rejected
+ * transfer reads the same on all three surfaces.
+ */
+export function rejectReasonText(raw: unknown): string | null {
+  const v = String(raw ?? '').trim()
+  if (!v || v.toLowerCase() === 'null' || v.toLowerCase() === 'undefined') return null
+  return v
+}
+
+/**
+ * What to show a guest about the last rejected transfer — `null` on a booking
+ * that ISN'T at the rejected stage.
+ *
+ * The stage gate is the point: `payment_reject_reason` is the latest proof's
+ * reason and it OUTLIVES the rejection. A guest who re-uploaded and was approved
+ * still has one on the row, so reading the column alone puts "your transfer
+ * wasn't accepted" next to a payment that since went through. Mirrors
+ * `paymentRejectReasonText` on iOS and Android.
+ */
+export function paymentRejectionFor(
+  b: StayPassBooking & { payment_reject_reason?: string | null },
+): { reason: string | null } | null {
+  const stage = paymentStageFor({ ...b, payment_state: b.payment_state ?? b.payment_status })
+  if (stage !== 'rejected') return null
+  return { reason: rejectReasonText(b.payment_reject_reason) }
+}
+
 // ---- Upload validation ------------------------------------------------------
 
 /** Matches the server's MAX_PROOF_BYTES and the client compressor's default target. */
