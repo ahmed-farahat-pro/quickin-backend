@@ -1,82 +1,32 @@
 import { NextResponse } from 'next/server'
-import {
-  getOrCreateConversation,
-  listConversations,
-  listChatMessages,
-  postChatMessage,
-} from '@/lib/local/db'
-import { getUserFromRequest } from '@/lib/local/auth'
-import { pendingWarningFor } from '@/lib/local/moderation'
-import { warningGateBody, WARNING_GATE_STATUS } from '@/lib/local/moderation-core'
 
-// The Messages inbox (guest ⇄ host). Polled by the web + mobile clients.
-//   GET  /api/local/chat                        → { conversations }
-//   GET  /api/local/chat?conversationId=…       → { messages }
-//   POST /api/local/chat { listingId }          → { conversationId }  (open/reuse a thread)
-//   POST /api/local/chat { conversationId, body } → { message }        (send)
-//
-// `conversations` covers BOTH thread kinds: the pre-booking thread opened from a
-// listing, and the per-reservation thread opened from a reservation request —
-// which used to be invisible here, so a host's reply reached a guest who could
-// only find it by reopening the reservation. Each row carries `kind`, and a
-// reservation thread is addressed as `booking:<uuid>` wherever a conversation id
-// goes. Clients pass the id back untouched; see lib/local/inbox-core.ts.
+// Host ⇄ guest messaging was removed on 2026-10-02 in favour of public comments on
+// the listing (/api/local/listings/:id/comments). App builds already installed on
+// phones still call this route, so it answers 410 with a sentence they can show
+// instead of a bare 404. The old threads stay in the database, unread.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Cache-Control': 'no-store',
 }
+const GONE = { error: 'Messaging has been removed. Ask the host in the listing’s comments.' }
 
-export function OPTIONS() {
+export async function OPTIONS() {
   return new Response(null, {
     status: 204,
-    headers: { ...CORS, 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS' },
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+    },
   })
 }
 
-export async function GET(req: Request) {
-  try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    const conversationId = new URL(req.url).searchParams.get('conversationId')
-    if (conversationId) {
-      return NextResponse.json({ messages: await listChatMessages(user.id, conversationId) }, { headers: CORS })
-    }
-    return NextResponse.json({ conversations: await listConversations(user.id) }, { headers: CORS })
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    const status = /not found|Invalid/i.test(msg) ? 400 : 500
-    return NextResponse.json({ error: msg }, { status, headers: CORS })
-  }
+export async function GET() {
+  return NextResponse.json(GONE, { status: 410, headers: CORS })
 }
 
-export async function POST(req: Request) {
-  try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    const body = await req.json().catch(() => null)
-    if (!body) return NextResponse.json({ error: 'Invalid request body' }, { status: 400, headers: CORS })
-
-    if (body.conversationId && typeof body.body === 'string') {
-      // The acknowledge gate: a warned user can read the thread but cannot send
-      // until they have confirmed they've read the warning. Server-side, so an app
-      // build that predates the dialog can't skip it.
-      const warning = await pendingWarningFor(user.id)
-      if (warning) {
-        return NextResponse.json(warningGateBody(warning), { status: WARNING_GATE_STATUS, headers: CORS })
-      }
-      const message = await postChatMessage(user.id, String(body.conversationId), String(body.body))
-      return NextResponse.json({ message }, { status: 201, headers: CORS })
-    }
-    if (body.listingId) {
-      const convo = await getOrCreateConversation(user.id, String(body.listingId))
-      return NextResponse.json({ conversationId: convo.id, listingTitle: convo.listing_title }, { status: 201, headers: CORS })
-    }
-    return NextResponse.json({ error: 'Nothing to do' }, { status: 400, headers: CORS })
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    const status = /not found|Invalid|empty|own listing|no host|hidden|number|isn’t allowed/i.test(msg) ? 400 : 500
-    return NextResponse.json({ error: msg }, { status, headers: CORS })
-  }
+export async function POST() {
+  return NextResponse.json(GONE, { status: 410, headers: CORS })
 }

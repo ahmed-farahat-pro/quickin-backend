@@ -37,7 +37,7 @@
 // ── Surfaces & messages ──────────────────────────────────────────────────────
 
 /** Where the text is going. Each surface gets its own wording on rejection. */
-export type GuardSurface = 'chat' | 'review' | 'listing' | 'profile'
+export type GuardSurface = 'chat' | 'review' | 'listing' | 'profile' | 'comment'
 
 /** What was found. `null` when the text is clean. */
 export type GuardKind = 'phone' | 'email' | 'social' | 'url'
@@ -47,6 +47,7 @@ const SURFACE_NOUN: Record<GuardSurface, string> = {
   review: 'in reviews',
   listing: 'in a listing',
   profile: 'in your profile',
+  comment: 'in public comments',
 }
 
 const KIND_NOUN: Record<GuardKind, string> = {

@@ -31,11 +31,14 @@ npm run dev        # API at http://localhost:4000
 | DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
 | POST | `/api/local/bookings` | Create a reservation (auth required) |
 | GET  | `/api/local/bookings` | The signed-in user's reservations |
-| GET  | `/api/local/chat` | **The Messages inbox** — every thread the signed-in user is part of as guest or host, newest activity first: `{ conversations: [{ id, kind, booking_id, listing_id, listing_title, listing_image, other_name, last_message, last_message_at, is_host, check_in, check_out, booking_status }] }`. `kind` is `listing` (the pre-booking thread) or `booking` (**the thread inside a reservation request**, whose `id` reads `booking:<uuid>`); the reservation fields are null on a `listing` row. A reservation appears only once it has at least one message. See One inbox, two kinds of thread below |
-| GET  | `/api/local/chat?conversationId=…` | One thread, oldest first → `{ messages: [{ id, sender_id, body, created_at, mine }] }`. Takes **either** id shape; a non-member gets 400 `Conversation not found`, and a malformed id 400 `Invalid id` |
-| POST | `/api/local/chat` | `{ listingId }` → 201 `{ conversationId, listingTitle }` opens/reuses the pre-booking thread. `{ conversationId, body }` → 201 `{ message }` sends — again on **either** id shape, so a reservation thread is answered from the inbox exactly as it is from the reservation screen |
-| GET  | `/api/local/bookings/:id/messages` | The reservation's thread, as opened from the reservation request itself. Guest, host or admin |
-| POST | `/api/local/bookings/:id/messages` | Send into that thread. **Notifies the other party** (`type: 'message'`, link `/messages`) — the same notification the pre-booking thread has always sent |
+| GET\|POST | `/api/local/chat`, `/api/local/bookings/:id/messages` | **Removed 2026-10-02 — answer 410** `{error}` with a sentence the old apps can show. Host ⇄ guest messaging was replaced by listing comments (below); the old threads stay in the database, unread |
+| GET  | `/api/local/listings/:id/comments` | **Public** Q&A on a listing, newest first (max 200): `{ comments: [{ id, listing_id, user_id, author_name, author_avatar, body, created_at, mine, reply: {body, created_at} \| null }], is_host, can_comment }`. Auth optional — it only decides `mine`, `is_host` (show reply controls) and `can_comment` (signed in, not the host, listing published). See Listing comments below |
+| POST | `/api/local/listings/:id/comments` | `{ body }` → 201 `{ comment }`. Signed in. 403 the listing's own host, 404 unpublished, 400 empty / over 1000 chars / contact details (contentguard surface `comment`), 409 the moderation warning gate, 429 over 10 per 10 min. Notifies the host (`type: 'comment'`) + push |
+| DELETE | `/api/local/listings/:id/comments/:commentId` | The author (or `role='admin'`) removes a comment — soft delete. → `{ ok: true }` |
+| PUT  | `/api/local/listings/:id/comments/:commentId/reply` | `{ body }` → `{ comment }`. **The listing's host only**; one reply per comment, a second PUT replaces it. Same 400/409 rules as a comment. Notifies the commenter (`type: 'comment_reply'`) + push |
+| DELETE | `/api/local/listings/:id/comments/:commentId/reply` | The host removes their reply → `{ comment }` with `reply: null` |
+| GET  | `/api/local/host/comments` | The host's "Guest questions" — comments across all their listings, unanswered first: `{ comments: [...same shape + listing_title, listing_image], unanswered }` |
+| DELETE | `/api/local/admin/comments/:id` | Staff (`moderation` module) remove any comment. Audited as `comment_removed` |
 | POST | `/api/auth/signup` | Register (email + password) |
 | POST | `/api/auth/login` | Sign in (email + password) |
 | POST | `/api/auth/social` | Demo social sign-in (`google`) |
@@ -2329,3 +2332,24 @@ A dependency-free admin UI (listings + users) lives in `local-backend/admin-serv
 ```bash
 node local-backend/admin-server.mjs   # http://localhost:3001
 ```
+
+## Listing comments
+
+Host ⇄ guest messaging was **removed on 2026-10-02**. In its place, every listing has
+public comments: anyone can read them, any signed-in user can ask, and the listing's
+host answers with **one reply per comment**. Public on purpose — the answer to "is the
+pool heated?" is written once and read by every later guest.
+
+| Piece | Role |
+|---|---|
+| `listing_comments` table | `scripts/migrate-listing-comments.mjs` (idempotent). `host_reply`/`host_replied_at` live on the comment row because there is at most one reply. `deleted_at` is a soft delete |
+| `lib/local/listing-comments-core.ts` | The pure rules, tested by `test/unit/listing-comments-core.test.mjs`: body validation (trimmed, 1–1000 chars), the public byline (**first name + last initial** — the page is public), `commentPermissions` (the host replies, never asks), the host-inbox order, the notification link `/explore/<id>#comments` |
+| `lib/local/listing-comments.ts` | SQL, notifications and push |
+
+**Contact details are blocked on both the comment and the reply** — contentguard
+surface `comment`, recorded in `policy_violations` like every other surface, and the
+moderation warning gate (409) that used to stop chat now stops comments and replies.
+The old `conversations`, `chat_messages` and `messages` tables are no longer read or
+written by any route; `lib/local/inbox-core.ts` and the chat functions in `db.ts` remain
+only because `/ops` can still open a user's historical threads.
+

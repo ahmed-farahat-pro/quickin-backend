@@ -38,7 +38,7 @@ import {
 describe('kinds and surfaces', () => {
   test('the catalog matches contentguard’s four categories', () => {
     assert.deepEqual([...VIOLATION_KINDS], ['phone', 'email', 'social', 'url'])
-    assert.deepEqual([...VIOLATION_SURFACES], ['chat', 'review', 'listing', 'profile'])
+    assert.deepEqual([...VIOLATION_SURFACES], ['chat', 'review', 'listing', 'profile', 'comment'])
   })
 
   test('a row written by a newer deploy falls back instead of throwing', () => {

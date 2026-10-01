@@ -20,7 +20,7 @@
 export const VIOLATION_KINDS = ['phone', 'email', 'social', 'url'] as const
 export type ViolationKind = (typeof VIOLATION_KINDS)[number]
 
-export const VIOLATION_SURFACES = ['chat', 'review', 'listing', 'profile'] as const
+export const VIOLATION_SURFACES = ['chat', 'review', 'listing', 'profile', 'comment'] as const
 export type ViolationSurface = (typeof VIOLATION_SURFACES)[number]
 
 const KIND_LABELS: Record<ViolationKind, string> = {
@@ -35,6 +35,7 @@ const SURFACE_LABELS: Record<ViolationSurface, string> = {
   review: 'Review',
   listing: 'Listing',
   profile: 'Profile',
+  comment: 'Listing comment',
 }
 
 /** Unknown values fall back rather than throw: a row written by a newer deploy
