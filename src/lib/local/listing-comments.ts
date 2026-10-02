@@ -3,7 +3,12 @@ import { createNotification } from './notifications'
 import { sendPush } from './push'
 import { guardContent } from './moderation'
 import {
+  ADMIN_COMMENT_LIMIT,
   COMMENT_PAGE_LIMIT,
+  moderationState,
+  normalizeAdminScope,
+  normalizeRemovalReason,
+  removalNotice,
   checkCommentBody,
   commentPermissions,
   commentsLink,
@@ -28,6 +33,10 @@ export class CommentError extends Error {
     this.status = status
   }
 }
+
+/** A banned (blocked/removed) author's comments are hidden while the ban lasts,
+ *  and come back if it is lifted — nothing is deleted. */
+const AUTHOR_ACTIVE = `COALESCE(u.account_status, 'active') = 'active'`
 
 const SELECT_COMMENT = `
   SELECT c.id, c.listing_id, c.user_id, c.body, c.created_at, c.host_reply, c.host_replied_at,
@@ -62,7 +71,7 @@ export async function getListingComments(listingId: string, viewerId: string | n
   if (!listing) return { comments: [], is_host: false, can_comment: false }
   const { rows } = await pool.query(
     `${SELECT_COMMENT}
-      WHERE c.listing_id = $1 AND c.deleted_at IS NULL
+      WHERE c.listing_id = $1 AND c.deleted_at IS NULL AND ${AUTHOR_ACTIVE}
       ORDER BY c.created_at DESC
       LIMIT ${COMMENT_PAGE_LIMIT}`,
     [listingId],
@@ -108,17 +117,102 @@ export async function deleteListingComment(
   const row = await oneComment(listingId, commentId)
   if (!row) throw new CommentError('Comment not found', 404)
   if (row.user_id !== user.id && user.role !== 'admin') throw new CommentError('Not allowed', 403)
-  await pool.query(`UPDATE listing_comments SET deleted_at = now() WHERE id = $1`, [commentId])
+  const by = row.user_id === user.id ? 'author' : 'staff'
+  await pool.query(`UPDATE listing_comments SET deleted_at = now(), deleted_by = $2 WHERE id = $1`, [commentId, by])
 }
 
-/** Staff moderation: remove any comment by id, whatever the listing. */
-export async function adminDeleteListingComment(commentId: string): Promise<boolean> {
-  if (!isUuid(commentId)) return false
-  const { rowCount } = await pool.query(
-    `UPDATE listing_comments SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL`,
+export interface AdminCommentRow {
+  id: string
+  listing_id: string
+  listing_title: string | null
+  user_id: string
+  author_name: string | null
+  author_email: string | null
+  author_status: string
+  body: string
+  created_at: string
+  host_reply: string | null
+  host_replied_at: string | null
+  deleted_at: string | null
+  deleted_by: string | null
+  delete_reason: string | null
+  state: ReturnType<typeof moderationState>
+}
+
+/** /ops → Comments. Full names and emails: staff need to know who they are banning. */
+export async function adminListComments(opts: {
+  scope?: unknown
+  q?: unknown
+  listingId?: unknown
+  userId?: unknown
+}): Promise<AdminCommentRow[]> {
+  const scope = normalizeAdminScope(opts.scope)
+  const where: string[] = []
+  const args: unknown[] = []
+  if (scope === 'visible') where.push(`c.deleted_at IS NULL AND ${AUTHOR_ACTIVE}`)
+  if (scope === 'hidden') where.push(`c.deleted_at IS NULL AND NOT ${AUTHOR_ACTIVE}`)
+  if (scope === 'removed') where.push(`c.deleted_at IS NOT NULL`)
+  const listingId = String(opts.listingId ?? '')
+  if (isUuid(listingId)) { args.push(listingId); where.push(`c.listing_id = $${args.length}`) }
+  const userId = String(opts.userId ?? '')
+  if (isUuid(userId)) { args.push(userId); where.push(`c.user_id = $${args.length}`) }
+  const q = String(opts.q ?? '').trim().slice(0, 200)
+  if (q) {
+    args.push(`%${q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`)
+    const p = `$${args.length}`
+    where.push(`(c.body ILIKE ${p} OR c.host_reply ILIKE ${p} OR u.full_name ILIKE ${p} OR u.email ILIKE ${p} OR l.title ILIKE ${p})`)
+  }
+  const { rows } = await pool.query(
+    `SELECT c.id, c.listing_id, l.title AS listing_title, c.user_id,
+            u.full_name AS author_name, u.email AS author_email,
+            COALESCE(u.account_status, 'active') AS author_status,
+            c.body, c.created_at, c.host_reply, c.host_replied_at,
+            c.deleted_at, c.deleted_by, c.delete_reason
+       FROM listing_comments c
+       JOIN users u ON u.id = c.user_id
+       JOIN listings l ON l.id = c.listing_id
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY c.created_at DESC
+      LIMIT ${ADMIN_COMMENT_LIMIT}`,
+    args,
+  )
+  return rows.map((r) => ({ ...r, state: moderationState(r) }))
+}
+
+/**
+ * Staff remove a comment (soft delete) and tell its author why it vanished.
+ * `null` when there is no such live comment — already removed, or a bad id.
+ */
+export async function adminRemoveComment(
+  commentId: string,
+  reason: unknown,
+): Promise<{ user_id: string; listing_id: string; reason: string | null } | null> {
+  if (!isUuid(commentId)) return null
+  const why = normalizeRemovalReason(reason)
+  const { rows } = await pool.query(
+    `UPDATE listing_comments c
+        SET deleted_at = now(), deleted_by = 'staff', delete_reason = $2
+       FROM listings l
+      WHERE c.id = $1 AND c.deleted_at IS NULL AND l.id = c.listing_id
+      RETURNING c.user_id, c.listing_id, l.title`,
+    [commentId, why],
+  )
+  const row = rows[0]
+  if (!row) return null
+  await createNotification(row.user_id, { type: 'comment_removed', ...removalNotice(row.title), link: null })
+  return { user_id: row.user_id, listing_id: row.listing_id, reason: why }
+}
+
+/** Staff remove only the host's reply, leaving the question up. */
+export async function adminRemoveReply(commentId: string): Promise<{ listing_id: string } | null> {
+  if (!isUuid(commentId)) return null
+  const { rows } = await pool.query(
+    `UPDATE listing_comments SET host_reply = NULL, host_replied_at = NULL
+      WHERE id = $1 AND host_reply IS NOT NULL
+      RETURNING listing_id`,
     [commentId],
   )
-  return (rowCount ?? 0) > 0
+  return rows[0] ?? null
 }
 
 /** The host answers (or re-answers) a comment. One reply per comment. */
@@ -177,7 +271,7 @@ export async function getHostComments(hostId: string): Promise<{ comments: Comme
        FROM listing_comments c
        JOIN listings l ON l.id = c.listing_id
        JOIN users u ON u.id = c.user_id
-      WHERE l.host_id = $1 AND c.deleted_at IS NULL
+      WHERE l.host_id = $1 AND c.deleted_at IS NULL AND ${AUTHOR_ACTIVE}
       ORDER BY (c.host_reply IS NULL) DESC, c.created_at DESC
       LIMIT ${COMMENT_PAGE_LIMIT}`,
     [hostId],

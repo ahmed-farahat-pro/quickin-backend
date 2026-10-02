@@ -120,3 +120,52 @@ export function sortForHost<T extends { reply: unknown; created_at: string }>(li
     return b.created_at.localeCompare(a.created_at)
   })
 }
+
+// ── Staff moderation (/ops → Comments) ───────────────────────────────────────
+
+/** Which comments the staff list shows. `visible` = what the public can see now. */
+export const ADMIN_COMMENT_SCOPES = ['visible', 'removed', 'hidden', 'all'] as const
+export type AdminCommentScope = (typeof ADMIN_COMMENT_SCOPES)[number]
+
+export function normalizeAdminScope(value: unknown): AdminCommentScope {
+  const v = String(value ?? '').toLowerCase()
+  return (ADMIN_COMMENT_SCOPES as readonly string[]).includes(v) ? (v as AdminCommentScope) : 'visible'
+}
+
+/** Most rows one staff list returns. */
+export const ADMIN_COMMENT_LIMIT = 300
+
+export const MAX_REMOVAL_REASON = 500
+
+/** Staff may give a reason; it is kept for the audit trail, never shown publicly. */
+export function normalizeRemovalReason(value: unknown): string | null {
+  const s = typeof value === 'string' ? value.trim() : ''
+  return s ? s.slice(0, MAX_REMOVAL_REASON) : null
+}
+
+/** Who removed a comment, as stored in `listing_comments.deleted_by`. */
+export type CommentRemover = 'author' | 'staff'
+
+/**
+ * Where a row stands for staff. `hidden` is a comment nobody deleted whose author
+ * is blocked or removed — it disappears from the listing while the ban lasts and
+ * comes back if the ban is lifted.
+ */
+export function moderationState(row: {
+  deleted_at: unknown
+  deleted_by?: string | null
+  author_status?: string | null
+}): 'visible' | 'hidden' | 'removed_by_author' | 'removed_by_staff' {
+  if (row.deleted_at) return row.deleted_by === 'staff' ? 'removed_by_staff' : 'removed_by_author'
+  const status = String(row.author_status ?? 'active') || 'active'
+  return status === 'active' ? 'visible' : 'hidden'
+}
+
+/** The notification the author gets when staff remove their comment. */
+export function removalNotice(listingTitle: string | null | undefined): { title: string; body: string } {
+  const where = listingTitle ? ` on “${listingTitle}”` : ''
+  return {
+    title: 'Your comment was removed',
+    body: `QuickIn removed your comment${where} because it broke our community rules.`,
+  }
+}

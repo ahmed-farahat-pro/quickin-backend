@@ -32,6 +32,10 @@ const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { reje
        ON listing_comments (listing_id, created_at DESC) WHERE deleted_at IS NULL`)
   await pool.query(
     `CREATE INDEX IF NOT EXISTS listing_comments_user_idx ON listing_comments (user_id, created_at DESC)`)
+  // Staff moderation (2026-10-02): who removed a comment, and why. NULL deleted_by
+  // on a deleted row means the author did — the only way to delete before this.
+  await pool.query(`ALTER TABLE listing_comments ADD COLUMN IF NOT EXISTS deleted_by text`)
+  await pool.query(`ALTER TABLE listing_comments ADD COLUMN IF NOT EXISTS delete_reason text`)
   const { rows } = await pool.query(`SELECT count(*)::int AS n FROM listing_comments`)
   console.log(`✅ listing_comments ready (${rows[0].n} rows)`)
   await pool.end()

@@ -38,7 +38,8 @@ npm run dev        # API at http://localhost:4000
 | PUT  | `/api/local/listings/:id/comments/:commentId/reply` | `{ body }` → `{ comment }`. **The listing's host only**; one reply per comment, a second PUT replaces it. Same 400/409 rules as a comment. Notifies the commenter (`type: 'comment_reply'`) + push |
 | DELETE | `/api/local/listings/:id/comments/:commentId/reply` | The host removes their reply → `{ comment }` with `reply: null` |
 | GET  | `/api/local/host/comments` | The host's "Guest questions" — comments across all their listings, unanswered first: `{ comments: [...same shape + listing_title, listing_image], unanswered }` |
-| DELETE | `/api/local/admin/comments/:id` | Staff (`moderation` module) remove any comment. Audited as `comment_removed` |
+| GET  | `/api/local/admin/comments` | **/ops → Comments** (module `moderation`). `?scope=visible\|hidden\|removed\|all` (default `visible`), `?q=` searches comment, reply, author name/email and listing title, `?listingId=` / `?userId=` narrow it. → `{ comments: [{ …, author_name, author_email, author_status, deleted_by, delete_reason, state }] }` — full name and email, because staff need to know whom they are banning. `state` is `visible` \| `hidden` (author banned) \| `removed_by_author` \| `removed_by_staff`. Max 300, newest first |
+| DELETE | `/api/local/admin/comments/:id` | Staff remove a comment (`moderation`), optional `{ reason }` kept for the audit log only. The author is notified (`type: 'comment_removed'`). `?part=reply` removes only the host's reply. Audited as `comment_removed` / `comment_reply_removed`. **Banning the author** is the existing `POST /api/local/admin/moderation {userId, action:'suspend', reason}` |
 | POST | `/api/auth/signup` | Register (email + password) |
 | POST | `/api/auth/login` | Sign in (email + password) |
 | POST | `/api/auth/social` | Demo social sign-in (`google`) |
@@ -2349,6 +2350,15 @@ pool heated?" is written once and read by every later guest.
 **Contact details are blocked on both the comment and the reply** — contentguard
 surface `comment`, recorded in `policy_violations` like every other surface, and the
 moderation warning gate (409) that used to stop chat now stops comments and replies.
+**Staff moderation.** /ops → Comments (module `moderation`) lists every comment with its
+author's full name, email and account status; staff can remove a comment (the author is
+notified, the reason goes to the audit log), remove just the host's reply, or ban the
+author. A ban is the ordinary reversible account block, and **a banned author's comments
+are hidden, not deleted** — every public and host read filters on the author's
+`account_status`, so lifting the ban in /ops → Users brings them back. `deleted_by`
+(`author` \| `staff`) and `delete_reason` were added to the table by the same migration
+script; a deleted row with `deleted_by` NULL predates them and was the author's.
+
 The old `conversations`, `chat_messages` and `messages` tables are no longer read or
 written by any route; `lib/local/inbox-core.ts` and the chat functions in `db.ts` remain
 only because `/ops` can still open a user's historical threads.

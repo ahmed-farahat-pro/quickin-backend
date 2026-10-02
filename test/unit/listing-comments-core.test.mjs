@@ -109,3 +109,33 @@ test('sortForHost puts unanswered first, then newest', () => {
 test('commentsLink points at the listing’s comments anchor', () => {
   assert.equal(commentsLink(LISTING), `/explore/${LISTING}#comments`)
 })
+
+describe('staff moderation helpers', async () => {
+  const core = await import('../../src/lib/local/listing-comments-core.ts')
+  test('scope falls back to visible', () => {
+    assert.equal(core.normalizeAdminScope('removed'), 'removed')
+    assert.equal(core.normalizeAdminScope('HIDDEN'), 'hidden')
+    assert.equal(core.normalizeAdminScope('nope'), 'visible')
+    assert.equal(core.normalizeAdminScope(undefined), 'visible')
+  })
+  test('removal reason is trimmed, optional and capped', () => {
+    assert.equal(core.normalizeRemovalReason('  spam  '), 'spam')
+    assert.equal(core.normalizeRemovalReason('   '), null)
+    assert.equal(core.normalizeRemovalReason(7), null)
+    assert.equal(core.normalizeRemovalReason('x'.repeat(900)).length, core.MAX_REMOVAL_REASON)
+  })
+  test('moderationState tells removed, hidden and visible apart', () => {
+    assert.equal(core.moderationState({ deleted_at: null, author_status: 'active' }), 'visible')
+    assert.equal(core.moderationState({ deleted_at: null, author_status: null }), 'visible')
+    assert.equal(core.moderationState({ deleted_at: null, author_status: 'blocked' }), 'hidden')
+    assert.equal(core.moderationState({ deleted_at: null, author_status: 'removed' }), 'hidden')
+    assert.equal(core.moderationState({ deleted_at: '2026-10-02', deleted_by: 'staff' }), 'removed_by_staff')
+    assert.equal(core.moderationState({ deleted_at: '2026-10-02', deleted_by: 'author' }), 'removed_by_author')
+    // rows deleted before deleted_by existed were all the author's own
+    assert.equal(core.moderationState({ deleted_at: '2026-10-02', deleted_by: null }), 'removed_by_author')
+  })
+  test('removalNotice names the listing when known', () => {
+    assert.match(core.removalNotice('Villa').body, /“Villa”/)
+    assert.doesNotMatch(core.removalNotice(null).body, /“/)
+  })
+})
