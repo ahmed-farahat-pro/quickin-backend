@@ -10,7 +10,10 @@ import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   BANK_KEYS,
+  FLASH_KEYS,
   INSTAPAY_KEYS,
+  MANUAL_PAYMENT_METHODS,
+  isManualPaymentMethod,
   MAX_ACCOUNT_NUMBER_CHARS,
   MAX_HANDLE_CHARS,
   MAX_INSTRUCTIONS_CHARS,
@@ -180,6 +183,7 @@ describe('rowsToPaymentConfig', () => {
         instructions: '',
         configured: false,
       },
+      flash: { enabled: false, configured: false },
       available_methods: ['instapay'],
     })
   })
@@ -251,13 +255,19 @@ describe('isPaymentConfigError', () => {
 // ---- Payment methods --------------------------------------------------------
 
 describe('PAYMENT_METHODS', () => {
-  test('is the vocabulary payment_proofs.method is constrained to', () => {
-    assert.deepEqual([...PAYMENT_METHODS], ['instapay', 'bank_transfer'])
+  test('is the vocabulary bookings.payment_method is constrained to', () => {
+    assert.deepEqual([...PAYMENT_METHODS], ['instapay', 'bank_transfer', 'flash'])
   })
 
-  test('isPaymentMethod accepts only those two', () => {
+  test('only the screenshot methods are manual', () => {
+    assert.deepEqual([...MANUAL_PAYMENT_METHODS], ['instapay', 'bank_transfer'])
+    assert.equal(isManualPaymentMethod('flash'), false)
+  })
+
+  test('isPaymentMethod accepts only those three', () => {
     assert.equal(isPaymentMethod('instapay'), true)
     assert.equal(isPaymentMethod('bank_transfer'), true)
+    assert.equal(isPaymentMethod('flash'), true)
     assert.equal(isPaymentMethod('paymob'), false)
     assert.equal(isPaymentMethod(''), false)
     assert.equal(isPaymentMethod(undefined), false)
@@ -271,12 +281,14 @@ describe('PAYMENT_METHODS', () => {
     assert.equal(normalizePaymentMethod(undefined), 'instapay')
     assert.equal(normalizePaymentMethod('vodafone_cash'), 'instapay')
     assert.equal(normalizePaymentMethod({ nope: 1 }), 'instapay')
+    // A screenshot is never a Flash payment — Flash confirms itself.
+    assert.equal(normalizePaymentMethod('flash'), 'instapay')
   })
 })
 
 describe('PAYMENT_SETTING_KEYS', () => {
   test('covers every key both destinations are stored in', () => {
-    for (const k of [...Object.values(INSTAPAY_KEYS), ...Object.values(BANK_KEYS)]) {
+    for (const k of [...Object.values(INSTAPAY_KEYS), ...Object.values(BANK_KEYS), ...Object.values(FLASH_KEYS)]) {
       assert.ok(PAYMENT_SETTING_KEYS.includes(k), `${k} must be read by getPaymentConfig`)
     }
   })
@@ -524,5 +536,37 @@ describe('availableMethods', () => {
     ])
     assert.deepEqual(cfg.available_methods, [])
     assert.equal(isPaymentConfigured(cfg), false)
+  })
+})
+
+describe('flash', () => {
+  const INSTA = { key: 'instapay_handle', value: 'a@instapay' }
+
+  test('a NEW method: off until an admin switches it on, even with credentials', () => {
+    assert.deepEqual(rowsToPaymentConfig([INSTA], { flashConfigured: true }).flash, { enabled: false, configured: true })
+    assert.deepEqual(rowsToPaymentConfig([INSTA, { key: 'flash_enabled', value: '' }], { flashConfigured: true }).available_methods, ['instapay'])
+  })
+
+  test('offered first when enabled and configured — it confirms instantly', () => {
+    const cfg = rowsToPaymentConfig([INSTA, ...BANK_ROWS, { key: 'flash_enabled', value: '1' }], { flashConfigured: true })
+    assert.deepEqual(cfg.available_methods, ['flash', 'instapay', 'bank_transfer'])
+    assert.equal(isPaymentConfigured(cfg), true)
+  })
+
+  test('switched on without server credentials, it stays hidden', () => {
+    const cfg = rowsToPaymentConfig([{ key: 'flash_enabled', value: '1' }])
+    assert.deepEqual(cfg.flash, { enabled: true, configured: false })
+    assert.deepEqual(cfg.available_methods, [])
+  })
+
+  test('switched off, it is hidden', () => {
+    const cfg = rowsToPaymentConfig([{ key: 'flash_enabled', value: '0' }], { flashConfigured: true })
+    assert.deepEqual(cfg.available_methods, [])
+  })
+
+  test('Flash alone is enough to be payable', () => {
+    const cfg = rowsToPaymentConfig([{ key: 'flash_enabled', value: '1' }], { flashConfigured: true })
+    assert.deepEqual(cfg.available_methods, ['flash'])
+    assert.equal(isPaymentConfigured(cfg), true)
   })
 })

@@ -48,11 +48,16 @@ npm run dev        # API at http://localhost:4000
 | —    | *(all auth routes above)* | A **blocked or removed** account is refused with **403 `{ error, accountStatus }`** — deliberately **without** `needsVerification`, so the apps show the message instead of routing to the OTP screen. See Account status below |
 | DELETE | `/api/local/admin/users/:id` | **410 Gone** — hard delete is retired. Block or remove the account in `/ops` → Users |
 | GET  | `/api/auth/logout` | Clear the auth cookie, then **302 to the relative `/explore`** (relative on purpose — the browser reaches this through the web app’s `/api/*` rewrite, so an absolute redirect built from `req.url` would point at this backend, which serves no pages) |
-| GET  | `/api/local/payment-config` | Every destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload, instapay_enabled, bank:{…}, available_methods}` |
+| GET  | `/api/local/payment-config` | Every destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload, instapay_enabled, bank:{…}, flash:{enabled, configured}, available_methods}` |
+| POST | `/api/local/bookings/[id]/flash-checkout` | Guest starts (or resumes) a **Flash** card/wallet checkout → `{status, paid, payment_link, expires_at, amount_cents, order_id}`. Open `payment_link` in a browser. Re-POSTing while the link is still good returns the **same** link, never a second order. `409 {code:'flash_unavailable'}` when Flash is off/unconfigured, `409 {code:'not_payable'}` when the booking can't be paid, `400 {code:'below_minimum'}` under 5 EGP, `502 {code:'flash_error'}` when Flash refuses. See *Flash — the automatic way to pay* |
+| GET  | `/api/local/bookings/[id]/flash-checkout` | Same shape, refreshed **from Flash** while the checkout is open — poll it after the guest returns from the checkout page and stop when `paid` is `true`. `status:'none'` before any checkout |
+| POST | `/api/local/payments/flash/webhook` | Flash's transaction callback. **Signed** (`signature` header, HMAC-SHA256 — `401` otherwise); the status is then re-read from Flash's API before anything is applied. `200` for an order we don't know |
 | GET  | `/api/local/admin/settings/instapay` | Read the same config for editing (both methods). Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/instapay` | Update the Instapay half — `{enabled?, instapay_handle?, instapay_link?, instapay_qr_image?, instructions?}`. Each field is optional: omit to leave untouched, send `""` to clear. `400` on an invalid link or QR |
 | GET  | `/api/local/admin/settings/bank` | Read the config (same payload as the Instapay route). Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/bank` | Update the bank-transfer half — `{enabled?, bank_name?, account_name?, account_number?, iban?, instructions?}`. `400` with the reason on a malformed account number or IBAN |
+| GET  | `/api/local/admin/settings/flash` | Read the config (same payload). Staff session with the `payments` module |
+| PUT  | `/api/local/admin/settings/flash` | `{enabled: boolean}` — the only Flash setting; credentials are env vars. Audited as `flash_updated` |
 | POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, doc_type, id_front, id_back, company?, notes?}`. **The ID documents are required** (`doc_type` + both sides, as `data:image/…` URLs) unless the applicant's identity is already `verified` or `pending`, in which case they are omitted and the application is linked to the submission on file; they are filed as a pending `id_verifications` row (`source='host_application'`) so one admin decision covers host status and identity. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review |
 | PATCH | `/api/local/host/listings/[id]/visibility` | **The host takes their own listing off the market, or puts it back** — `{is_published: false\|true}` → `{id, is_published, unpublished_by_host, declined_requests, blocked_by, blocked_message, listing}`. There is no host-facing DELETE and there will not be one; see *A host removes a listing by hiding it* below. Deactivating also **declines every booking request still waiting on this host** (`declined_requests` says how many) through the same path a manual decline uses, so each guest gets the ordinary notification. Reactivating clears only the host's own flag: when an account block, the identity gate or the review queue still holds the listing down, `blocked_by` names it (`verification` \| `staff` \| `rejected` \| `under_review`) and `is_published` comes back **false**. 401 unsigned, 403 not the host |
 | PATCH | `/api/local/host/services/[id]/visibility` | The same, for one of the host's standalone services. Declines every pending request. Services have no moderation queue and no identity gate, so a reactivate always goes live and there is no `blocked_by` |
@@ -375,6 +380,52 @@ if one is set, else the handle) — the web with `qrcode.react`, iOS with CoreIm
 a guest always has something to scan. Nothing is stored twice: `qr_payload`,
 `bank.iban_formatted`, `bank.configured` and `available_methods` are all derived on
 read, never persisted.
+
+### Flash — the automatic way to pay
+
+Instapay and bank transfer are manual: the guest sends money elsewhere and uploads a
+screenshot an admin reviews. **Flash** (useflash.app) is the third method and the only
+automatic one — a hosted card / wallet / Valu checkout that confirms itself.
+
+1. The guest picks Flash; the client `POST`s `/bookings/:id/flash-checkout`.
+2. The backend creates a Flash order for the booking's **commission-inclusive**
+   `total_price` (in piastres), stores it in `flash_orders`, and returns `payment_link`.
+3. The client opens the link (`webEnabled: true` — no Flash app needed). Flash's API
+   has no return URL, so the client simply polls `GET …/flash-checkout` when the guest
+   comes back.
+4. The booking flips to `payment_status='paid'`, `payment_method='flash'`, `paid_at` —
+   from whichever arrives first: the webhook or the poll. The guest and host are
+   notified **once**.
+
+Rules worth not re-deriving (all in `flash-core.ts`, unit-tested):
+
+- **Off until switched on.** Unlike the manual methods, a missing `flash_enabled` row
+  reads as OFF, so setting `FLASH_*` in an environment never by itself starts charging
+  cards. It is offered only when enabled **and** all four credentials are present, and
+  it leads `available_methods` because it confirms instantly.
+- **One id per attempt.** `aggregatorOrderId` is `qk-<booking>-<time>-<nonce>`. Flash
+  staging was seen to accept a duplicate id silently (despite documenting
+  `DUPLICATE_ORDER`), so ids are never reused. Starting a new checkout cancels the
+  previous pending one first, so there is only ever one payable link per booking; an
+  open link for the same amount with more than 5 minutes left is handed back instead.
+- **Links live 30 minutes** — the amount is the booking's price at minting time.
+- **Money only moves forward.** `succeeded` can only become `refunded`; a late
+  `pending` from a slow poll can't un-pay a booking. A success that arrives after we
+  marked an order expired or cancelled still counts.
+- **The webhook is a doorbell.** It must carry a valid signature (flatten the JSON,
+  drop empties, sort keys, join `k=v` with commas, HMAC-SHA256 hex — the test pins
+  Flash's own worked example byte for byte), and even then the status is re-read from
+  `GET /v1/orders/aggregator/:id`. A `paidAmountCents` below the order is treated as a
+  failure.
+- **`customer` needs a phone.** Flash rejects a `customer` object without one
+  (`invalid: phone (field required)`), so it is omitted for guests with no number.
+- **Refunds are not wired yet.** Flash has `POST /v1/orders/refund`; cancellations
+  still go through the existing manual refund process.
+
+The callback URL to give Flash is
+`https://quickin-backend.vercel.app/api/local/payments/flash/webhook`. Payments work
+without it (the poll settles them), but the webhook confirms a guest who closes the app
+before returning.
 
 ## The address has to be one mail can reach
 
@@ -1082,6 +1133,10 @@ host why it disappeared and still pings /ops.
 | `DATABASE_URL` | yes | Postgres connection string. Falls back to `postgresql://ahmedfarahat@127.0.0.1:5432/quickin_local` for local dev. Managed Postgres (Neon/Vercel/RDS) uses TLS automatically. |
 | `AUTH_SECRET` | yes (prod) | Secret used to HMAC-sign auth tokens. Defaults to a dev secret — set a real one in production. |
 | `GOOGLE_CLIENT_ID` | optional | Enables `/api/auth/google` (Google ID-token audience). |
+| `FLASH_CLIENT_ID` / `FLASH_CLIENT_SECRET` | for Flash | Flash API client credentials (Basic auth for `POST /v1/auth/token`). |
+| `FLASH_INTEGRATION_ID` | for Flash | The numeric integration id Flash assigned (one per payment method — Flash and Instapay-via-Flash have different ids). |
+| `FLASH_HMAC_SECRET` | for Flash | Verifies webhook signatures. Without it Flash counts as **unconfigured** — an automatic method we can't authenticate isn't offered. |
+| `FLASH_BASE_URL` | optional | Defaults to production `https://beta-api.useflash.app`. Staging is `https://stg-api.useflash.app`. **All four credentials above must be set** or Flash stays out of `available_methods` whatever the admin toggle says. |
 | `BLOB_READ_WRITE_TOKEN` | optional | Vercel Blob store for listing photos. Injected automatically when a Blob store is linked to the project; locally via `vercel env pull`. **Unset is a supported state** — photos then keep being stored inline as data URLs, exactly as they were before. See [Listing photos live in Blob, not in the database](#listing-photos-live-in-blob-not-in-the-database). |
 
 ## Run the whole stack locally
@@ -2300,6 +2355,7 @@ the list of record. Recent additions:
 | `migrate-resorts.mjs` | `resorts`, `resort_aliases`, `resort_submissions`, `listings.resort_id`/`resort_name` — the curated compound catalog that replaces free-text location as the geographic filter |
 | `migrate-analytics.mjs` | `bookings.cancelled_by`/`cancelled_by_role`/`cancellation_policy`/`commission_rate`/`refunded_at`, the `platform_commission_rate` setting, and the analytics indexes |
 | `migrate-instapay.mjs` | `app_settings`, `payment_proofs`, and the four seeded `instapay_*` setting rows |
+| `migrate-flash.mjs` | `flash_orders` (one row per Flash checkout attempt) and the `flash_enabled = '0'` setting. Run it **before** deploying the Flash routes — they read the table |
 | `migrate-host-verification.mjs` | `id_verifications.doc_type`, `host_applications.verification_id` (links an application to the ID filed with it), `listings.unpublished_by_verification`, and the host verification-status index. Also **reports** how many approved hosts are unverified and how many live listings they hold — read that before deploying, since the gate is a hard cutover |
 | `migrate-commission.mjs` | Makes the platform commission safe on any database: creates `app_settings` if absent, seeds `platform_commission_rate`, adds `bookings.commission_rate` — and backfills it on **every** booking, not just paid ones (`migrate-analytics.mjs` only did the paid ones, which was fine when the column was a reporting field and is not now that guest prices derive from it) |
 | `migrate-activity.mjs` | `user_logins` (the one activity event nothing recorded) plus timestamp indexes on `users`/`listings`/`payment_proofs` and a partial index on open reports — the derived activity feed and alert centre in `/ops` |

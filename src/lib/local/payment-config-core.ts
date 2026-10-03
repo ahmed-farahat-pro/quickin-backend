@@ -1,10 +1,14 @@
 // Pure payment-destination logic: the app_settings keys that make up every
 // guest-facing way to pay, plus the validators the admin PUT routes run.
 //
-// There are two destinations, each independently toggleable from /ops/payments:
+// There are three methods, each independently toggleable from /ops/payments:
 //   • instapay      — a handle, an optional deep link and an optional QR
 //   • bank_transfer — a bank name, an account holder, an account number and an
 //                     optional IBAN
+//   • flash         — AUTOMATIC: a hosted card/wallet checkout (useflash.app).
+//                     Nothing to configure here but the toggle; its credentials
+//                     are server env vars, so whether it is `configured` is
+//                     passed in by the caller (see rowsToPaymentConfig).
 //
 // No runtime imports, so `node --test` can import this file directly — see
 // CLAUDE.md → "Standing requirement — docs and tests". db.ts imports this
@@ -18,23 +22,36 @@
 // write the same Neon rows. scripts/check-payment-config-core-parity.mjs fails
 // if they drift, so edit one copy and paste it over the other verbatim.
 
-/** The ways a guest can pay. `payment_proofs.method` stores one of these. */
-export const PAYMENT_METHODS = ['instapay', 'bank_transfer'] as const
+/** The ways a guest can pay. `bookings.payment_method` stores one of these. */
+export const PAYMENT_METHODS = ['instapay', 'bank_transfer', 'flash'] as const
 export type PaymentMethod = (typeof PAYMENT_METHODS)[number]
+
+/**
+ * The methods paid by uploading a transfer screenshot an admin reviews.
+ * `payment_proofs.method` stores one of THESE — never 'flash', which confirms
+ * itself and has no screenshot.
+ */
+export const MANUAL_PAYMENT_METHODS = ['instapay', 'bank_transfer'] as const
+export type ManualPaymentMethod = (typeof MANUAL_PAYMENT_METHODS)[number]
 
 export function isPaymentMethod(value: unknown): value is PaymentMethod {
   return (PAYMENT_METHODS as readonly string[]).includes(String(value))
 }
 
+export function isManualPaymentMethod(value: unknown): value is ManualPaymentMethod {
+  return (MANUAL_PAYMENT_METHODS as readonly string[]).includes(String(value))
+}
+
 /**
- * The method a client claims it used. Anything unrecognised falls back to
- * 'instapay' — the column is plain text with no CHECK constraint, and a typo
- * from an old client should land on the original method rather than poison the
- * queue with a value no reviewer's UI knows how to label.
+ * The method a client claims it used for a SCREENSHOT. Anything unrecognised
+ * falls back to 'instapay' — the column is plain text with no CHECK constraint,
+ * and a typo from an old client should land on the original method rather than
+ * poison the queue with a value no reviewer's UI knows how to label. 'flash' is
+ * unrecognised here on purpose: a screenshot is never a Flash payment.
  */
-export function normalizePaymentMethod(value: unknown): PaymentMethod {
+export function normalizePaymentMethod(value: unknown): ManualPaymentMethod {
   const v = String(value ?? '').trim().toLowerCase()
-  return isPaymentMethod(v) ? v : 'instapay'
+  return isManualPaymentMethod(v) ? v : 'instapay'
 }
 
 /** The app_settings rows that make up the Instapay destination. */
@@ -56,10 +73,16 @@ export const BANK_KEYS = {
   instructions: 'bank_instructions',
 } as const
 
+/** The app_settings rows for Flash — only the toggle; credentials are env vars. */
+export const FLASH_KEYS = {
+  enabled: 'flash_enabled',
+} as const
+
 /** Every key getPaymentConfig() reads in one query. */
 export const PAYMENT_SETTING_KEYS: readonly string[] = [
   ...Object.values(INSTAPAY_KEYS),
   ...Object.values(BANK_KEYS),
+  ...Object.values(FLASH_KEYS),
 ]
 
 export const MAX_HANDLE_CHARS = 200
@@ -89,6 +112,13 @@ export interface BankConfig {
   configured: boolean
 }
 
+export interface FlashConfig {
+  /** Whether the admin switched it on. Unlike the manual methods, OFF when never set. */
+  enabled: boolean
+  /** Whether the server holds Flash credentials. Decided by the caller, not by a row. */
+  configured: boolean
+}
+
 export interface PaymentConfig {
   /** The Instapay address/number guests transfer to, e.g. `someone@instapay`. */
   instapay_handle: string
@@ -101,6 +131,7 @@ export interface PaymentConfig {
   qr_payload: string
   instapay_enabled: boolean
   bank: BankConfig
+  flash: FlashConfig
   /**
    * The methods to offer, in the order to offer them: enabled AND configured.
    * A client should render a picker from this and never hardcode the list — that
@@ -329,8 +360,20 @@ export function bankConfigGap(b: BankFields): string {
 
 // ---- Assembly ---------------------------------------------------------------
 
+export interface PaymentConfigOptions {
+  /**
+   * Whether the server has Flash credentials (FLASH_* env vars). Only the backend
+   * can know; it defaults to false so any caller that doesn't say never offers a
+   * method it couldn't complete.
+   */
+  flashConfigured?: boolean
+}
+
 /** Build the guest-facing config from raw `app_settings` rows (missing ⇒ ''). */
-export function rowsToPaymentConfig(rows: Array<{ key: string; value: string | null }>): PaymentConfig {
+export function rowsToPaymentConfig(
+  rows: Array<{ key: string; value: string | null }>,
+  opts: PaymentConfigOptions = {},
+): PaymentConfig {
   const map: Record<string, string> = {}
   for (const r of rows) map[r.key] = r.value ?? ''
   const has = (k: string) => Object.prototype.hasOwnProperty.call(map, k)
@@ -361,6 +404,13 @@ export function rowsToPaymentConfig(rows: Array<{ key: string; value: string | n
     qr_payload: qrPayload(instapay_handle, instapay_link),
     instapay_enabled: storedToBool(has(INSTAPAY_KEYS.enabled) ? map[INSTAPAY_KEYS.enabled] : ''),
     bank,
+    flash: {
+      // A NEW method, so a missing row is OFF — the opposite of the manual
+      // methods' rule, which exists only because they predate their toggles.
+      // Setting FLASH_* in an environment must not by itself start charging cards.
+      enabled: (map[FLASH_KEYS.enabled] ?? '').trim() !== '' && storedToBool(map[FLASH_KEYS.enabled]),
+      configured: Boolean(opts.flashConfigured),
+    },
     available_methods: [],
   }
   cfg.available_methods = availableMethods(cfg)
@@ -372,9 +422,13 @@ export function isInstapayConfigured(cfg: PaymentConfig): boolean {
   return Boolean(cfg.instapay_handle || cfg.instapay_link)
 }
 
-/** Enabled AND configured, in the order the clients render the picker. */
+/**
+ * Enabled AND configured, in the order the clients render the picker. Flash
+ * leads: it confirms instantly, so it is the best default when it is on.
+ */
 export function availableMethods(cfg: PaymentConfig): PaymentMethod[] {
   const out: PaymentMethod[] = []
+  if (cfg.flash?.enabled && cfg.flash.configured) out.push('flash')
   if (cfg.instapay_enabled && isInstapayConfigured(cfg)) out.push('instapay')
   if (cfg.bank.enabled && cfg.bank.configured) out.push('bank_transfer')
   return out

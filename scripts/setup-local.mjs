@@ -87,6 +87,7 @@ const MIGRATIONS = [
   'migrate-payout-methods.mjs',
   'migrate-id-change-requests.mjs',
   'migrate-listing-review-note.mjs',
+  'migrate-flash.mjs',
 ]
 
 const pool = new pg.Pool({ connectionString: url, ssl: isLocal ? false : { rejectUnauthorized: false } })

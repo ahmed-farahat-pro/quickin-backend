@@ -43,6 +43,7 @@ import { isContactBlockedError } from './contentguard'
 import { guardContent, guardSplitContent } from './moderation'
 import { PAYMENT_SETTING_KEYS, normalizePaymentMethod, rowsToPaymentConfig } from './payment-config-core'
 import type { PaymentConfig } from './payment-config-core'
+import { isFlashConfigured } from './flash'
 import { rowToPayoutMethod } from './payout-method-core'
 import { needsIdentityDocuments, normalizeVerificationStatus, revokesListingPrivileges } from './host-verification-core'
 import type { PayoutMethodRecord, PayoutMethodView } from './payout-method-core'
@@ -3295,7 +3296,9 @@ export async function getPaymentConfig(): Promise<PaymentConfig> {
     `SELECT key, value FROM app_settings WHERE key = ANY($1::text[])`,
     [PAYMENT_SETTING_KEYS]
   )
-  return rowsToPaymentConfig(rows as Array<{ key: string; value: string | null }>)
+  return rowsToPaymentConfig(rows as Array<{ key: string; value: string | null }>, {
+    flashConfigured: isFlashConfigured(),
+  })
 }
 
 /**
