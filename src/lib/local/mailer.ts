@@ -62,12 +62,12 @@ function otpEmailHtml(code: string): string {
   <div style="background:#F6F1E6;padding:32px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
     <div style="max-width:460px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;border:1px solid #EFE6D8">
       <div style="background:#5B0F16;padding:22px 28px">
-        <span style="color:#F6F1E6;font-size:22px;font-weight:700;letter-spacing:.5px">QuickIn</span>
+        <span style="color:#F6F1E6;font-size:22px;font-weight:700;letter-spacing:.5px">Quick In</span>
       </div>
       <div style="padding:28px">
         <h1 style="margin:0 0 8px;color:#2A2220;font-size:20px">Verify your email</h1>
         <p style="margin:0 0 22px;color:#6B6055;font-size:14px;line-height:1.5">
-          Enter this code to finish creating your QuickIn account. It expires in 10 minutes.
+          Enter this code to finish creating your Quick In account. It expires in 10 minutes.
         </p>
         <div style="text-align:center;margin:0 0 22px">
           <span style="display:inline-block;background:#EFE6D8;color:#5B0F16;font-size:32px;font-weight:700;letter-spacing:10px;padding:14px 24px;border-radius:14px">${code}</span>
@@ -94,10 +94,10 @@ export async function sendOtpEmail(to: string, code: string): Promise<void> {
   }
   try {
     const info = await getTransporter().sendMail({
-      from: `QuickIn <${FROM}>`,
+      from: `Quick In <${FROM}>`,
       to,
-      subject: `Your QuickIn verification code: ${code}`,
-      text: `Your QuickIn verification code is ${code}. It expires in 10 minutes.`,
+      subject: `Your Quick In verification code: ${code}`,
+      text: `Your Quick In verification code is ${code}. It expires in 10 minutes.`,
       html: otpEmailHtml(code),
     })
     console.log(`[mailer] OTP emailed to ${to} via ${HOST}:${PORT} (messageId ${info.messageId})`)
@@ -119,7 +119,7 @@ function brandedHtml(heading: string, paragraphs: string[], cta?: { label: strin
   <div style="background:#E4DECF;padding:32px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
     <div style="max-width:460px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;border:1px solid #EFE6D8">
       <div style="background:linear-gradient(135deg,#5B0F16,#8a2530);padding:22px 28px">
-        <span style="color:#F6F1E6;font-size:22px;font-weight:700;letter-spacing:.5px">QuickIn</span>
+        <span style="color:#F6F1E6;font-size:22px;font-weight:700;letter-spacing:.5px">Quick In</span>
       </div>
       <div style="padding:28px">
         <h1 style="margin:0 0 12px;color:#2A2220;font-size:20px">${heading}</h1>
@@ -148,7 +148,7 @@ export async function sendNotificationEmail(
   }
   try {
     await getTransporter().sendMail({
-      from: `QuickIn <${FROM}>`,
+      from: `Quick In <${FROM}>`,
       to,
       subject,
       text: `${heading}\n\n${paragraphs.join('\n\n')}${cta ? `\n\n${cta.label}: ${cta.url}` : ''}`,

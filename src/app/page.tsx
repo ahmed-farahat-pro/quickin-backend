@@ -1,4 +1,4 @@
-// QuickIn API — status / index page (server component).
+// Quick In API — status / index page (server component).
 // Lists the available endpoints. Plain inline styles, no external CSS.
 
 const BURGUNDY = '#5B0F16'
@@ -44,7 +44,7 @@ export default function Home() {
     >
       <div style={{ maxWidth: 760, margin: '0 auto' }}>
         <h1 style={{ margin: 0, fontSize: 36, color: BURGUNDY, letterSpacing: '-0.02em' }}>
-          QuickIn <span style={{ fontWeight: 400, color: INK }}>API</span>
+          Quick In <span style={{ fontWeight: 400, color: INK }}>API</span>
         </h1>
         <p style={{ color: MUTED, fontSize: 15, marginTop: 8 }}>
           Standalone backend — listings, bookings &amp; auth over node-postgres. No Supabase.

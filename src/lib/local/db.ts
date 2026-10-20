@@ -201,7 +201,7 @@ export interface Listing {
   listing_images: ListingImage[]
 }
 
-// The coarse, host-picked areas QuickIn covers. The host chooses one of these
+// The coarse, host-picked areas Quick In covers. The host chooses one of these
 // first; search can filter by it (chips) and it's matched by free-text too.
 export const REGIONS = ['North Coast', 'Ain Sokhna', 'El Gouna', 'Cairo'] as const
 export type Region = (typeof REGIONS)[number]
@@ -1168,7 +1168,7 @@ export async function createBooking(input: CreateBookingInput): Promise<Booking>
     if (hostEmail) {
       await sendNotificationEmail(
         hostEmail,
-        'New booking request — QuickIn',
+        'New booking request — Quick In',
         'You have a new booking request',
         [
           `${booking.guests} guest(s) requested <strong>${booking.title}</strong>.`,
@@ -2873,7 +2873,7 @@ export interface HostVisibilityResult {
 /**
  * The host takes their own listing off the market, or puts it back.
  *
- * This is QuickIn's answer to "delete my listing": there is no host-facing
+ * This is Quick In's answer to "delete my listing": there is no host-facing
  * DELETE and there is not going to be one. Bookings, reviews, payments, messages
  * and the stay guide all hang off this listing id; deleting the row would cascade
  * through every one of them and erase a guest's completed stay along with it. So
@@ -3122,7 +3122,7 @@ export async function setBookingStatus(
         // have confirmed the transfer (see isLiveStayPass).
         await sendNotificationEmail(
           guestEmail,
-          'Your host accepted your reservation 🎉 — QuickIn',
+          'Your host accepted your reservation 🎉 — Quick In',
           'Your host accepted — one step left',
           [
             `Your host accepted your reservation at <strong>${updated.title}</strong>.`,
@@ -3135,7 +3135,7 @@ export async function setBookingStatus(
       } else {
         await sendNotificationEmail(
           guestEmail,
-          'Update on your reservation — QuickIn',
+          'Update on your reservation — Quick In',
           'Your request wasn’t accepted',
           [
             `Unfortunately your request for <strong>${updated.title}</strong> wasn’t accepted this time.`,
@@ -3348,7 +3348,7 @@ export async function submitPaymentProof(
   if (booking) {
     // The GUEST is told their part is done. This used to notify only the host, with
     // "Payment to review" and a link to /host — but hosts no longer confirm transfers
-    // (the money goes to QuickIn's account, and an admin decides), so that message
+    // (the money goes to Quick In's account, and an admin decides), so that message
     // asked them to do something they can't. The host is still told money arrived.
     await createNotification(userId, {
       type: 'payment_submitted',
@@ -3360,7 +3360,7 @@ export async function submitPaymentProof(
       await createNotification(booking.host_id, {
         type: 'payment_submitted',
         title: 'Guest sent a payment',
-        body: `${booking.title} — QuickIn is confirming the transfer`,
+        body: `${booking.title} — Quick In is confirming the transfer`,
         link: '/host',
       })
       await sendPush(booking.host_id, {
@@ -4376,8 +4376,8 @@ export async function getPayoutMethod(userId: string): Promise<PayoutMethodView 
  * Save the host's chosen destination, replacing whatever was there.
  *
  * `record` must come from validatePayout — that is what guarantees the fields of
- * the other two methods are cleared rather than carried over. Upsert on user_id:
- * a host has one payout method, and switching from a bank account to a wallet
+ * the other method are cleared rather than carried over. Upsert on user_id:
+ * a host has one payout method, and switching from a bank account to InstaPay
  * rewrites the row rather than adding one.
  */
 export async function savePayoutMethod(
@@ -5763,14 +5763,14 @@ export async function getAuditLog(
   return { entries: rows.slice(0, filter.limit) as AuditEntry[], hasMore }
 }
 
-/** How many listings and services the current rate is repricing. Shown on the
- *  admin screen so an operator sees the blast radius before they change it. */
-export async function getCommissionImpact(): Promise<{ listings: number; services: number }> {
+/** How many listings the current rate is repricing. Shown on the admin screen so
+ *  an operator sees the blast radius before they change it. (Services were
+ *  removed 2026-10-20, so they are no longer counted.) */
+export async function getCommissionImpact(): Promise<{ listings: number }> {
   const { rows } = await pool.query(
-    `SELECT (SELECT count(*) FROM listings WHERE is_published = true)::int AS listings,
-            (SELECT count(*) FROM services WHERE is_published = true)::int AS services`
+    `SELECT (SELECT count(*) FROM listings WHERE is_published = true)::int AS listings`
   )
-  return { listings: Number(rows[0]?.listings ?? 0), services: Number(rows[0]?.services ?? 0) }
+  return { listings: Number(rows[0]?.listings ?? 0) }
 }
 
 /** The admin queue. Defaults to the applications still awaiting a decision;

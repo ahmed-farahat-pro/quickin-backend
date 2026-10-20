@@ -1,16 +1,17 @@
 import { NextResponse } from 'next/server'
-import { getServices, createService } from '@/lib/local/services'
-import { getUserFromRequest } from '@/lib/local/auth'
 
-// Services — standalone experiences a host offers (jet ski, diving, tours…).
-//   GET  /api/local/services → all published services (browse)
-//   POST /api/local/services → a host (or admin) posts a service
+// GONE. Services (host-posted experiences — jet ski, diving, tours — that guests
+// requested) were removed on 2026-10-20. App builds already installed on phones
+// still call this route, so it answers 410 with a sentence they can show instead
+// of a bare 404. The `services` / `service_requests` tables are kept, dormant:
+// nothing reads or writes them any more, and no row was changed or cancelled.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Cache-Control': 'no-store',
 }
+const GONE = { error: 'Services have been removed' }
 
 export async function OPTIONS() {
   return new Response(null, {
@@ -24,39 +25,9 @@ export async function OPTIONS() {
 }
 
 export async function GET() {
-  try {
-    const services = await getServices()
-    return NextResponse.json(services, { headers: CORS })
-  } catch (err) {
-    console.error('GET /api/local/services failed:', err)
-    return NextResponse.json({ error: 'Failed to load services', detail: String(err) }, { status: 500, headers: CORS })
-  }
+  return NextResponse.json(GONE, { status: 410, headers: CORS })
 }
 
-// A host posts a service. Requires a signed-in user with role 'host' (or 'admin').
-export async function POST(req: Request) {
-  try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Please sign in' }, { status: 401, headers: CORS })
-    if (user.role !== 'host' && user.role !== 'admin') {
-      return NextResponse.json({ error: 'Only hosts can post a service. Register as a host first.' }, { status: 403, headers: CORS })
-    }
-    const b = await req.json()
-    const service = await createService(user.id, {
-      title: b.title,
-      description: b.description,
-      category: b.category,
-      location: b.location,
-      price: Number(b.price ?? 0),
-      imageUrl: b.image_url ?? b.imageUrl,
-      lat: b.lat,
-      lng: b.lng,
-    })
-    return NextResponse.json(service, { status: 201, headers: CORS })
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error('POST /api/local/services failed:', msg)
-    const status = /required|negative|Invalid/i.test(msg) ? 400 : 500
-    return NextResponse.json({ error: msg }, { status, headers: CORS })
-  }
+export async function POST() {
+  return NextResponse.json(GONE, { status: 410, headers: CORS })
 }

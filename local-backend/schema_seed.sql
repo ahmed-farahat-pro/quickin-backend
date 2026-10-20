@@ -1,5 +1,5 @@
 -- =============================================================================
--- QuickIn LOCAL (no Supabase) — plain PostgreSQL schema + dummy data
+-- Quick In LOCAL (no Supabase) — plain PostgreSQL schema + dummy data
 -- Run against the quickin_local database.
 -- =============================================================================
 

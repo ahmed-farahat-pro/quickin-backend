@@ -3,21 +3,18 @@ import { deleteEntity, updateUserRole, adminSetBookingStatus, adminSetListingPub
 import { requireStaff, staffActor, logStaffAction, clientIpOf, type StaffModule } from '@/lib/local/staff'
 
 // DELETE /api/local/admin/:entity/:id — admin removes any row.
-//   entity ∈ users | listings | bookings | services | service-requests
+//   entity ∈ users | listings | bookings  (services / service-requests were removed
+//   2026-10-20 and now answer 400 "Unknown entity"; their rows are kept)
 export const dynamic = 'force-dynamic'
 
 // Which staff module owns each entity. Unlike every other admin route, the
 // permission here depends on the path parameter, so the gate can only run after
 // `await ctx.params` — and an unrecognised entity must be rejected BEFORE the gate,
 // or a typo would be checked against the wrong permission.
-// services / service-requests have no /ops module of their own yet; they're gated by
-// their nearest owner (a service is a host listing, a request is a booking).
 const ENTITY_MODULE: Record<string, StaffModule> = {
   users: 'users',
   listings: 'listings',
   bookings: 'bookings',
-  services: 'listings',
-  'service-requests': 'bookings',
 }
 const CORS = {
   'Access-Control-Allow-Origin': '*',

@@ -2,8 +2,8 @@
 import type { ReactNode } from 'react'
 
 export const metadata = {
-  title: 'QuickIn API',
-  description: 'Standalone backend API for QuickIn — listings, bookings, and auth.',
+  title: 'Quick In API',
+  description: 'Standalone backend API for Quick In — listings, bookings, and auth.',
 }
 
 export default function RootLayout({ children }: { children: ReactNode }) {

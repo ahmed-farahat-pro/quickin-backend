@@ -2,8 +2,8 @@ import { NextResponse } from 'next/server'
 import { getAdminOverview } from '@/lib/local/admin'
 import { requireStaff } from '@/lib/local/staff'
 
-// GET /api/local/admin/overview → everything (users, listings, bookings, services,
-// service-requests + counts). Admin only.
+// GET /api/local/admin/overview → everything (users, listings, bookings, device
+// tokens + counts). Admin only. Services were removed 2026-10-20.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',

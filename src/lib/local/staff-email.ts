@@ -38,7 +38,7 @@ export async function sendStaffResetEmail(to: string, code: string, minutes: num
   try {
     await sendNotificationEmail(
       String(to),
-      'Reset your QuickIn admin password',
+      'Reset your Quick In admin password',
       'Admin password reset',
       [
         `Your admin password reset code is <strong style="font-size:20px;letter-spacing:3px;color:#5B0F16">${String(code)}</strong>.`,

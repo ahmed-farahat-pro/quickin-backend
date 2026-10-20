@@ -1,5 +1,5 @@
 -- =============================================================================
--- QuickIn PRODUCTION DB INIT  (run once against your Vercel/Neon Postgres)
+-- Quick In PRODUCTION DB INIT  (run once against your Vercel/Neon Postgres)
 -- Creates all tables + seeds the demo listings. Users are created on sign-up.
 --   psql "$DATABASE_URL" -f local-backend/init.sql
 -- =============================================================================
@@ -77,7 +77,7 @@ CREATE INDEX IF NOT EXISTS idx_bookings_listing ON bookings(listing_id);
 -- the booking is pending and is assigned ONCE, at the confirmation transition —
 -- no code ⇒ no QR, no wallet pass, no /stay/<code> page.
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS host_id uuid REFERENCES users(id);
--- The host's own takedown — QuickIn has no host-facing DELETE, so "remove my
+-- The host's own takedown — Quick In has no host-facing DELETE, so "remove my
 -- listing" is a reversible unpublish. Its own flag because four parties can hold
 -- a listing down (host, operator, account block, identity gate) and each may only
 -- release its own grip. See src/lib/local/host-visibility-core.ts.

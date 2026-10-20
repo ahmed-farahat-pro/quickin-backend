@@ -100,7 +100,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ bookingId: stri
   // 1. Resolve signing material (env base64, else committed PEM files) + metadata.
   const passTypeId = envStr('PASS_TYPE_ID') || 'pass.com.quick'
   const teamId = envStr('PASS_TEAM_ID') || '97DNR5Y3Y5'
-  const orgName = envStr('PASS_ORG_NAME') || 'QuickIn'
+  const orgName = envStr('PASS_ORG_NAME') || 'Quick In'
   const signing = loadSigning()
   if (!signing) {
     return NextResponse.json({ error: 'Wallet pass not configured' }, { status: 501, headers: CORS })
@@ -147,7 +147,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ bookingId: stri
       signing,
       {
         organizationName: orgName,
-        description: 'QuickIn reservation',
+        description: 'Quick In reservation',
         passTypeIdentifier: passTypeId,
         teamIdentifier: teamId,
         serialNumber: booking.id,

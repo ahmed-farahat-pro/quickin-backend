@@ -61,7 +61,7 @@ export async function POST(req: Request) {
         {
           role: 'system',
           content:
-            'You write warm, vivid, honest vacation-rental listing descriptions for QuickIn (boutique stays in Egypt). ' +
+            'You write warm, vivid, honest vacation-rental listing descriptions for Quick In (boutique stays in Egypt). ' +
             'Write 2 short paragraphs (~90-130 words total), guest-facing, second person, evocative but not exaggerated. ' +
             'Do not invent amenities, prices, or exact addresses. Match the language of the input (Arabic or English). Return only the description text.',
         },

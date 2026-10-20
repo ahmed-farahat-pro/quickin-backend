@@ -1,3 +1,4 @@
+// NOTE: the Services feature was removed 2026-10-20 (routes answer 410); these tables are kept dormant — kept here as history.
 // Adds the services + service_requests tables (a "booking system" for standalone
 // experiences: host posts a service, user requests it, host accepts). Idempotent.
 //   node quickin-backend/scripts/migrate-services.mjs

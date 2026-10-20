@@ -242,7 +242,7 @@ describe('ordinary chat — allowed', () => {
 })
 
 describe('allowed links', () => {
-  // A map pin and QuickIn's own pages have to keep working — the guard is about
+  // A map pin and Quick In's own pages have to keep working — the guard is about
   // leaving the platform, not about links as such.
   const cases = [
     'the location pin: https://maps.app.goo.gl/xY12ab',

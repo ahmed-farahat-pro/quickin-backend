@@ -117,7 +117,7 @@ export function buildOrderBody(i: FlashOrderInput): Record<string, unknown> {
     currency: 'EGP',
     orderType: 'online',
     webEnabled: true,
-    merchantName: 'QuickIn',
+    merchantName: 'Quick In',
     validity: i.validitySeconds ?? FLASH_ORDER_VALIDITY_SECONDS,
     description: String(i.description ?? '').slice(0, 200),
     additionalInfo,

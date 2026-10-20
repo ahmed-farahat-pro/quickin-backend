@@ -61,7 +61,7 @@ export async function POST(req: Request) {
           {
             role: 'system',
             content:
-              'You convert a traveler\'s natural-language request into JSON search filters for QuickIn (vacation rentals in Egypt). ' +
+              'You convert a traveler\'s natural-language request into JSON search filters for Quick In (vacation rentals in Egypt). ' +
               `Return ONLY a JSON object with any of these keys: q (string, leftover free text or place name), region (one of ${REGIONS.join(', ')}), ` +
               `guests (int), minPrice (int, EGP/night), maxPrice (int, EGP/night), propertyType (one of ${PROPERTY_TYPES.join(', ')}), ` +
               `amenities (array from: ${AMENITIES.join(', ')}). Omit keys you are unsure about. Map synonyms (e.g. "beachfront"→Beach access, "wifi"→WiFi).`,

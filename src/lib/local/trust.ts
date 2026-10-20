@@ -64,7 +64,7 @@ export async function setVerification(userId: string, approve: boolean): Promise
   })
   await sendPush(userId, {
     title: approve ? 'Identity verified ✓' : 'Verification update',
-    body: approve ? 'Your QuickIn account is now verified.' : 'Please resubmit your ID.',
+    body: approve ? 'Your Quick In account is now verified.' : 'Please resubmit your ID.',
     link: '/account',
   })
   return rows[0] as VerificationState

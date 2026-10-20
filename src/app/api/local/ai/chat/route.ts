@@ -1,6 +1,6 @@
 import { createTravelChatStream, hasOpenAIKey, type ChatMessage } from '@/lib/local/ai'
 
-// POST /api/local/ai/chat — the QuickIn AI travel concierge ("where to go in
+// POST /api/local/ai/chat — the Quick In AI travel concierge ("where to go in
 // Egypt?"). Body: { messages: [{ role: 'user' | 'assistant', content }] }.
 // Streams the reply back as Server-Sent Events:
 //   data: {"delta":"..."}\n\n   per token

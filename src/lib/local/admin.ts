@@ -57,28 +57,6 @@ export async function getAllBookings() {
   return rows
 }
 
-export async function getAllServices() {
-  const { rows } = await pool.query(
-    `SELECT s.id, s.title, s.category, s.location, s.price::float8 AS price,
-            s.host_id, u.email AS host_email, u.full_name AS host_name, s.created_at
-       FROM services s LEFT JOIN users u ON u.id = s.host_id
-      ORDER BY s.created_at DESC NULLS LAST`
-  )
-  return rows
-}
-
-export async function getAllServiceRequests() {
-  const { rows } = await pool.query(
-    `SELECT r.id, r.request_code, r.status, s.title AS service_title,
-            ru.email AS requester_email, r.created_at
-       FROM service_requests r
-       LEFT JOIN services s ON s.id = r.service_id
-       LEFT JOIN users ru ON ru.id = r.user_id
-      ORDER BY r.created_at DESC NULLS LAST`
-  )
-  return rows
-}
-
 /** Registered FCM/APNs device push tokens, with the owning account. */
 export async function getAllDeviceTokens() {
   const { rows } = await pool.query(
@@ -92,27 +70,23 @@ export async function getAllDeviceTokens() {
 
 /** Everything, in one shot, for the admin dashboard. */
 export async function getAdminOverview() {
-  const [users, listings, bookings, services, serviceRequests, deviceTokens] = await Promise.all([
+  // Services were removed 2026-10-20; their tables are kept dormant and are no
+  // longer listed here (nor deletable through deleteEntity below).
+  const [users, listings, bookings, deviceTokens] = await Promise.all([
     getAllUsers(),
     getAllListings(),
     getAllBookings(),
-    getAllServices(),
-    getAllServiceRequests(),
     getAllDeviceTokens(),
   ])
   return {
     users,
     listings,
     bookings,
-    services,
-    serviceRequests,
     deviceTokens,
     counts: {
       users: users.length,
       listings: listings.length,
       bookings: bookings.length,
-      services: services.length,
-      serviceRequests: serviceRequests.length,
       deviceTokens: deviceTokens.length,
     },
   }
@@ -123,14 +97,12 @@ const TABLES: Record<string, string> = {
   users: 'users',
   listings: 'listings',
   bookings: 'bookings',
-  services: 'services',
-  'service-requests': 'service_requests',
   'device-tokens': 'device_tokens',
 }
 
 /** Delete any row by entity slug + id. Deleting a user also removes the listings
  *  they host (whose bookings/images cascade), since listings.host_id has no
- *  ON DELETE CASCADE; the user's own bookings/services/requests cascade on delete. */
+ *  ON DELETE CASCADE; the user's own bookings cascade on delete. */
 export async function deleteEntity(entity: string, id: string): Promise<{ deleted: boolean }> {
   const table = TABLES[entity]
   if (!table) throw new Error('Unknown entity')
@@ -235,11 +207,11 @@ export async function adminSetListingPublished(
     if (email) {
       await sendNotificationEmail(
         email,
-        isPublished ? 'Your QuickIn listing is approved 🎉' : 'Your QuickIn listing was deactivated',
+        isPublished ? 'Your Quick In listing is approved 🎉' : 'Your Quick In listing was deactivated',
         isPublished ? 'Your listing is live' : 'Listing deactivated',
         [
           isPublished
-            ? `“${row.title}” has been approved and is now visible to guests on QuickIn.`
+            ? `“${row.title}” has been approved and is now visible to guests on Quick In.`
             : `“${row.title}” is temporarily hidden from guests.`,
         ],
         { label: 'Open host dashboard', url: `${WEB_URL}/host` }
@@ -288,8 +260,8 @@ export async function adminBroadcast(args: {
         u.email,
         title,
         title,
-        body ? [body] : ['You have a new update from QuickIn.'],
-        link ? { label: 'Open QuickIn', url: link.startsWith('http') ? link : `${WEB_URL}${link}` } : undefined
+        body ? [body] : ['You have a new update from Quick In.'],
+        link ? { label: 'Open Quick In', url: link.startsWith('http') ? link : `${WEB_URL}${link}` } : undefined
       )
       emailed++
     }

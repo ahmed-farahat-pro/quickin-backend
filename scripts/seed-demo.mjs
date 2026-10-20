@@ -1,6 +1,7 @@
 // QuickIn demo seeder — creates ready-to-use guest + host accounts (verified, known
 // password, with country), each host with real listings across the three regions
-// (North Coast / El Gouna / Ain Sokhna) + services, plus sample booking + subscription.
+// (North Coast / El Gouna / Ain Sokhna), plus a sample booking. (Services were
+// removed 2026-10-20 and are no longer seeded.)
 // Drives the SAME deployed API the apps use, then DB-approves + publishes the seeded
 // listings (since new listings now enter the moderation queue as pending).
 //
@@ -62,17 +63,13 @@ const IMG = {
   pool: 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=1200&q=80',
 }
 
-// Hosts (country Egypt), each with listings across the three regions + services.
+// Hosts (country Egypt), each with listings across the three regions.
 const HOSTS = [
   {
     email: 'host.nour@demo.quickin.app', name: 'Nour El-Din', country: 'Egypt',
     listings: [
       { title: 'Sahel Beach Villa', region: 'North Coast', location: 'Sidi Abdel Rahman, North Coast', price_per_night: 5200, max_guests: 6, bedrooms: 3, beds: 4, bathrooms: 2, property_type: 'Villa', lat: 30.95, lng: 28.75, image: IMG.villa, amenities: ['WiFi', 'Pool', 'Beach access', 'Air conditioning', 'Free parking'], cancellation_policy: 'moderate', weekly_discount: 10, monthly_discount: 20, weekend_price: 6800, monthly_prices: { 6: 7000, 7: 8500, 8: 9000, 9: 7500 } },
       { title: 'Marassi Marina Apartment', region: 'North Coast', location: 'Marassi, North Coast', price_per_night: 2800, max_guests: 4, bedrooms: 2, beds: 2, bathrooms: 2, property_type: 'Apartment', lat: 30.99, lng: 28.62, image: IMG.apt, amenities: ['WiFi', 'Pool', 'Air conditioning', 'TV'], cancellation_policy: 'flexible', weekly_discount: 5, monthly_discount: 15 },
-    ],
-    services: [
-      { title: 'Jet Ski Rental', category: 'Jet Ski', location: 'Sidi Abdel Rahman', price: 900, image: 'https://images.unsplash.com/photo-1530053969600-caed2596d242?w=1200&q=80' },
-      { title: 'Private Beach BBQ', category: 'Dining', location: 'North Coast', price: 1800, image: 'https://images.unsplash.com/photo-1555939594-58d7cb561ad1?w=1200&q=80' },
     ],
   },
   {
@@ -81,19 +78,12 @@ const HOSTS = [
       { title: 'El Gouna Lagoon House', region: 'El Gouna', location: 'El Gouna, Red Sea', price_per_night: 3400, max_guests: 4, bedrooms: 2, beds: 3, bathrooms: 2, property_type: 'House', lat: 27.3954, lng: 33.6781, image: IMG.lagoon, amenities: ['WiFi', 'Beach access', 'Air conditioning', 'Kitchen'], cancellation_policy: 'moderate', weekly_discount: 12, monthly_discount: 25 },
       { title: 'Abu Tig Marina Studio', region: 'El Gouna', location: 'Abu Tig Marina, El Gouna', price_per_night: 1900, max_guests: 2, bedrooms: 1, beds: 1, bathrooms: 1, property_type: 'Apartment', lat: 27.40, lng: 33.68, image: IMG.pool, amenities: ['WiFi', 'Pool', 'Air conditioning'], cancellation_policy: 'strict', weekly_discount: 8, monthly_discount: 18 },
     ],
-    services: [
-      { title: 'Scuba Diving Trip', category: 'Diving', location: 'El Gouna Reef', price: 1400, image: 'https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=1200&q=80' },
-      { title: 'Kitesurfing Lesson', category: 'Watersports', location: 'El Gouna', price: 1100, image: 'https://images.unsplash.com/photo-1502933691298-84fc14542831?w=1200&q=80' },
-    ],
   },
   {
     email: 'host.dina@demo.quickin.app', name: 'Dina Fouad', country: 'Egypt',
     listings: [
       { title: 'Ain Sokhna Sea-View Chalet', region: 'Ain Sokhna', location: 'Ain Sokhna, Suez', price_per_night: 2400, max_guests: 4, bedrooms: 2, beds: 2, bathrooms: 1, property_type: 'Chalet', lat: 29.6, lng: 32.35, image: IMG.chalet, amenities: ['WiFi', 'Beach access', 'Air conditioning', 'Free parking'], cancellation_policy: 'flexible', weekly_discount: 10, monthly_discount: 20 },
       { title: 'Porto Sokhna Marina Apartment', region: 'Ain Sokhna', location: 'Porto Sokhna', price_per_night: 1700, max_guests: 3, bedrooms: 1, beds: 2, bathrooms: 1, property_type: 'Apartment', lat: 29.58, lng: 32.36, image: IMG.apt, amenities: ['WiFi', 'Pool', 'TV'], cancellation_policy: 'moderate', weekly_discount: 7, monthly_discount: 14 },
-    ],
-    services: [
-      { title: 'Sunset Yacht Cruise', category: 'Boat', location: 'Ain Sokhna Marina', price: 3200, image: 'https://images.unsplash.com/photo-1605281317010-fe5ffe798166?w=1200&q=80' },
     ],
   },
   {
@@ -102,18 +92,12 @@ const HOSTS = [
       { title: 'Hacienda Bay Chalet', region: 'North Coast', location: 'Hacienda Bay, North Coast', price_per_night: 4100, max_guests: 5, bedrooms: 3, beds: 3, bathrooms: 2, property_type: 'Chalet', lat: 31.02, lng: 28.45, image: IMG.beach, amenities: ['WiFi', 'Pool', 'Beach access', 'Air conditioning', 'BBQ grill'], cancellation_policy: 'moderate', weekly_discount: 10, monthly_discount: 22 },
       { title: 'El Gouna Garden Villa', region: 'El Gouna', location: 'El Gouna, Red Sea', price_per_night: 4600, max_guests: 8, bedrooms: 4, beds: 5, bathrooms: 3, property_type: 'Villa', lat: 27.41, lng: 33.67, image: IMG.villa, amenities: ['WiFi', 'Pool', 'Kitchen', 'Air conditioning', 'Free parking', 'Washer'], cancellation_policy: 'strict', weekly_discount: 15, monthly_discount: 28, weekend_price: 5500, monthly_prices: { 12: 6500, 1: 6000, 7: 5800, 8: 5800 } },
     ],
-    services: [
-      { title: 'Private Chef Dinner', category: 'Dining', location: 'North Coast', price: 2500, image: 'https://images.unsplash.com/photo-1555244162-803834f70033?w=1200&q=80' },
-    ],
   },
   {
     email: 'host.youssef@demo.quickin.app', name: 'Youssef Adel', country: 'Egypt',
     listings: [
       { title: 'Stella Sokhna Family Chalet', region: 'Ain Sokhna', location: 'Stella Di Mare, Ain Sokhna', price_per_night: 2200, max_guests: 6, bedrooms: 3, beds: 4, bathrooms: 2, property_type: 'Chalet', lat: 29.45, lng: 32.39, image: IMG.chalet, amenities: ['WiFi', 'Pool', 'Beach access', 'Air conditioning'], cancellation_policy: 'flexible', weekly_discount: 8, monthly_discount: 16 },
       { title: 'Mountain View North Coast Apt', region: 'North Coast', location: 'Fouka Bay, North Coast', price_per_night: 3000, max_guests: 4, bedrooms: 2, beds: 2, bathrooms: 2, property_type: 'Apartment', lat: 31.07, lng: 28.10, image: IMG.apt, amenities: ['WiFi', 'Pool', 'Air conditioning', 'TV', 'Free parking'], cancellation_policy: 'moderate', weekly_discount: 10, monthly_discount: 20 },
-    ],
-    services: [
-      { title: 'Quad Bike Desert Safari', category: 'Adventure', location: 'Ain Sokhna', price: 1300, image: 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=1200&q=80' },
     ],
   },
 ]
@@ -122,8 +106,6 @@ async function cleanup() {
   const emails = [...GUESTS, ...HOSTS].map((x) => x.email)
   await pool.query(`delete from bookings where listing_id in (select id from listings where host_id in (select id from users where email = any($1)))`, [emails])
   await pool.query(`delete from listings where host_id in (select id from users where email = any($1))`, [emails])
-  await pool.query(`delete from service_requests where service_id in (select id from services where host_id in (select id from users where email = any($1)))`, [emails]).catch(() => {})
-  await pool.query(`delete from services where host_id in (select id from users where email = any($1))`, [emails]).catch(() => {})
   await pool.query(`delete from users where email = any($1)`, [emails])
 }
 
@@ -131,7 +113,7 @@ function esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
-function buildHtml(guests, hosts, sample, sub) {
+function buildHtml(guests, hosts, sample) {
   const guestRows = guests
     .map(
       (g) => `<tr><td><span class="pill pill-guest">Guest</span></td><td>${esc(g.name)}</td><td class="mono">${esc(g.email)}</td><td class="mono">${PASSWORD}</td><td>${esc(g.country)}</td></tr>`
@@ -140,16 +122,11 @@ function buildHtml(guests, hosts, sample, sub) {
   const hostRows = hosts
     .map((h) => {
       const ls = h.listings.map((l) => `${esc(l.title)} <span class="muted">(${esc(l.region)})</span>`).join('<br>')
-      const sv = (h.services || []).map((s) => `${esc(s.title)} <span class="muted">(EGP ${s.price})</span>`).join('<br>')
-      const svBlock = sv ? `<div class="muted" style="margin-top:8px;font-size:12px">Services: ${sv}</div>` : ''
-      return `<tr><td><span class="pill pill-host">Host</span></td><td>${esc(h.name)}</td><td class="mono">${esc(h.email)}</td><td class="mono">${PASSWORD}</td><td>${ls || '<span class="muted">—</span>'}${svBlock}</td></tr>`
+      return `<tr><td><span class="pill pill-host">Host</span></td><td>${esc(h.name)}</td><td class="mono">${esc(h.email)}</td><td class="mono">${PASSWORD}</td><td>${ls || '<span class="muted">—</span>'}</td></tr>`
     })
     .join('\n')
   const sampleNote = sample
     ? `<p class="note"><b>Sample booking seeded:</b> ${esc(sample.guest)} → ${esc(sample.listing)} (status <b>pending</b>) — log in as the host (${esc(sample.host)}) to chat &amp; confirm it.</p>`
-    : ''
-  const subNote = sub
-    ? `<p class="note"><b>Sample subscription seeded:</b> ${esc(sub.guest)} → ${esc(sub.service)} (status <b>pending</b>) — the host accepts it the same way as a booking.</p>`
     : ''
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QuickIn — Demo accounts</title>
@@ -185,13 +162,12 @@ function buildHtml(guests, hosts, sample, sub) {
   </header>
 
   ${sampleNote}
-  ${subNote}
 
   <div class="card">
-    <h2>Guests (book &amp; subscribe)</h2>
+    <h2>Guests (book)</h2>
     <table><thead><tr><th>Role</th><th>Name</th><th>Email</th><th>Password</th><th>Country</th></tr></thead>
     <tbody>${guestRows}</tbody></table>
-    <h2>Hosts (post places &amp; services)</h2>
+    <h2>Hosts (post places)</h2>
     <table><thead><tr><th>Role</th><th>Name</th><th>Email</th><th>Password</th><th>Listings</th></tr></thead>
     <tbody>${hostRows}</tbody></table>
   </div>
@@ -200,7 +176,6 @@ function buildHtml(guests, hosts, sample, sub) {
     <li>All passwords are <code>${PASSWORD}</code>. Sign in at <a href="https://quickin-frontend.vercel.app/login">quickin-frontend.vercel.app/login</a>.</li>
     <li>Listings span <b>North Coast</b>, <b>El Gouna</b> and <b>Ain Sokhna</b>, with weekly/monthly discounts &amp; cancellation policies set.</li>
     <li>Same email can be <b>both</b> a guest and a host — sign up a guest, then register the same email "as host".</li>
-    <li>Hosts post <b>Services</b> (jet ski, diving, yacht…); guests browse Services and <b>subscribe</b>.</li>
     <li>Hardcoded admin: <span class="mono">admin / Medahny@12345</span> → <a href="https://quickin-frontend.vercel.app/admin">/admin</a> (approve listings, verifications, promos, reports).</li>
   </ul>
 </div></body></html>`
@@ -217,7 +192,7 @@ function buildHtml(guests, hosts, sample, sub) {
     console.log(`  ✅ ${g.email} (${g.country})`)
   }
 
-  console.log('Creating hosts + listings + services…')
+  console.log('Creating hosts + listings…')
   const hostResults = []
   const createdListingIds = []
   for (const h of HOSTS) {
@@ -241,20 +216,7 @@ function buildHtml(guests, hosts, sample, sub) {
         console.log(`  ❌ ${h.email} → ${l.title}: ${res.status} ${JSON.stringify(res.body)}`)
       }
     }
-    const createdServices = []
-    for (const sv of h.services || []) {
-      const res = await post('/api/local/services', {
-        title: sv.title, description: `${sv.category} experience in ${sv.location}. A QuickIn service.`,
-        category: sv.category, location: sv.location, price: sv.price, image_url: sv.image,
-      }, token)
-      if (res.status === 201 && res.body.id) {
-        createdServices.push({ id: res.body.id, title: sv.title, category: sv.category, price: sv.price })
-        console.log(`  ✅ ${h.name} → service: ${sv.title}`)
-      } else {
-        console.log(`  ❌ ${h.email} → service ${sv.title}: ${res.status} ${JSON.stringify(res.body)}`)
-      }
-    }
-    hostResults.push({ ...h, token, listings: created, services: createdServices })
+    hostResults.push({ ...h, token, listings: created })
   }
 
   // New listings enter the moderation queue (pending + unpublished). Auto-approve +
@@ -315,28 +277,11 @@ function buildHtml(guests, hosts, sample, sub) {
     console.log(`  ⚠️  sample booking skipped: ${e.message}`)
   }
 
-  // Sample pending subscription: second guest requests the first service.
-  let sub = null
-  try {
-    const gToken = guestTokens[GUESTS[1].email]
-    const svc = hostResults.flatMap((h) => h.services || []).find(Boolean)
-    if (svc && gToken) {
-      const r = await post('/api/local/service-requests', { service_id: svc.id, note: 'Looking forward to it!' }, gToken)
-      if (r.status === 201) {
-        sub = { guest: GUESTS[1].name, service: svc.title }
-        console.log(`  ✅ sample subscription: ${GUESTS[1].name} → ${svc.title} (${r.body.status})`)
-      }
-    }
-  } catch (e) {
-    console.log(`  ⚠️  sample subscription skipped: ${e.message}`)
-  }
-
   const outPath = join(process.cwd(), 'demo-accounts.html')
-  writeFileSync(outPath, buildHtml(GUESTS, hostResults, sample, sub))
+  writeFileSync(outPath, buildHtml(GUESTS, hostResults, sample))
   const totalListings = hostResults.reduce((n, h) => n + h.listings.length, 0)
-  const totalServices = hostResults.reduce((n, h) => n + h.services.length, 0)
   console.log(`\n📄 Wrote ${outPath}`)
-  console.log(`\nDone. ${GUESTS.length} guests, ${hostResults.length} hosts, ${totalListings} listings, ${totalServices} services. Password: ${PASSWORD}\n`)
+  console.log(`\nDone. ${GUESTS.length} guests, ${hostResults.length} hosts, ${totalListings} listings. Password: ${PASSWORD}\n`)
   await pool.end()
 })().catch(async (e) => {
   console.error('SEED FAILED:', e)

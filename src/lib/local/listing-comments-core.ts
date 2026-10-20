@@ -38,7 +38,7 @@ export function checkCommentBody(raw: unknown, what: 'comment' | 'reply' = 'comm
  */
 export function authorDisplayName(fullName: unknown): string {
   const parts = String(fullName ?? '').trim().split(/\s+/).filter(Boolean)
-  if (parts.length === 0) return 'QuickIn guest'
+  if (parts.length === 0) return 'Quick In guest'
   if (parts.length === 1) return parts[0]
   return `${parts[0]} ${parts[parts.length - 1].charAt(0).toUpperCase()}.`
 }
@@ -166,6 +166,6 @@ export function removalNotice(listingTitle: string | null | undefined): { title:
   const where = listingTitle ? ` on “${listingTitle}”` : ''
   return {
     title: 'Your comment was removed',
-    body: `QuickIn removed your comment${where} because it broke our community rules.`,
+    body: `Quick In removed your comment${where} because it broke our community rules.`,
   }
 }

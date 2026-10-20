@@ -6,10 +6,10 @@ import { isCommissionError, rateFromPercent } from '@/lib/local/commission-core'
 // The platform commission — the percentage added on top of every host's raw
 // price to produce the price a guest sees and pays.
 //   GET /api/local/admin/settings/commission
-//     → { rate, percent, updated_at, updated_by, impact: { listings, services } }
+//     → { rate, percent, updated_at, updated_by, impact: { listings } }
 //   PUT /api/local/admin/settings/commission  { percent }   (e.g. 12.5)
 //
-// Changing this REPRICES every listing and service immediately, because guest
+// Changing this REPRICES every listing immediately, because guest
 // prices are derived at read time. It does NOT touch bookings that already
 // exist: each one snapshots the rate it was taken at (bookings.commission_rate).
 // Requires a staff session with the 'pricing' module.

@@ -48,7 +48,7 @@ import {
 /** A fully filled-in bank destination, as app_settings rows. */
 const BANK_ROWS = [
   { key: 'bank_name', value: 'Banque Misr' },
-  { key: 'bank_account_name', value: 'QuickIn for Tourism' },
+  { key: 'bank_account_name', value: 'Quick In for Tourism' },
   { key: 'bank_account_number', value: '1234567890123' },
 ]
 
@@ -341,7 +341,7 @@ describe('BANK_KEYS', () => {
 describe('normalizeBankName / normalizeAccountName', () => {
   test('trim and collapse inner whitespace', () => {
     assert.equal(normalizeBankName('  Banque   Misr  '), 'Banque Misr')
-    assert.equal(normalizeAccountName('QuickIn\n for  Tourism'), 'QuickIn for Tourism')
+    assert.equal(normalizeAccountName('Quick In\n for  Tourism'), 'Quick In for Tourism')
   })
 
   test('empty stays empty (clearing the field)', () => {
@@ -442,7 +442,7 @@ describe('formatIban', () => {
 })
 
 describe('isBankConfigured', () => {
-  const base = { bank_name: 'Banque Misr', account_name: 'QuickIn', account_number: '123456', iban: '' }
+  const base = { bank_name: 'Banque Misr', account_name: 'Quick In', account_number: '123456', iban: '' }
 
   test('needs a bank, a beneficiary and a number', () => {
     assert.equal(isBankConfigured(base), true)
@@ -469,7 +469,7 @@ describe('bankConfigGap', () => {
 
   test('says nothing once it is complete', () => {
     assert.equal(
-      bankConfigGap({ bank_name: 'Banque Misr', account_name: 'QuickIn', account_number: '1', iban: '' }),
+      bankConfigGap({ bank_name: 'Banque Misr', account_name: 'Quick In', account_number: '1', iban: '' }),
       '',
     )
   })

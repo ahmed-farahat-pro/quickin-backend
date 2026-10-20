@@ -6,7 +6,7 @@ import { getUserFromRequest } from '@/lib/local/auth'
 // PATCH /api/local/host/listings/:id/visibility  { is_published: boolean }
 //
 // The host takes their own listing off the market, or puts it back. This is
-// QuickIn's answer to "delete my listing" — there is no host-facing DELETE and
+// Quick In's answer to "delete my listing" — there is no host-facing DELETE and
 // there will not be one, because bookings, reviews, payments, messages and the
 // stay guide all hang off the listing id and deleting the row would cascade a
 // guest's completed stay away with it.

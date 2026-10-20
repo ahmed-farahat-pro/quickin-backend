@@ -1,5 +1,5 @@
 // =============================================================================
-// QuickIn LOCAL ADMIN PANEL — port 3001
+// Quick In LOCAL ADMIN PANEL — port 3001
 // Dependency-free: node:http + the psql client. No Supabase, no npm packages.
 // Manages the local quickin_local Postgres: listings (view/add/delete/toggle)
 // and users (view).
@@ -109,11 +109,11 @@ function page(stats, listings, users) {
     `<label style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:${C.muted}">${label}
       <input name="${name}" type="${type}" ${extra} style="padding:9px 11px;border:1px solid ${C.tan};border-radius:10px;font-size:14px;background:#fff" /></label>`
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>QuickIn Admin</title></head>
+  <title>Quick In Admin</title></head>
   <body style="margin:0;background:${C.cream};color:${C.ink};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
   <div style="max-width:1080px;margin:0 auto;padding:32px 24px 64px">
     <div style="display:flex;align-items:baseline;gap:12px">
-      <h1 style="margin:0;font-size:30px;color:${C.burgundy}">QuickIn <span style="font-weight:400;color:${C.ink}">Admin</span></h1>
+      <h1 style="margin:0;font-size:30px;color:${C.burgundy}">Quick In <span style="font-weight:400;color:${C.ink}">Admin</span></h1>
       <span style="color:${C.muted};font-size:14px">local · no Supabase · :${PORT}</span>
     </div>
     <div style="display:flex;gap:14px;margin:22px 0 32px;flex-wrap:wrap">
@@ -203,4 +203,4 @@ const server = createServer(async (req, res) => {
   }
 })
 
-server.listen(PORT, () => console.log(`QuickIn admin running on http://localhost:${PORT}`))
+server.listen(PORT, () => console.log(`Quick In admin running on http://localhost:${PORT}`))

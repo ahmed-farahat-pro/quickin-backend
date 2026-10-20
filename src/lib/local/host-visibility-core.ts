@@ -2,7 +2,7 @@
 // back — pure, and DELIBERATELY free of runtime imports so `node --test` can load
 // it as-is (see the note at the top of resort-core.ts, and README → Testing).
 //
-// QuickIn has no listing DELETE for hosts. "Remove my listing" is a reversible
+// Quick In has no listing DELETE for hosts. "Remove my listing" is a reversible
 // unpublish: `is_published` goes false, every booking, review and payment record
 // stays exactly where it was, and the host can put the listing back up later. The
 // column already existed and both readers already honour it — search filters on

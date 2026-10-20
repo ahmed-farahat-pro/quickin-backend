@@ -1,4 +1,4 @@
-// Content guard — keeps contact details off QuickIn's free-text surfaces, so a
+// Content guard — keeps contact details off Quick In's free-text surfaces, so a
 // host and a guest can't take the deal (and the payment) off-platform. Enforced
 // server-side on every write path, so no client can bypass it.
 //
@@ -61,8 +61,8 @@ const KIND_NOUN: Record<GuardKind, string> = {
 export function blockMessage(kind: GuardKind, surface: GuardSurface): string {
   const tail =
     surface === 'chat'
-      ? 'Keep booking & payment on QuickIn.'
-      : 'Keep booking & payment on QuickIn — guests will reach you here.'
+      ? 'Keep booking & payment on Quick In.'
+      : 'Keep booking & payment on Quick In — guests will reach you here.'
   return `For your safety, sharing ${KIND_NOUN[kind]} ${SURFACE_NOUN[surface]} isn’t allowed. ${tail}`
 }
 
@@ -433,7 +433,7 @@ export function containsPhoneNumber(text: string): boolean {
 const TLD =
   '(?:com|net|org|edu|gov|mil|int|info|biz|name|io|co|me|app|dev|ai|link|ly|gg|tv|cc|to|sh|st|so|is|it|ee|page|bio|live|shop|store|club|fun|top|vip|pro|xyz|online|site|space|website|blog|wiki|news|media|photo|photos|pics|video|chat|social|group|team|world|life|today|one|now|run|fyi|cloud|host|press|studio|design|agency|digital|email|network|tools|zone|works|land|house|guru|ninja|rocks|cool|cash|deals|gift|art|fit|fm|am|gl|eg|sa|ae|kw|qa|bh|om|jo|lb|sy|iq|ye|ma|tn|dz|ly|sd|uk|de|fr|es|nl|be|ch|at|se|no|dk|fi|pl|cz|sk|si|hr|rs|ba|mk|al|bg|ro|hu|gr|pt|ie|lt|lv|by|ua|ru|kz|ge|am|az|md|tr|us|ca|au|nz|in|pk|bd|lk|np|cn|jp|kr|hk|tw|sg|my|id|th|ph|vn|br|mx|ar|cl|co|pe|za|ng|ke|gh|tz|ug)'
 
-// Hosts a guest or host may legitimately paste: QuickIn itself, and a map pin
+// Hosts a guest or host may legitimately paste: Quick In itself, and a map pin
 // for the property. Everything else is an off-platform link.
 const ALLOWED_HOSTS = [
   /(^|\.)quickin\.app$/,
@@ -538,7 +538,7 @@ export function containsSocialHandle(text: string): boolean {
 
   // Platform named alongside the machinery for joining it — "my whatsapp group
   // link", "telegram channel", "scan my snap QR". No handle needed: the point of
-  // the sentence is to move the conversation off QuickIn.
+  // the sentence is to move the conversation off Quick In.
   const JOIN = '(group|groups|channel|link|invite|join|qr|scan|جروب|قروب|لينك|رابط|جروبنا)'
   if (
     new RegExp(`${PLATFORM.source}\\s*(?:\\S+\\s+)?${JOIN}`).test(t) ||
@@ -569,7 +569,7 @@ export function containsSocialHandle(text: string): boolean {
 
 /**
  * Rewrite spelled-out dots so "site dot com" reads as a domain, then look for a
- * host with a known TLD. QuickIn's own links and a map pin are allowed through;
+ * host with a known TLD. Quick In's own links and a map pin are allowed through;
  * everything else is a way off the platform.
  */
 export function containsExternalUrl(text: string): boolean {

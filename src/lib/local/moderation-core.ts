@@ -128,7 +128,7 @@ export const MAX_WARNING_CHARS = 1000
  * this is read for the first time in a dialog that is blocking their chat.
  */
 export const DEFAULT_WARNING =
-  'You tried to share contact details in chat. QuickIn keeps conversations and payments on the platform ' +
+  'You tried to share contact details in chat. Quick In keeps conversations and payments on the platform ' +
   'so both sides stay protected — bookings made off-platform have no cover if something goes wrong. ' +
   'Please keep it here. Repeated attempts can lead to your account being suspended.'
 

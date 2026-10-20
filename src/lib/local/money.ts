@@ -19,7 +19,7 @@ const isUuid = (s: string) => /^[0-9a-fA-F-]{36}$/.test(s)
 /** The rate to price a booking by: its snapshot, else the live setting. */
 const BOOKING_RATE_SQL = `COALESCE(b.commission_rate, ${COMMISSION_RATE_SQL})`
 
-// Currencies QuickIn displays (EGP base). Display-only — bookings are always EGP.
+// Currencies Quick In displays (EGP base). Display-only — bookings are always EGP.
 const DISPLAY_CURRENCIES = ['EGP', 'USD', 'EUR', 'GBP', 'SAR', 'AED'] as const
 
 // Static fallback (1 EGP → X) used when the live feed is unreachable.

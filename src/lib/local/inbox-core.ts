@@ -1,7 +1,7 @@
 // The Messages inbox is a UNION of two message stores, and this module is the
 // seam that lets them share one list.
 //
-// QuickIn grew two independent threads between the same two people:
+// Quick In grew two independent threads between the same two people:
 //
 //   • `conversations` + `chat_messages` — the PRE-BOOKING thread, one per
 //     (listing, guest). Opened by "Message host" on a listing.

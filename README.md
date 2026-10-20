@@ -60,16 +60,17 @@ npm run dev        # API at http://localhost:4000
 | PUT  | `/api/local/admin/settings/flash` | `{enabled: boolean}` — the only Flash setting; credentials are env vars. Audited as `flash_updated` |
 | POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, doc_type, id_front, id_back, company?, notes?}`. **The ID documents are required** (`doc_type` + both sides, as `data:image/…` URLs) unless the applicant's identity is already `verified` or `pending`, in which case they are omitted and the application is linked to the submission on file; they are filed as a pending `id_verifications` row (`source='host_application'`) so one admin decision covers host status and identity. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review |
 | PATCH | `/api/local/host/listings/[id]/visibility` | **The host takes their own listing off the market, or puts it back** — `{is_published: false\|true}` → `{id, is_published, unpublished_by_host, declined_requests, blocked_by, blocked_message, listing}`. There is no host-facing DELETE and there will not be one; see *A host removes a listing by hiding it* below. Deactivating also **declines every booking request still waiting on this host** (`declined_requests` says how many) through the same path a manual decline uses, so each guest gets the ordinary notification. Reactivating clears only the host's own flag: when an account block, the identity gate or the review queue still holds the listing down, `blocked_by` names it (`verification` \| `staff` \| `rejected` \| `under_review`) and `is_published` comes back **false**. 401 unsigned, 403 not the host |
-| PATCH | `/api/local/host/services/[id]/visibility` | The same, for one of the host's standalone services. Declines every pending request. Services have no moderation queue and no identity gate, so a reactivate always goes live and there is no `blocked_by` |
-| GET  | `/api/local/services/[id]` | One service. **404 when unpublished**, except for its own host, who gets the host projection |
+| ANY  | `/api/local/services`, `/api/local/services/[id]`, `/api/local/service-requests`, `/api/local/service-requests/[id]`, `/api/local/host/services`, `/api/local/host/services/[id]/visibility`, `/api/local/host/service-requests` | **410 Gone** — Services were removed 2026-10-20. See *Services were removed* below |
+| GET  | `/api/local/wishlist` | `{listings, listingIds, services: [], serviceIds: []}` — listings only; the two service keys are always empty, kept for old app builds |
+| POST | `/api/local/wishlist` | `{item_type?, item_id, action?: add\|remove\|toggle}` → `{saved}`. `item_type: 'service'` → **410** (`DELETE` the same) |
 | GET  | `/api/local/host/bookings` | The host's reservation inbox — every booking across their listings, **a bare JSON array**, newest first. Not `{bookings}`: iOS decodes `[HostBooking]`, Android `JSONArray(text)`, and the web reads the array through `hostBookingsFrom()`. Carries two host-only columns the shared booking projection withholds — **`host_payout`** (the raw amount owed, before commission) and **`guest_name`** (null when the guest account is gone). 401 unsigned |
 | GET  | `/api/local/host/listing-gate` | May this host add a listing — `{allowed, code, message, reason}`. Same `code` the create route returns on 403, so the apps can refuse up front. `reason` only on a rejection |
 | GET  | `/api/local/host/commission` | The platform commission — `{rate, percent}` — so the add/edit-listing screens can show a host what guests will pay. Auth required (a guest holding the rate could divide out the host's raw price) |
 | GET  | `/api/local/host/payout-method` | Where QuickIn sends this host's earnings — `{payout_method, payout_ready, is_host}`. `payout_method` is `null` until they add one. Host-only; a guest gets `403 {code:'not_host'}` |
-| PUT  | `/api/local/host/payout-method` | Add or replace it — `{method, account_name, …}` where `method` is `bank_account` \| `instapay` \| `wallet`. `400` with the reason on invalid input (the IBAN checksum included) |
+| PUT  | `/api/local/host/payout-method` | Add or replace it — `{method, account_name, …}` where `method` is `bank_account` \| `instapay`. `400` with the reason on invalid input (the IBAN checksum included); a retired `wallet` gets its own `400` telling the host to switch |
 | DELETE | `/api/local/host/payout-method` | Remove it — `{removed, payout_method:null, payout_ready:false}`. Idempotent |
 | GET  | `/api/local/admin/settings/commission` | The platform commission — `{rate, percent, updated_at, updated_by}`. Staff session with the `pricing` module |
-| PUT  | `/api/local/admin/settings/commission` | Set it — `{percent}` (e.g. `12.5`). `400` outside 0–100. Reprices every listing and service immediately; existing bookings keep their snapshotted rate |
+| PUT  | `/api/local/admin/settings/commission` | Set it — `{percent}` (e.g. `12.5`). `400` outside 0–100. Reprices every listing immediately (the `impact` payload is `{listings}` — the old `services` count is gone); existing bookings keep their snapshotted rate |
 
 All responses send `Access-Control-Allow-Origin: *`. Every POST route answers a CORS
 preflight (`OPTIONS` → `204`) so browsers can call the API cross-origin.
@@ -242,8 +243,8 @@ remembering to convert:
 
 | | `price_per_night` / `total_price` | Extra fields |
 | --- | --- | --- |
-| `LISTING_COLS`, `BOOKING_COLS`, `SERVICE_COLS` (guest) | commission-inclusive | — (the raw price is never sent to a guest) |
-| `LISTING_COLS_HOST`, `SERVICE_COLS_HOST` | the host's raw price | `guest_price_per_night`, `guest_weekend_price`, `guest_monthly_prices` |
+| `LISTING_COLS`, `BOOKING_COLS` (guest) | commission-inclusive | — (the raw price is never sent to a guest) |
+| `LISTING_COLS_HOST` | the host's raw price | `guest_price_per_night`, `guest_weekend_price`, `guest_monthly_prices` |
 | `getHostBookings` | commission-inclusive | `host_payout` — the raw amount owed |
 
 The host projection returns the **raw** price on purpose: the edit form loads that
@@ -1733,15 +1734,24 @@ change to the rule belongs in all four.
 
 Money flows *in* through Instapay (above) and *out* to whatever destination the host
 declared. `host_payout_methods` holds **one row per host** — a single preferred
-destination, not a wallet of many — chosen from three:
+destination, not a wallet of many — chosen from two:
 
 | `method` | Fields it carries | `account_ref` (the canonical destination) |
 | --- | --- | --- |
 | `bank_account` | `bank_name` (required), `iban`, `account_number`, `swift_bic`, `branch` | the IBAN, or the account number when there is no IBAN |
 | `instapay` | — | the InstaPay address, e.g. `kareem@instapay` |
-| `wallet` | `provider` (`vodafone_cash`, `etisalat_cash`, `orange_money`, `we_pay`, `other`) | the wallet number, normalised to `01XXXXXXXXX` |
+| `wallet` *(retired)* | `provider` (`vodafone_cash`, `etisalat_cash`, `orange_money`, `we_pay`, `other`) | the wallet number |
 
-**All three are stored whole, because all three have to be payable.** That is why a
+**`wallet` was retired on 2026-10-20.** `normalizePayoutMethod()` refuses it with
+"Wallet payouts are no longer available…" (older app builds still offer it, so the
+host must read a reason, not "unknown method"). It stays in `RETIRED_PAYOUT_METHODS`
+so a row saved before then is still **read** — `rowToPayoutMethod()` returns it and
+`payout_ready` stays true, because dropping it would lose the only place we know to pay
+that host. Every client lists only `PAYOUT_METHODS` in its picker, shows a "switch to a
+bank account or InstaPay" notice under a retired row, and opens the editor on a bank
+account. No migration: the rows are left as they are.
+
+**Every destination is stored whole, because it has to be payable.** That is why a
 credit-card option was withdrawn before this shipped: a card number cannot be paid out
 without a processor token, and holding one would have put this database in PCI-DSS
 scope for nothing. Bank details carry no such restriction — an IBAN exists to be handed
@@ -1902,9 +1912,10 @@ badge, the filter chip and the button from the same functions. If the two drifte
 the web would offer a Reactivate on a listing the API refuses to republish — or
 badge a deactivated listing "live".
 
-### Services work the same way
+### Services worked the same way (removed 2026-10-20)
 
-`services.unpublished_by_host` is the twin, behind
+Historical — the routes below now answer 410; see *Services were removed*.
+`services.unpublished_by_host` was the twin, behind
 `PATCH /api/local/host/services/:id/visibility`. Deactivating declines every
 pending `service_requests` row, `getServices()` drops it, `GET
 /api/local/services/:id` 404s for everyone but the host — and
@@ -2419,3 +2430,27 @@ The old `conversations`, `chat_messages` and `messages` tables are no longer rea
 written by any route; `lib/local/inbox-core.ts` and the chat functions in `db.ts` remain
 only because `/ops` can still open a user's historical threads.
 
+## Services were removed
+
+**2026-10-20.** Services — host-posted experiences (jet ski, diving, tours …) that
+guests requested — are gone from the API. Code and API only; **the data stays**.
+
+- **Every route answers `410 {error: 'Services have been removed'}`** for each method
+  it used to export (`OPTIONS` still 204 with CORS), so app builds already on phones
+  show a sentence instead of a bare 404: `/api/local/services`, `/services/[id]`,
+  `/service-requests`, `/service-requests/[id]`, `/host/services`,
+  `/host/services/[id]/visibility`, `/host/service-requests`. The stubs make no auth
+  or database call.
+- **Tables kept, dormant.** `services`, `service_requests` and the `wishlists` rows
+  with `item_type = 'service'` are untouched — no DROP, no migration, no in-flight
+  request cancelled or notified. Nothing reads or writes them. `migrate-services.mjs`
+  stays as history.
+- **Wishlist** keeps its response shape: `services: []` and `serviceIds: []` always.
+  Adding, toggling or removing an `item_type: 'service'` answers 410; any other value
+  (or none) is a listing, exactly as before. The rule is `parseWishItemType()` in
+  `src/lib/local/wishlist-core.ts`, tested by `test/unit/wishlist-core.test.mjs`.
+- **Admin**: `GET /api/local/admin/overview` no longer returns `services` /
+  `serviceRequests` (or their counts), `DELETE /api/local/admin/services|service-requests/:id`
+  is `400 Unknown entity`, and the commission `impact` counts listings only.
+- `src/lib/local/services.ts` is deleted, and with it the only code that created
+  service-request notifications. `scripts/seed-demo.mjs` no longer seeds services.

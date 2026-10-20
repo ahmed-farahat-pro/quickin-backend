@@ -1,11 +1,16 @@
-// Host payout methods — where QuickIn sends a host's earnings.
+// Host payout methods — where Quick In sends a host's earnings.
 //
-// A host picks exactly ONE preferred destination from three: a bank account, an
-// InstaPay address, or a mobile wallet. This module validates what they submit
-// and derives the one-liner their profile shows back, so the same rules apply on
-// the website, on iOS and on Android.
+// A host picks exactly ONE preferred destination from two: a bank account or an
+// InstaPay address. This module validates what they submit and derives the
+// one-liner their profile shows back, so the same rules apply on the website, on
+// iOS and on Android.
 //
-// All three are stored WHOLE, because all three are the payout destination and
+// A third option, a mobile wallet (Vodafone Cash and friends), was RETIRED on
+// 2026-10-20 at the business's direction. It can no longer be saved, but a row a
+// host saved before then is still read and shown back as-is — dropping it would
+// silently lose the only place we know to pay them. See RETIRED_PAYOUT_METHODS.
+//
+// Every destination is stored WHOLE, because it is the payout destination and
 // someone has to be able to send money to them. That is why this replaced an
 // earlier credit-card option: a card number cannot be paid out without a
 // processor token, and holding one would have put this database in PCI-DSS
@@ -25,14 +30,31 @@
 export const PAYOUT_METHODS = [
   { key: 'bank_account', label: 'Bank account' },
   { key: 'instapay', label: 'InstaPay' },
+] as const
+
+/**
+ * Methods that can no longer be SAVED but are still READ, so a host who chose
+ * one before it was retired keeps seeing (and getting paid at) what they set,
+ * and is asked to switch. Never offered in a picker.
+ */
+export const RETIRED_PAYOUT_METHODS = [
   { key: 'wallet', label: 'Wallet' },
 ] as const
 
-export type PayoutMethod = (typeof PAYOUT_METHODS)[number]['key']
+/** A method a host may save now. */
+export type ChoosablePayoutMethod = (typeof PAYOUT_METHODS)[number]['key']
+/** Any method a stored row may hold — the choosable ones plus the retired ones. */
+export type PayoutMethod = ChoosablePayoutMethod | (typeof RETIRED_PAYOUT_METHODS)[number]['key']
 
 const PAYOUT_METHOD_KEYS = new Set<string>(PAYOUT_METHODS.map((m) => m.key))
+const RETIRED_PAYOUT_METHOD_KEYS = new Set<string>(RETIRED_PAYOUT_METHODS.map((m) => m.key))
 
-/** Mobile wallets a host can be paid into. 'other' keeps an unlisted one usable. */
+/** True for a stored method that can no longer be chosen — clients prompt a switch. */
+export function isRetiredPayoutMethod(v: unknown): boolean {
+  return RETIRED_PAYOUT_METHOD_KEYS.has(String(v ?? '').trim())
+}
+
+/** Labels for the providers of a retired `wallet` row, so it still reads back by name. */
 export const WALLET_PROVIDERS = [
   { key: 'vodafone_cash', label: 'Vodafone Cash' },
   { key: 'etisalat_cash', label: 'Etisalat Cash' },
@@ -40,10 +62,6 @@ export const WALLET_PROVIDERS = [
   { key: 'we_pay', label: 'WE Pay' },
   { key: 'other', label: 'Other wallet' },
 ] as const
-
-export type WalletProvider = (typeof WALLET_PROVIDERS)[number]['key']
-
-const WALLET_PROVIDER_KEYS = new Set<string>(WALLET_PROVIDERS.map((p) => p.key))
 
 export const MAX_ACCOUNT_NAME_CHARS = 120
 export const MAX_INSTAPAY_ADDRESS_CHARS = 120
@@ -54,7 +72,7 @@ export const MAX_IBAN_CHARS = 34
 export const MAX_ACCOUNT_NUMBER_CHARS = 34
 
 /**
- * How long an IBAN is in the countries QuickIn's hosts actually bank in, plus the
+ * How long an IBAN is in the countries Quick In's hosts actually bank in, plus the
  * major ones a host abroad might use. The length is part of the format, so a
  * transposed or truncated IBAN that still passes the checksum is caught here.
  * A country absent from this table is accepted on the checksum and the 15–34
@@ -89,7 +107,7 @@ export interface PayoutMethodRecord {
   /**
    * The canonical destination, derived at write time so every method has one
    * column to pay into: the IBAN (or the account number when there is no IBAN),
-   * the InstaPay address, or the wallet number.
+   * the InstaPay address, or (retired) the wallet number.
    */
   account_ref: string
   /** Bank only. */
@@ -100,7 +118,7 @@ export interface PayoutMethodRecord {
   swift_bic: string
   /** Bank only, optional. */
   branch: string
-  /** Wallet provider for `wallet`; '' otherwise. */
+  /** Wallet provider for a retired `wallet` row; '' otherwise. */
   provider: string
 }
 
@@ -127,14 +145,11 @@ export interface PayoutMethodInput {
   branch?: unknown
   /** instapay */
   instapay_address?: unknown
-  /** wallet */
-  wallet_provider?: unknown
-  wallet_number?: unknown
 }
 
 export function payoutMethodLabel(v: unknown): string {
   const s = String(v ?? '').trim()
-  return PAYOUT_METHODS.find((m) => m.key === s)?.label ?? ''
+  return [...PAYOUT_METHODS, ...RETIRED_PAYOUT_METHODS].find((m) => m.key === s)?.label ?? ''
 }
 
 export function walletProviderLabel(v: unknown): string {
@@ -143,21 +158,28 @@ export function walletProviderLabel(v: unknown): string {
 }
 
 /**
- * Which of the three the host picked. THROWS rather than defaulting: guessing
- * would send their earnings somewhere they did not choose.
+ * Which method the host picked. THROWS rather than defaulting: guessing would
+ * send their earnings somewhere they did not choose. A retired method gets its
+ * own message — an older app build still offers it, and "unknown" would read
+ * like a bug rather than a change.
  */
-export function normalizePayoutMethod(v: unknown): PayoutMethod {
+export function normalizePayoutMethod(v: unknown): ChoosablePayoutMethod {
   const s = String(v ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
   if (!s) throw new PayoutMethodError('Please choose how you want to be paid')
+  if (RETIRED_PAYOUT_METHOD_KEYS.has(s)) {
+    throw new PayoutMethodError(
+      `Wallet payouts are no longer available. Choose ${PAYOUT_METHODS.map((m) => m.label).join(' or ')}`
+    )
+  }
   if (!PAYOUT_METHOD_KEYS.has(s)) {
     throw new PayoutMethodError(
       `Unknown payout method. Choose one of: ${PAYOUT_METHODS.map((m) => m.label).join(', ')}`
     )
   }
-  return s as PayoutMethod
+  return s as ChoosablePayoutMethod
 }
 
-/** The account holder's name. Required for all three — a transfer needs a payee. */
+/** The account holder's name. Required for every method — a transfer needs a payee. */
 export function normalizeAccountName(v: unknown): string {
   const s = String(v ?? '').trim().replace(/\s+/g, ' ')
   if (!s) throw new PayoutMethodError('Enter the name on the account')
@@ -245,7 +267,7 @@ export function normalizeAccountNumber(v: unknown): string {
 
 /**
  * A SWIFT/BIC code — 8 or 11 characters. Optional: it is only needed when the
- * money crosses a border, and most of QuickIn's hosts bank domestically.
+ * money crosses a border, and most of Quick In's hosts bank domestically.
  */
 export function normalizeSwiftBic(v: unknown): string {
   const s = String(v ?? '').replace(/[\s-]/g, '').toUpperCase()
@@ -277,31 +299,6 @@ export function normalizeInstapayAddress(v: unknown): string {
   return s
 }
 
-/**
- * A mobile-wallet number, normalised to the local Egyptian form `01XXXXXXXXX`
- * so the same phone typed as +20, 0020 or 01… is stored once. A number that is
- * plainly not Egyptian is kept in `+<digits>` form rather than rejected — a host
- * abroad still has to be payable.
- */
-export function normalizeWalletNumber(v: unknown): string {
-  const raw = String(v ?? '').trim()
-  if (!raw) throw new PayoutMethodError('Enter your wallet number')
-  const digits = raw.replace(/[\s()\-.]/g, '').replace(/^\+/, '').replace(/^00/, '')
-  if (!/^\d+$/.test(digits)) throw new PayoutMethodError('A wallet number can only contain digits')
-  const eg = digits.replace(/^20/, '')
-  if (/^1\d{9}$/.test(eg)) return `0${eg}`
-  if (/^01\d{9}$/.test(eg)) return eg
-  if (digits.length < 8 || digits.length > 15) throw new PayoutMethodError('That wallet number is not the right length')
-  return `+${digits}`
-}
-
-/** Which wallet the number belongs to. Defaults to 'other' rather than throwing. */
-export function normalizeWalletProvider(v: unknown): WalletProvider {
-  const s = String(v ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
-  if (!s) return 'other'
-  return (WALLET_PROVIDER_KEYS.has(s) ? s : 'other') as WalletProvider
-}
-
 const EMPTY_BANK = { bank_name: '', iban: '', account_number: '', swift_bic: '', branch: '' }
 
 /**
@@ -309,8 +306,8 @@ const EMPTY_BANK = { bank_name: '', iban: '', account_number: '', swift_bic: '',
  *
  * Every branch is validated before anything is written, so a half-valid bank
  * account never replaces a working InstaPay address. Fields belonging to the
- * other two methods are cleared rather than carried over — switching from a bank
- * to a wallet must not leave a stale IBAN on the row.
+ * other method are cleared rather than carried over — switching from a bank to
+ * InstaPay must not leave a stale IBAN (or a retired wallet's provider) on the row.
  */
 export function validatePayout(input: PayoutMethodInput): PayoutMethodRecord {
   const method = normalizePayoutMethod(input.method)
@@ -339,22 +336,12 @@ export function validatePayout(input: PayoutMethodInput): PayoutMethodRecord {
     }
   }
 
-  if (method === 'instapay') {
-    return {
-      method,
-      account_name,
-      account_ref: normalizeInstapayAddress(input.instapay_address),
-      ...EMPTY_BANK,
-      provider: '',
-    }
-  }
-
   return {
     method,
     account_name,
-    account_ref: normalizeWalletNumber(input.wallet_number),
+    account_ref: normalizeInstapayAddress(input.instapay_address),
     ...EMPTY_BANK,
-    provider: normalizeWalletProvider(input.wallet_provider),
+    provider: '',
   }
 }
 
@@ -390,7 +377,7 @@ export function rowToPayoutMethod(
 ): PayoutMethodView | null {
   if (!row) return null
   const method = String(row.method ?? '').trim()
-  if (!PAYOUT_METHOD_KEYS.has(method)) return null
+  if (!PAYOUT_METHOD_KEYS.has(method) && !RETIRED_PAYOUT_METHOD_KEYS.has(method)) return null
   const record: PayoutMethodRecord = {
     method: method as PayoutMethod,
     account_name: String(row.account_name ?? ''),

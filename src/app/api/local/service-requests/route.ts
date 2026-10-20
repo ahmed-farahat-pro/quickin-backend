@@ -1,16 +1,17 @@
 import { NextResponse } from 'next/server'
-import { createServiceRequest, getUserServiceRequests } from '@/lib/local/services'
-import { getUserFromRequest } from '@/lib/local/auth'
 
-// Service requests ("subscriptions").
-//   GET  /api/local/service-requests → the signed-in user's subscriptions
-//   POST /api/local/service-requests { service_id, preferred_date?, note? } → request a service
+// GONE. Services (host-posted experiences — jet ski, diving, tours — that guests
+// requested) were removed on 2026-10-20. App builds already installed on phones
+// still call this route, so it answers 410 with a sentence they can show instead
+// of a bare 404. The `services` / `service_requests` tables are kept, dormant:
+// nothing reads or writes them any more, and no row was changed or cancelled.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Cache-Control': 'no-store',
 }
+const GONE = { error: 'Services have been removed' }
 
 export async function OPTIONS() {
   return new Response(null, {
@@ -23,34 +24,10 @@ export async function OPTIONS() {
   })
 }
 
-export async function GET(req: Request) {
-  try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
-    const requests = await getUserServiceRequests(user.id)
-    return NextResponse.json(requests, { headers: CORS })
-  } catch (err) {
-    return NextResponse.json({ error: 'Failed to load subscriptions', detail: String(err) }, { status: 500, headers: CORS })
-  }
+export async function GET() {
+  return NextResponse.json(GONE, { status: 410, headers: CORS })
 }
 
-export async function POST(req: Request) {
-  try {
-    const user = await getUserFromRequest(req)
-    if (!user) return NextResponse.json({ error: 'Please sign in to subscribe' }, { status: 401, headers: CORS })
-    const b = await req.json().catch(() => ({}))
-    const serviceId = String(b.service_id ?? b.serviceId ?? '')
-    if (!serviceId) return NextResponse.json({ error: 'service_id is required' }, { status: 400, headers: CORS })
-    const request = await createServiceRequest(user.id, {
-      serviceId,
-      preferredDate: b.preferred_date ?? b.preferredDate ?? null,
-      note: b.note ?? null,
-    })
-    return NextResponse.json(request, { status: 201, headers: CORS })
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error('POST /api/local/service-requests failed:', msg)
-    const status = /already|not found|Invalid|required/i.test(msg) ? 400 : 500
-    return NextResponse.json({ error: msg }, { status, headers: CORS })
-  }
+export async function POST() {
+  return NextResponse.json(GONE, { status: 410, headers: CORS })
 }

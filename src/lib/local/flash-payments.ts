@@ -156,7 +156,7 @@ export async function startFlashCheckout(bookingId: string, userId: string): Pro
       amountCents,
       bookingId: booking.id,
       reservationCode: booking.reservation_code,
-      description: `QuickIn stay — ${booking.title ?? 'reservation'}${booking.reservation_code ? ` (${booking.reservation_code})` : ''}`,
+      description: `Quick In stay — ${booking.title ?? 'reservation'}${booking.reservation_code ? ` (${booking.reservation_code})` : ''}`,
       customerName: guest.rows[0]?.full_name ?? null,
       customerPhone: guest.rows[0]?.phone ?? null,
     })

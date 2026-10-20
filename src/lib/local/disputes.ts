@@ -15,7 +15,7 @@ import {
 // keeping the SQL together makes the lifecycle readable in one file.
 //
 // Deliberately NOT content-guarded. Every other free-text surface runs through
-// contentguard, but a dispute is addressed to QuickIn staff rather than to the
+// contentguard, but a dispute is addressed to Quick In staff rather than to the
 // other party, and it routinely needs to quote contact details as EVIDENCE
 // ("the host told me to pay him directly on 010…"). Guarding it would suppress
 // exactly the thing an investigator needs. See README → Guest disputes.

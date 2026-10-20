@@ -6,12 +6,14 @@ import {
   toggleWishlist,
   addToWishlist,
   removeFromWishlist,
-  type WishItemType,
 } from '@/lib/local/wishlist'
+import { parseWishItemType } from '@/lib/local/wishlist-core'
 
-// GET    /api/local/wishlist                     → { listings, services, listingIds, serviceIds }
+// GET    /api/local/wishlist                     → { listings, services: [], listingIds, serviceIds: [] }
 // POST   /api/local/wishlist { item_type, item_id, action? }  → add | remove | toggle (default)
 // DELETE /api/local/wishlist { item_type, item_id }           → remove
+// Listings only. Services were removed 2026-10-20: `services` / `serviceIds` are
+// always empty (kept for old app builds), and item_type 'service' answers 410.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -30,8 +32,6 @@ export async function OPTIONS() {
   })
 }
 
-const typeOf = (v: unknown): WishItemType => (v === 'service' ? 'service' : 'listing')
-
 export async function GET(req: Request) {
   try {
     const user = await getUserFromRequest(req)
@@ -48,7 +48,9 @@ export async function POST(req: Request) {
     const user = await getUserFromRequest(req)
     if (!user) return NextResponse.json({ error: 'Please sign in to save favorites' }, { status: 401, headers: CORS })
     const b = await req.json().catch(() => ({}))
-    const itemType = typeOf(b.item_type ?? b.itemType)
+    const parsed = parseWishItemType(b.item_type ?? b.itemType)
+    if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status, headers: CORS })
+    const itemType = parsed.type
     const itemId = String(b.item_id ?? b.itemId ?? '')
     if (!itemId) return NextResponse.json({ error: 'item_id is required' }, { status: 400, headers: CORS })
     const action = String(b.action ?? 'toggle')
@@ -72,7 +74,9 @@ export async function DELETE(req: Request) {
     const user = await getUserFromRequest(req)
     if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
     const b = await req.json().catch(() => ({}))
-    const itemType = typeOf(b.item_type ?? b.itemType)
+    const parsed = parseWishItemType(b.item_type ?? b.itemType)
+    if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status, headers: CORS })
+    const itemType = parsed.type
     const itemId = String(b.item_id ?? b.itemId ?? '')
     if (!itemId) return NextResponse.json({ error: 'item_id is required' }, { status: 400, headers: CORS })
     await removeFromWishlist(user.id, itemType, itemId)

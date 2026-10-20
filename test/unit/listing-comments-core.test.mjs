@@ -43,8 +43,8 @@ describe('authorDisplayName', () => {
     assert.equal(authorDisplayName('Sara'), 'Sara')
   })
   test('no name falls back', () => {
-    assert.equal(authorDisplayName(null), 'QuickIn guest')
-    assert.equal(authorDisplayName('   '), 'QuickIn guest')
+    assert.equal(authorDisplayName(null), 'Quick In guest')
+    assert.equal(authorDisplayName('   '), 'Quick In guest')
   })
 })
 

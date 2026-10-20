@@ -1,5 +1,5 @@
 // Unit tests for src/lib/local/payout-method-core.ts — the validators behind the
-// host's payout method (bank account / InstaPay / wallet).
+// host's payout method (bank account / InstaPay; the wallet option is retired).
 //
 // Offline: no database, no network, no server. Run with `npm test`.
 // Note the explicit `.ts` extension — Node 22 strips types, but its ESM resolver
@@ -12,11 +12,12 @@ import {
   MAX_ACCOUNT_NAME_CHARS,
   MAX_INSTAPAY_ADDRESS_CHARS,
   PAYOUT_METHODS,
-  WALLET_PROVIDERS,
+  RETIRED_PAYOUT_METHODS,
   formatIban,
   ibanChecksumValid,
   isPayoutMethodError,
   isPayoutReady,
+  isRetiredPayoutMethod,
   normalizeAccountName,
   normalizeAccountNumber,
   normalizeBankName,
@@ -25,13 +26,10 @@ import {
   normalizeInstapayAddress,
   normalizePayoutMethod,
   normalizeSwiftBic,
-  normalizeWalletNumber,
-  normalizeWalletProvider,
   payoutDisplay,
   payoutMethodLabel,
   rowToPayoutMethod,
   validatePayout,
-  walletProviderLabel,
 } from '../../src/lib/local/payout-method-core.ts'
 
 /** Real-format IBANs (the published specimen values for each country). */
@@ -49,8 +47,16 @@ function throwsPayoutError(fn, match) {
 }
 
 describe('PAYOUT_METHODS', () => {
-  test('are the three destinations a host can choose', () => {
-    assert.deepEqual(PAYOUT_METHODS.map((m) => m.key), ['bank_account', 'instapay', 'wallet'])
+  test('are the two destinations a host can choose', () => {
+    assert.deepEqual(PAYOUT_METHODS.map((m) => m.key), ['bank_account', 'instapay'])
+  })
+
+  test('wallet is retired: still labelled for old rows, never choosable', () => {
+    assert.deepEqual(RETIRED_PAYOUT_METHODS.map((m) => m.key), ['wallet'])
+    assert.equal(payoutMethodLabel('wallet'), 'Wallet')
+    assert.equal(isRetiredPayoutMethod('wallet'), true)
+    assert.equal(isRetiredPayoutMethod('instapay'), false)
+    assert.equal(isRetiredPayoutMethod(''), false)
   })
 
   test('every method has a human label', () => {
@@ -66,10 +72,16 @@ describe('PAYOUT_METHODS', () => {
 })
 
 describe('normalizePayoutMethod', () => {
-  test('accepts each of the three', () => {
+  test('accepts each of the two', () => {
     assert.equal(normalizePayoutMethod('bank_account'), 'bank_account')
     assert.equal(normalizePayoutMethod('instapay'), 'instapay')
-    assert.equal(normalizePayoutMethod('wallet'), 'wallet')
+  })
+
+  test('refuses the retired wallet with a message that says so', () => {
+    // An older app build still offers Wallet; the host must learn it was
+    // retired, not see an "unknown method" that reads like a bug.
+    throwsPayoutError(() => normalizePayoutMethod('wallet'), /no longer available.*Bank account or InstaPay/)
+    throwsPayoutError(() => normalizePayoutMethod(' Wallet '), /no longer available/)
   })
 
   test('tolerates spacing, dashes and case from a client', () => {
@@ -84,7 +96,7 @@ describe('normalizePayoutMethod', () => {
   })
 
   test('throws on an unsupported method and names the options', () => {
-    throwsPayoutError(() => normalizePayoutMethod('paypal'), /Bank account, InstaPay, Wallet/)
+    throwsPayoutError(() => normalizePayoutMethod('paypal'), /Bank account, InstaPay$/)
   })
 })
 
@@ -267,57 +279,6 @@ describe('normalizeInstapayAddress', () => {
   })
 })
 
-describe('normalizeWalletNumber', () => {
-  test('stores one Egyptian number one way, however it was typed', () => {
-    for (const input of [
-      '01012345678',
-      '+201012345678',
-      '00201012345678',
-      '+20 101 234 5678',
-      '010-1234-5678',
-      '(010) 1234 5678',
-    ]) {
-      assert.equal(normalizeWalletNumber(input), '01012345678', input)
-    }
-  })
-
-  test('keeps a non-Egyptian number payable rather than refusing it', () => {
-    assert.equal(normalizeWalletNumber('+971501234567'), '+971501234567')
-  })
-
-  test('requires a number', () => {
-    throwsPayoutError(() => normalizeWalletNumber(''), /enter your wallet number/i)
-  })
-
-  test('rejects letters', () => {
-    throwsPayoutError(() => normalizeWalletNumber('0101234abcd'), /only contain digits/i)
-  })
-
-  test('rejects an impossible length', () => {
-    throwsPayoutError(() => normalizeWalletNumber('12345'), /right length/i)
-  })
-})
-
-describe('normalizeWalletProvider', () => {
-  test('accepts each listed wallet', () => {
-    for (const p of WALLET_PROVIDERS) {
-      assert.equal(normalizeWalletProvider(p.key), p.key)
-      assert.equal(walletProviderLabel(p.key), p.label)
-    }
-  })
-
-  test('tolerates spacing and case', () => {
-    assert.equal(normalizeWalletProvider('Vodafone Cash'), 'vodafone_cash')
-    assert.equal(normalizeWalletProvider('orange-money'), 'orange_money')
-  })
-
-  test("falls back to 'other' instead of throwing — the number is what matters", () => {
-    assert.equal(normalizeWalletProvider(''), 'other')
-    assert.equal(normalizeWalletProvider('some_new_wallet'), 'other')
-    assert.equal(normalizeWalletProvider(null), 'other')
-  })
-})
-
 describe('validatePayout', () => {
   test('a bank account keeps every field, stored whole', () => {
     const record = validatePayout({
@@ -401,35 +362,31 @@ describe('validatePayout', () => {
     assert.equal(record.bank_name, '')
   })
 
-  test('a wallet keeps its number and provider', () => {
-    const record = validatePayout({
-      method: 'wallet',
-      account_name: 'Kareem El Adl',
-      wallet_provider: 'vodafone_cash',
-      wallet_number: '+20 101 234 5678',
-    })
-    assert.equal(record.account_ref, '01012345678')
-    assert.equal(record.provider, 'vodafone_cash')
+  test('refuses a wallet submission from an older client', () => {
+    throwsPayoutError(
+      () => validatePayout({ method: 'wallet', account_name: 'Kareem El Adl', wallet_number: '01012345678' }),
+      /no longer available/
+    )
   })
 
   test('switching method drops the previous method’s fields', () => {
-    // A host moving from a bank account to a wallet must not keep a stale IBAN.
+    // A host moving from a bank account to InstaPay must not keep a stale IBAN.
     const record = validatePayout({
-      method: 'wallet',
+      method: 'instapay',
       account_name: 'Kareem El Adl',
       bank_name: 'Banque Misr',
       iban: IBAN_EG,
       account_number: '123456789012',
       swift_bic: 'NBEGEGCX',
       branch: 'Zamalek',
-      wallet_number: '01012345678',
+      instapay_address: 'kareem@instapay',
     })
     assert.equal(record.iban, '')
     assert.equal(record.account_number, '')
     assert.equal(record.bank_name, '')
     assert.equal(record.swift_bic, '')
     assert.equal(record.branch, '')
-    assert.equal(record.account_ref, '01012345678')
+    assert.equal(record.account_ref, 'kareem@instapay')
   })
 
   test('validates the name before the method-specific fields', () => {
@@ -482,7 +439,7 @@ describe('payoutDisplay', () => {
     )
   })
 
-  test('pairs a wallet number with its provider', () => {
+  test('pairs a retired wallet row’s number with its provider', () => {
     assert.equal(
       payoutDisplay({ ...bank, method: 'wallet', account_ref: '01012345678', provider: 'vodafone_cash', bank_name: '', iban: '', account_number: '' }),
       'Vodafone Cash · 01012345678'
@@ -515,6 +472,15 @@ describe('rowToPayoutMethod', () => {
     assert.equal(view.iban_formatted, 'EG38 0019 0005 0000 0000 2631 8000 2')
     assert.equal(view.display, 'Banque Misr · EG38 0019 0005 0000 0000 2631 8000 2')
     assert.equal(view.updated_at, '2026-06-01T10:00:00.000Z')
+  })
+
+  test('still reads a retired wallet row, with its provider label', () => {
+    // A host who saved a wallet before it was retired must keep seeing it —
+    // dropping the row would lose the only place we know to pay them.
+    const view = rowToPayoutMethod({ method: 'wallet', account_name: 'K', account_ref: '01012345678', provider: 'vodafone_cash' })
+    assert.equal(view.method, 'wallet')
+    assert.equal(view.method_label, 'Wallet')
+    assert.equal(view.display, 'Vodafone Cash · 01012345678')
   })
 
   test('labels a wallet provider, and leaves the other two without one', () => {

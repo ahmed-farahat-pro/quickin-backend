@@ -161,10 +161,10 @@ describe('the gate contract the clients branch on', () => {
   })
 
   test('the body carries the warning in BOTH fields', () => {
-    const body = warningGateBody({ id: 'abc', message: 'Please keep it on QuickIn.' })
+    const body = warningGateBody({ id: 'abc', message: 'Please keep it on Quick In.' })
     assert.deepEqual(body, {
-      error: 'Please keep it on QuickIn.',
-      policyWarning: { id: 'abc', message: 'Please keep it on QuickIn.' },
+      error: 'Please keep it on Quick In.',
+      policyWarning: { id: 'abc', message: 'Please keep it on Quick In.' },
     })
   })
 

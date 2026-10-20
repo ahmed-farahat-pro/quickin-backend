@@ -1,4 +1,4 @@
-// QuickIn end-to-end flow test (the path web + iOS + Android all exercise).
+// Quick In end-to-end flow test (the path web + iOS + Android all exercise).
 // Run:  cd quickin-backend && DATABASE_URL="<neon-url>" node test/full-flow.mjs
 //       BASE_URL defaults to the deployed backend; override to test local (:4000).
 //
@@ -33,7 +33,7 @@ async function cleanup() {
 }
 
 ;(async () => {
-  console.log(`\nQuickIn full-flow test against ${BASE}\n`)
+  console.log(`\nQuick In full-flow test against ${BASE}\n`)
   await cleanup()
 
   console.log('Browse')

@@ -3,7 +3,7 @@ import { getUserFromRequest } from '@/lib/local/auth'
 import { getListingGateState, getPayoutMethod, savePayoutMethod, deletePayoutMethod } from '@/lib/local/db'
 import { isPayoutMethodError, isPayoutReady, validatePayout } from '@/lib/local/payout-method-core'
 
-// The signed-in host's payout method — where QuickIn sends their earnings.
+// The signed-in host's payout method — where Quick In sends their earnings.
 //   GET    /api/local/host/payout-method  → { payout_method, payout_ready, is_host }
 //   PUT    /api/local/host/payout-method  {method, account_name, …} → saves/replaces it
 //   DELETE /api/local/host/payout-method  → removes it
