@@ -18,7 +18,8 @@ npm run dev        # API at http://localhost:4000
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET  | `/api/local/listings` | All published listings. Filters: `?location=&guests=&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD`. `?sort=` is `recommended` (default) \| `price_asc` \| `price_desc` \| `newest`; **`recommended` ranks by rating + completed bookings** — see Search ranking below |
+| GET  | `/api/local/destinations` | The explore **region rail**: all 12 regions in rail order, each `{ name, slug, name_ar, icon, count, sub_areas: [{ id, slug, name, name_ar, km_marker, location_note, count }] }`. A sub-area is a `resorts` row (active, or still holding published listings), ordered by `sort_order` → km marker → name. Empty `sub_areas` = hide the chip row. Public, `s-maxage=60`. Before `migrate-destinations.mjs` runs it degrades to names only. Pure logic: `destinations-core.ts` |
+| GET  | `/api/local/listings` | All published listings. Filters: `?region=` (name or slug) `&area=` (sub-area slug — narrows within the region; unknown slug → `[]`) `&location=&guests=&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD`. `?sort=` is `recommended` (default) \| `price_asc` \| `price_desc` \| `newest`; **`recommended` ranks by rating + completed bookings** — see Search ranking below |
 | GET  | `/api/local/listings/[id]` | One listing by UUID (404 if missing). **404 also when the listing is unpublished** — a listing a host or an operator has taken down stops resolving from a deep link too, not only from search. Its own host still gets it (that is what the dashboard's *View* opens); `?asHost=1` additionally switches to the raw-price projection, and is honoured only for the actual host |
 | POST | `/api/local/listings` | Create a listing (approved + identity-verified host). The response is the listing plus **`pin_warning`** — `null`, or `{code, scope, message}` when the map pin falls outside the `country` / `region` the host chose. It is a **warning**: the listing is created either way. A lat/lng outside ±90/±180 is a different matter and answers **400** |
 | PATCH | `/api/local/listings/[id]` | The host edits their listing. Carries the same **`pin_warning`** field, for the same reason — a pin can be dragged into the wrong country from the editor too |
@@ -71,6 +72,9 @@ npm run dev        # API at http://localhost:4000
 | DELETE | `/api/local/host/payout-method` | Remove it — `{removed, payout_method:null, payout_ready:false}`. Idempotent |
 | GET  | `/api/local/admin/settings/commission` | The platform commission — `{rate, percent, updated_at, updated_by}`. Staff session with the `pricing` module |
 | PUT  | `/api/local/admin/settings/commission` | Set it — `{percent}` (e.g. `12.5`). `400` outside 0–100. Reprices every listing immediately (the `impact` payload is `{listings}` — the old `services` count is gone); existing bookings keep their snapshotted rate |
+| GET  | `/api/local/admin/host-response-alerts` | Booking requests hosts left unanswered 24h+ (`bookings` module). `?status=open` (default) \| `handled` \| `closed` \| `all`. Each row carries the host's contact details and `host_alert_count` (repeat offenders). See [Host response alerts](#host-response-alerts) |
+| POST | `/api/local/admin/host-response-alerts` | `{id, note}` — open → handled. `note` is required (≤500). `409` when the alert is no longer open. Does not touch the booking. Audited as `host_response_alert_handled` |
+| GET  | `/api/cron/host-response-alerts` | The nightly sweep (01:00 UTC = 03:00 Cairo in winter, 04:00 in summer). Opens/refreshes alerts, closes answered or past-check-in ones, reminds each host once per night. `Authorization: Bearer <CRON_SECRET>` when that is set. Returns `{today, resolved, expired, opened, stale, nudged}` |
 
 All responses send `Access-Control-Allow-Origin: *`. Every POST route answers a CORS
 preflight (`OPTIONS` → `204`) so browsers can call the API cross-origin.
@@ -1138,6 +1142,7 @@ host why it disappeared and still pings /ops.
 | `FLASH_INTEGRATION_ID` | for Flash | The numeric integration id Flash assigned (one per payment method — Flash and Instapay-via-Flash have different ids). |
 | `FLASH_HMAC_SECRET` | for Flash | Verifies webhook signatures. Without it Flash counts as **unconfigured** — an automatic method we can't authenticate isn't offered. |
 | `FLASH_BASE_URL` | optional | Defaults to production `https://beta-api.useflash.app`. Staging is `https://stg-api.useflash.app`. **All four credentials above must be set** or Flash stays out of `available_methods` whatever the admin toggle says. |
+| `CRON_SECRET` | yes (prod) | Bearer secret Vercel sends to `/api/cron/*`. **Opt-in guard**: unset, the cron routes are open to anyone — and `host-response-alerts` sends hosts reminders, so set it in production. |
 | `BLOB_READ_WRITE_TOKEN` | optional | Vercel Blob store for listing photos. Injected automatically when a Blob store is linked to the project; locally via `vercel env pull`. **Unset is a supported state** — photos then keep being stored inline as data URLs, exactly as they were before. See [Listing photos live in Blob, not in the database](#listing-photos-live-in-blob-not-in-the-database). |
 
 ## Run the whole stack locally
@@ -2364,11 +2369,13 @@ the list of record. Recent additions:
 | `migrate-staff-rbac.mjs` | `staff_accounts`, `staff_permissions`, `staff_sessions`, `staff_password_resets`, `staff_audit_log` — the `/ops` role system |
 | `migrate-web-tables.mjs` | Tables and columns the web app reads that never had a script (`host_applications`, `id_verifications`, `otp_codes`, `saved_listings`, `conversations`, `chat_messages`, `users.is_host`/`host_type`, …) |
 | `migrate-resorts.mjs` | `resorts`, `resort_aliases`, `resort_submissions`, `listings.resort_id`/`resort_name` — the curated compound catalog that replaces free-text location as the geographic filter |
+| `migrate-destinations.mjs` | `resorts.name_ar` / `km_marker` / `location_note` / `sort_order`, plus the business owner's ~120 sub-areas across North Coast, Ain Sokhna, Ras Sudr, Cairo, New Cairo and Giza (2026-10-22). Same name in two regions → region-suffixed slug (`lasirena-ain-sokhna`). Unused starter resorts not in the list are deactivated. Run after `migrate-resorts.mjs` |
 | `migrate-analytics.mjs` | `bookings.cancelled_by`/`cancelled_by_role`/`cancellation_policy`/`commission_rate`/`refunded_at`, the `platform_commission_rate` setting, and the analytics indexes |
 | `migrate-instapay.mjs` | `app_settings`, `payment_proofs`, and the four seeded `instapay_*` setting rows |
 | `migrate-flash.mjs` | `flash_orders` (one row per Flash checkout attempt) and the `flash_enabled = '0'` setting. Run it **before** deploying the Flash routes — they read the table |
 | `migrate-host-verification.mjs` | `id_verifications.doc_type`, `host_applications.verification_id` (links an application to the ID filed with it), `listings.unpublished_by_verification`, and the host verification-status index. Also **reports** how many approved hosts are unverified and how many live listings they hold — read that before deploying, since the gate is a hard cutover |
 | `migrate-commission.mjs` | Makes the platform commission safe on any database: creates `app_settings` if absent, seeds `platform_commission_rate`, adds `bookings.commission_rate` — and backfills it on **every** booking, not just paid ones (`migrate-analytics.mjs` only did the paid ones, which was fine when the column was a reporting field and is not now that guest prices derive from it) |
+| `migrate-host-response-alerts.mjs` | `host_response_alerts` (one row per booking request a host left unanswered 24h+) and a partial index on pending bookings by `created_at`. Run it **before** deploying — the cron and the ops screen 500 without it (the alert centre degrades to 0) |
 | `migrate-activity.mjs` | `user_logins` (the one activity event nothing recorded) plus timestamp indexes on `users`/`listings`/`payment_proofs` and a partial index on open reports — the derived activity feed and alert centre in `/ops` |
 | `migrate-documents-audit.mjs` | The `staff_audit_log (target_type, target_id)` index, a partial index on `users.verification_status`, the `documents` module grant for existing `verifications`/`listings` moderators, and the backfill of `users.verification_status` from `id_verifications` — the source of truth behind the verified badge |
 | `migrate-account-status.mjs` | `users.account_status`/`status_reason`/`status_changed_at`/`status_changed_by`, `listings.unpublished_by_admin`, and the user search indexes — the block / remove lifecycle behind `/ops` → Users |
@@ -2454,3 +2461,42 @@ guests requested — are gone from the API. Code and API only; **the data stays*
   is `400 Unknown entity`, and the commission `impact` counts listings only.
 - `src/lib/local/services.ts` is deleted, and with it the only code that created
   service-request notifications. `scripts/seed-demo.mjs` no longer seeds services.
+
+## Host response alerts
+
+Added 2026-10-22. A guest's booking request that the host has neither accepted nor
+declined after **24 hours** becomes an alert in `/ops → Host response`, and the host
+is reminded once a night until they answer.
+
+| Piece | Role |
+|---|---|
+| `host_response_alerts` table | `scripts/migrate-host-response-alerts.mjs`. One row per booking, ever (`booking_id` is unique). `status` is `open` → `handled` (staff noted what they did) → `resolved` (the booking left `pending`) or `expired` (check-in passed unanswered) |
+| `lib/local/host-response-alerts-core.ts` | The pure rules, tested by `test/unit/host-response-alerts-core.test.mjs`: the 24h threshold, the Cairo calendar day, `closureFor`, the once-a-night nudge gap, the handling note, the reminder copy. **Byte-identical copy in quickin-frontend** — `scripts/check-host-response-alerts-core-parity.mjs` guards it |
+| `lib/local/host-response-alerts.ts` | The SQL: `runHostResponseSweep`, the admin list/handle, and the degrade-to-0 counters for the alert centre |
+| `GET /api/cron/host-response-alerts` | Scheduled in `vercel.json` at `0 1 * * *` |
+| Alert centre | `stale_booking_requests` in `ALERT_SOURCES` (`activity-core.ts`, both repos), gated by `bookings` |
+
+**Why stored rows**, when every other alert is a derived count: staff need to mark an
+alert handled with a note, and the history shows which hosts ignore guests repeatedly
+(`host_alert_count`).
+
+**The sweep, in order:** (1) close every active alert whose booking left `pending`
+(`resolved`, reason = the booking's status) or whose check-in date has passed
+(`expired`); (2) upsert an alert for every `pending` booking with `created_at` ≤ now−24h
+and `check_in` ≥ today in Cairo. A `resolved` row whose booking went back to `pending`
+(a guest re-uploading after a decline) reopens; (3) remind each of those hosts by
+in-app notification, push and email, unless they were reminded within the last
+`NUDGE_MIN_GAP_HOURS` (20, not 24, because Vercel fires a daily cron "within the
+hour"). Re-running the sweep the same night opens nothing and nudges no one.
+
+**Behaviour to know:**
+- Running once a day means a request is flagged between 24 and 48 hours after it was
+  made. The screen shows its real age.
+- `handled` does not stop the host reminders. They are about the host, not staff,
+  and continue until the booking leaves `pending` or its check-in passes.
+- Marking handled never changes the booking. To decide a request yourself, use
+  `/ops → Booking Requests`.
+- **DST:** a Vercel cron is fixed UTC and can't follow Egypt's daylight saving.
+  `01:00 UTC` is **03:00 Cairo in winter (EET, UTC+2) and 04:00 in summer (EEST,
+  UTC+3)**. An exact 03:00 all year would need a second cron entry plus an hour check
+  in the route.

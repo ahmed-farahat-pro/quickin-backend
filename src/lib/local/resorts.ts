@@ -90,11 +90,19 @@ export async function resolveResortSelection(input: {
   if (!slug) return { resort_id: null, resort_name: typed, region: fallbackRegion }
 
   // 2 + 3. A previously-merged misspelling, or an existing catalog name.
+  // The same compound name can exist in several regions (Lasirena is in North
+  // Coast, Ain Sokhna and Ras Sudr); the catalog keeps slugs globally unique by
+  // suffixing the region ('lasirena-ain-sokhna'), so a host who picked a region
+  // first is matched to THAT region's one rather than being moved to another.
   const { rows: matched } = await pool.query<{ id: string; region: string }>(
     `SELECT r.id, r.region FROM resorts r
-      WHERE r.is_active AND (r.slug = $1 OR r.id = (SELECT resort_id FROM resort_aliases WHERE slug = $1))
+      WHERE r.is_active AND (
+            r.slug = $1
+         OR r.id = (SELECT resort_id FROM resort_aliases WHERE slug = $1)
+         OR ($2::text IS NOT NULL AND r.region = $2 AND r.slug = $1 || '-' || $3))
+      ORDER BY (r.region = $2) DESC NULLS LAST
       LIMIT 1`,
-    [slug]
+    [slug, fallbackRegion, fallbackRegion ? resortSlug(fallbackRegion) : null]
   )
   if (matched[0]) return { resort_id: matched[0].id, resort_name: null, region: matched[0].region }
 

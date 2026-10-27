@@ -308,6 +308,9 @@ export const ALERT_SOURCES = [
   { key: 'pending_resort_submissions', label: 'Resort submissions to review', module: 'resorts', href: '/ops/resorts' },
   { key: 'flagged_users', label: 'Users caught sharing contact details', module: 'moderation', href: '/ops/moderation' },
   { key: 'open_disputes', label: 'Guest disputes to investigate', module: 'disputes', href: '/ops/disputes' },
+  // Stored by the nightly host-response sweep, not counted live — see
+  // host-response-alerts.ts. Gated by `bookings`, same as Booking Requests.
+  { key: 'stale_booking_requests', label: 'Booking requests hosts left unanswered 24h+', module: 'bookings', href: '/ops/host-response' },
 ] as const
 
 export type AlertKey = (typeof ALERT_SOURCES)[number]['key']

@@ -18,8 +18,12 @@
 // cannot import a .ts module. Keep all three in step.
 
 /** The regions a resort can belong to. A listing's region is DERIVED from its
- *  resort, so this is the single source of truth for both. */
-export const REGION_VALUES = ['North Coast', 'Ain Sokhna', 'El Gouna', 'Cairo'] as const
+ *  resort, so this is the single source of truth for both. Order is the order
+ *  guests see in the explore region rail (destinations-core.ts REGION_META). */
+export const REGION_VALUES = [
+  'North Coast', 'Ain Sokhna', 'Ras Sudr', 'Cairo', 'New Cairo', 'Giza',
+  'Alexandria', 'Marsa Matrouh', 'Hurghada', 'El Gouna', 'Sharm El Sheikh', 'Dahab',
+] as const
 export type Region = (typeof REGION_VALUES)[number]
 
 export function isRegion(value: unknown): value is Region {

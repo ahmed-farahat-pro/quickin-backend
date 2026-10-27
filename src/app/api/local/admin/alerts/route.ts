@@ -34,6 +34,7 @@ export async function GET(req: Request) {
           pending_listings: stats.oldest_listing,
           pending_payments: stats.oldest_payment,
           open_reports: stats.oldest_report,
+          stale_booking_requests: stats.oldest_stale_request,
         },
       },
       { headers: CORS },

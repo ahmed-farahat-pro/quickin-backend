@@ -22,13 +22,17 @@ import {
 
 describe('REGION_VALUES', () => {
   test('is the closed set a resort may belong to', () => {
-    assert.deepEqual([...REGION_VALUES], ['North Coast', 'Ain Sokhna', 'El Gouna', 'Cairo'])
+    assert.deepEqual([...REGION_VALUES], [
+      'North Coast', 'Ain Sokhna', 'Ras Sudr', 'Cairo', 'New Cairo', 'Giza',
+      'Alexandria', 'Marsa Matrouh', 'Hurghada', 'El Gouna', 'Sharm El Sheikh', 'Dahab',
+    ])
   })
 
   test('isRegion accepts members and rejects everything else', () => {
     assert.equal(isRegion('North Coast'), true)
     assert.equal(isRegion('north coast'), false, 'case-sensitive: it is a stored value, not user input')
-    assert.equal(isRegion('Alexandria'), false)
+    assert.equal(isRegion('Dahab'), true)
+    assert.equal(isRegion('Sahel'), false)
     assert.equal(isRegion(null), false)
     assert.equal(isRegion(42), false)
   })

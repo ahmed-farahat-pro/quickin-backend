@@ -5,6 +5,7 @@ import { normalizeStatus } from './user-admin-core'
 import { countOpenDisputes, oldestOpenDisputeAt } from './disputes'
 import { countFlaggedUsers, oldestFlaggedAt } from './moderation'
 import { countPendingIdChanges, oldestPendingIdChangeAt } from './id-changes'
+import { countOpenHostResponseAlerts, oldestOpenHostResponseAlertAt } from './host-response-alerts'
 import { idChangeColumnFor, idColumnFor, statusForAction } from './document-core'
 import { canPay, isLiveStayPass, outcomeFor, PaymentProofError } from './payment-flow-core'
 import type { PaymentReviewAction } from './payment-flow-core'
@@ -22,7 +23,8 @@ import {
 } from './cancellation-core'
 import { BookingConflictError, holdsDatesSql } from './availability-core'
 import { resolveResortSelection } from './resorts'
-import { normalizeResortName, validateResortName } from './resort-core'
+import { normalizeResortName, validateResortName, REGION_VALUES } from './resort-core'
+import { buildDestinationTree, findRegion, type DestinationRegion, type SubAreaRow } from './destinations-core'
 import {
   PUBLISH_RESPECTING_HOST_SQL,
   goesLiveOnReactivate,
@@ -203,7 +205,7 @@ export interface Listing {
 
 // The coarse, host-picked areas Quick In covers. The host chooses one of these
 // first; search can filter by it (chips) and it's matched by free-text too.
-export const REGIONS = ['North Coast', 'Ain Sokhna', 'El Gouna', 'Cairo'] as const
+export const REGIONS = REGION_VALUES
 export type Region = (typeof REGIONS)[number]
 
 export type ListingSort = 'recommended' | 'price_asc' | 'price_desc' | 'newest'
@@ -213,8 +215,11 @@ export interface SearchFilters {
   q?: string
   /** Back-compat alias for q (the explore bar still sends `location`). */
   location?: string
-  /** Exact region chip (one of REGIONS). */
+  /** Exact region chip (one of REGIONS, or its slug from REGION_META). */
   region?: string
+  /** Sub-area chip: a resort's slug (see destinations-core.ts). Narrows within
+   *  the region; an unknown slug matches nothing rather than being ignored. */
+  area?: string
   /** All published listings by a given host (for "more from this host"). */
   host?: string
   guests?: number
@@ -421,10 +426,15 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
       `(l.title ILIKE $${p} OR l.location ILIKE $${p} OR l.region ILIKE $${p} OR l.country ILIKE $${p})`
     )
   }
-  // Exact region chip.
+  // Exact region chip. A slug ('north-coast') is accepted as well as the name.
   if (filters.region && filters.region.trim()) {
-    params.push(filters.region.trim())
+    params.push(findRegion(filters.region)?.name ?? filters.region.trim())
     where.push(`l.region ILIKE $${params.length}`)
+  }
+  // Sub-area chip — a catalog resort, by slug. Index: idx_listings_resort.
+  if (filters.area && filters.area.trim()) {
+    params.push(filters.area.trim().toLowerCase())
+    where.push(`l.resort_id = (SELECT id FROM resorts WHERE slug = $${params.length})`)
   }
   // A specific host's listings.
   if (filters.host && /^[0-9a-fA-F-]{36}$/.test(filters.host)) {
@@ -519,6 +529,39 @@ export async function getRegionCounts(): Promise<{ region: string; count: number
   )
   const map = new Map(rows.map((r) => [String(r.region), Number(r.count)]))
   return REGIONS.map((region) => ({ region, count: map.get(region) ?? 0 }))
+}
+
+/**
+ * The explore region rail: every region (rail order) with its sub-areas and live
+ * counts. A sub-area is offered when it is active OR still has published listings
+ * (a deactivated resort keeps its guests able to find what's already there).
+ *
+ * Degrades rather than 500s before scripts/migrate-destinations.mjs has run on a
+ * database: the display columns are missing (42703), so it falls back to names
+ * only and the clients just show chips without Arabic names or km markers.
+ */
+export async function getDestinations(): Promise<DestinationRegion[]> {
+  const counts = await pool.query(
+    `SELECT region, count(*)::int AS count FROM listings
+      WHERE is_published = true AND region IS NOT NULL GROUP BY region`
+  )
+  const regionCounts = new Map(counts.rows.map((r) => [String(r.region), Number(r.count)]))
+  const sub = (cols: string) => `
+    SELECT r.id, r.slug, r.name, r.region, ${cols},
+           (SELECT count(*)::int FROM listings l WHERE l.resort_id = r.id AND l.is_published = true) AS count
+      FROM resorts r
+     WHERE r.is_active
+        OR EXISTS (SELECT 1 FROM listings l WHERE l.resort_id = r.id AND l.is_published = true)`
+  let rows: SubAreaRow[]
+  try {
+    rows = (await pool.query(sub('r.name_ar, r.km_marker, r.location_note, r.sort_order'))).rows
+  } catch (err) {
+    if ((err as { code?: string }).code !== '42703') throw err
+    rows = (await pool.query(
+      sub('NULL::text AS name_ar, NULL::numeric AS km_marker, NULL::text AS location_note, 0 AS sort_order')
+    )).rows
+  }
+  return buildDestinationTree(regionCounts, rows)
 }
 
 /**
@@ -5458,23 +5501,30 @@ export async function adminStats(): Promise<AdminStats> {
   // centre down on any database where migrate-policy-violations / migrate-disputes
   // hasn't run. Each helper answers 0 in that case, so the console degrades to
   // "nothing in this queue" instead of breaking.
-  const [flagged_users, open_disputes, pending_id_changes, oldest_flag, oldest_dispute, oldest_id_change] =
+  const [
+    flagged_users, open_disputes, pending_id_changes, stale_booking_requests,
+    oldest_flag, oldest_dispute, oldest_id_change, oldest_stale_request,
+  ] =
     await Promise.all([
       countFlaggedUsers(),
       countOpenDisputes(),
       countPendingIdChanges(),
+      countOpenHostResponseAlerts(),
       oldestFlaggedAt(),
       oldestOpenDisputeAt(),
       oldestPendingIdChangeAt(),
+      oldestOpenHostResponseAlertAt(),
     ])
   return {
     ...(rows[0] as AdminStats),
     flagged_users,
     open_disputes,
     pending_id_changes,
+    stale_booking_requests,
     oldest_flag,
     oldest_dispute,
     oldest_id_change,
+    oldest_stale_request,
   }
 }
 
@@ -6247,6 +6297,9 @@ export interface AdminStats {
   flagged_users: number
   /** Guest disputes still open or in review — the Disputes queue. */
   open_disputes: number
+  /** Booking requests unanswered 24h+ with an open alert — /ops → Host response. */
+  stale_booking_requests: number
+  oldest_stale_request: string | null
   /** When the oldest item in each queue arrived, so an alert can show how long it has waited. */
   oldest_verification: string | null
   oldest_id_change: string | null
