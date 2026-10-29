@@ -2,14 +2,22 @@
 //
 // A listing points at EITHER a catalog resort (resort_id) OR free text the host
 // typed (resort_name), never both — a CHECK constraint enforces it. Free text still
-// publishes and is shown to guests as typed; it just queues for an admin to approve,
-// rename or merge.
+// publishes and is shown to guests as typed, and explore files it under the
+// region's "Other" chip. It also queues, but mapping it into the catalog is
+// OPTIONAL (2026-10-29): the default is that it stays Other, so the chip row
+// doesn't grow a new sub-area for every name a host invents.
 //
 // The pure naming rules live in resort-core.ts (unit-tested, no imports). This file
 // is the SQL layer. A near-identical copy exists in quickin-frontend — both projects
 // create listings (iOS here, web there), so both need the write path.
 import { pool } from './pool'
 import { normalizeResortName, resortSlug, isRegion, isValidResortName } from './resort-core'
+import { OTHER_AREA_SLUG } from './destinations-core'
+
+/** 'Other' is the explore catch-all chip (destinations-core.ts), never a catalog resort. */
+function assertNotOtherSlug(slug: string): void {
+  if (slug === OTHER_AREA_SLUG) throw new Error('"Other" is reserved — listings without a catalog resort already show under it')
+}
 
 export interface ResortOption {
   id: string
@@ -208,6 +216,7 @@ export async function approveResortSubmission(input: {
     let resortId = input.mergeIntoId && isUuid(input.mergeIntoId) ? input.mergeIntoId : null
     if (!resortId) {
       const canonicalSlug = resortSlug(name)
+      assertNotOtherSlug(canonicalSlug)
       const { rows: found } = await client.query<{ id: string }>(`SELECT id FROM resorts WHERE slug = $1`, [canonicalSlug])
       if (found[0]) {
         resortId = found[0].id
@@ -298,6 +307,7 @@ export async function createResort(input: {
   if (!isRegion(input.region)) throw new Error('Pick a valid region')
   const slug = resortSlug(name)
   if (!slug) throw new Error('That name has no usable characters')
+  assertNotOtherSlug(slug)
 
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO resorts (name, slug, region, created_by) VALUES ($1, $2, $3, $4)
@@ -440,6 +450,7 @@ export async function resolveListingResort(input: {
 
       const slug = resortSlug(name)
       if (!slug) throw new Error('That name has no usable characters')
+      assertNotOtherSlug(slug)
       // Reuse rather than duplicate if the admin types a name that already exists.
       const { rows: found } = await client.query<{ id: string }>(`SELECT id FROM resorts WHERE slug = $1`, [slug])
       if (found[0]) {
@@ -517,6 +528,7 @@ export async function updateResort(
     if (!name) throw new Error('A resort name is required')
     slug = resortSlug(name)
     if (!slug) throw new Error('That name has no usable characters')
+    assertNotOtherSlug(slug)
     const { rows: clash } = await pool.query(`SELECT 1 FROM resorts WHERE slug = $1 AND id <> $2`, [slug, id])
     if (clash.length) throw new Error(`Another resort already uses the name "${name}"`)
   }

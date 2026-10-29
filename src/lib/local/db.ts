@@ -24,7 +24,7 @@ import {
 import { BookingConflictError, holdsDatesSql } from './availability-core'
 import { resolveResortSelection } from './resorts'
 import { normalizeResortName, validateResortName, REGION_VALUES } from './resort-core'
-import { buildDestinationTree, findRegion, type DestinationRegion, type SubAreaRow } from './destinations-core'
+import { buildDestinationTree, findRegion, isOtherArea, type DestinationRegion, type SubAreaRow } from './destinations-core'
 import {
   PUBLISH_RESPECTING_HOST_SQL,
   goesLiveOnReactivate,
@@ -433,8 +433,14 @@ export async function getListings(filters: SearchFilters = {}): Promise<Listing[
   }
   // Sub-area chip — a catalog resort, by slug. Index: idx_listings_resort.
   if (filters.area && filters.area.trim()) {
-    params.push(filters.area.trim().toLowerCase())
-    where.push(`l.resort_id = (SELECT id FROM resorts WHERE slug = $${params.length})`)
+    // 'other' is the catch-all chip: everything the catalog doesn't cover,
+    // including the free text a host typed (see destinations-core.ts).
+    if (isOtherArea(filters.area)) {
+      where.push(`l.resort_id IS NULL`)
+    } else {
+      params.push(filters.area.trim().toLowerCase())
+      where.push(`l.resort_id = (SELECT id FROM resorts WHERE slug = $${params.length})`)
+    }
   }
   // A specific host's listings.
   if (filters.host && /^[0-9a-fA-F-]{36}$/.test(filters.host)) {
@@ -546,6 +552,11 @@ export async function getDestinations(): Promise<DestinationRegion[]> {
       WHERE is_published = true AND region IS NOT NULL GROUP BY region`
   )
   const regionCounts = new Map(counts.rows.map((r) => [String(r.region), Number(r.count)]))
+  const others = await pool.query(
+    `SELECT region, count(*)::int AS count FROM listings
+      WHERE is_published = true AND region IS NOT NULL AND resort_id IS NULL GROUP BY region`
+  )
+  const otherCounts = new Map(others.rows.map((r) => [String(r.region), Number(r.count)]))
   const sub = (cols: string) => `
     SELECT r.id, r.slug, r.name, r.region, ${cols},
            (SELECT count(*)::int FROM listings l WHERE l.resort_id = r.id AND l.is_published = true) AS count
@@ -561,7 +572,7 @@ export async function getDestinations(): Promise<DestinationRegion[]> {
       sub('NULL::text AS name_ar, NULL::numeric AS km_marker, NULL::text AS location_note, 0 AS sort_order')
     )).rows
   }
-  return buildDestinationTree(regionCounts, rows)
+  return buildDestinationTree(regionCounts, rows, otherCounts)
 }
 
 /**

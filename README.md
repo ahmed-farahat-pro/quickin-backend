@@ -18,8 +18,8 @@ npm run dev        # API at http://localhost:4000
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET  | `/api/local/destinations` | The explore **region rail**: all 12 regions in rail order, each `{ name, slug, name_ar, icon, count, sub_areas: [{ id, slug, name, name_ar, km_marker, location_note, count }] }`. A sub-area is a `resorts` row (active, or still holding published listings), ordered by `sort_order` → km marker → name. Empty `sub_areas` = hide the chip row. Public, `s-maxage=60`. Before `migrate-destinations.mjs` runs it degrades to names only. Pure logic: `destinations-core.ts` |
-| GET  | `/api/local/listings` | All published listings. Filters: `?region=` (name or slug) `&area=` (sub-area slug — narrows within the region; unknown slug → `[]`) `&location=&guests=&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD`. `?sort=` is `recommended` (default) \| `price_asc` \| `price_desc` \| `newest`; **`recommended` ranks by rating + completed bookings** — see Search ranking below |
+| GET  | `/api/local/destinations` | The explore **region rail**: all 12 regions in rail order, each `{ name, slug, name_ar, icon, count, sub_areas: [{ id, slug, name, name_ar, km_marker, location_note, count }] }`. A sub-area is a `resorts` row (active, or still holding published listings), ordered by `sort_order` → km marker → name. Empty `sub_areas` = hide the chip row. When a region has chips AND published listings with no catalog resort, a synthetic **Other** chip comes last (`slug: 'other'`, `id: 'other-<region slug>'`, `name_ar: 'أخرى'`) — see *Typed resorts go to Other* below. Public, `s-maxage=60`. Before `migrate-destinations.mjs` runs it degrades to names only. Pure logic: `destinations-core.ts` |
+| GET  | `/api/local/listings` | All published listings. Filters: `?region=` (name or slug) `&area=` (sub-area slug — narrows within the region; unknown slug → `[]`; **`other`** = listings with no catalog resort, i.e. what hosts typed themselves) `&location=&guests=&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD`. `?sort=` is `recommended` (default) \| `price_asc` \| `price_desc` \| `newest`; **`recommended` ranks by rating + completed bookings** — see Search ranking below |
 | GET  | `/api/local/listings/[id]` | One listing by UUID (404 if missing). **404 also when the listing is unpublished** — a listing a host or an operator has taken down stops resolving from a deep link too, not only from search. Its own host still gets it (that is what the dashboard's *View* opens); `?asHost=1` additionally switches to the raw-price projection, and is honoured only for the actual host |
 | POST | `/api/local/listings` | Create a listing (approved + identity-verified host). The response is the listing plus **`pin_warning`** — `null`, or `{code, scope, message}` when the map pin falls outside the `country` / `region` the host chose. It is a **warning**: the listing is created either way. A lat/lng outside ±90/±180 is a different matter and answers **400** |
 | PATCH | `/api/local/listings/[id]` | The host edits their listing. Carries the same **`pin_warning`** field, for the same reason — a pin can be dragged into the wrong country from the editor too |
@@ -568,6 +568,22 @@ as free text rather than dropped. It has no match key, so it can't auto-link to 
 catalog row and can't queue (`resort_submissions` is keyed on the slug), but it is
 stored, returned to the apps as typed, and visible to an admin in the /ops
 unassigned-names sweep.
+
+### Typed resorts go to "Other" (2026-10-29)
+
+A resort a host types that isn't in the catalog is **not** mapped into a new
+sub-area by default — that grew every region's chip row without bound. The
+listing keeps `resort_name` (guests still see what the host typed) and explore
+files it under the region's **Other** chip: `buildDestinationTree` appends it from
+a per-region count of published `resort_id IS NULL` listings, and the feed reads
+`?area=other` as `l.resort_id IS NULL`. Blank-resort listings land there too.
+
+Mapping stays **optional**: the /ops queue, the "Map resort…" button on a pending
+listing and the unassigned sweep all still work, but approving a listing no longer
+stops on a resort review, and pending submissions no longer raise an /ops alert.
+`other` is a reserved slug — every path that creates or renames a catalog resort
+refuses it (`assertNotOtherSlug` in `resorts.ts`). No migration, no client change:
+all three apps render whatever `sub_areas` arrive and send the chip's slug.
 
 `resort-core.ts` is byte-identical to the web project's copy — the same rule runs on
 the web host forms, which localize the problem code. `scripts/check-resort-core-parity.mjs`

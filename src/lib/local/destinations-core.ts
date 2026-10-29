@@ -102,23 +102,37 @@ export function compareSubAreas(a: SubAreaRow, b: SubAreaRow): number {
 }
 
 /**
+ * The catch-all chip. A location a host types that isn't in the catalog is NOT
+ * mapped into a new sub-area (that grew the chip row without bound) — the listing
+ * keeps the host's text for guests and lands here. Every listing in a region with
+ * no catalog resort counts, typed or blank. The feed reads `?area=other` as
+ * `resort_id IS NULL`; no catalog resort may use this slug.
+ */
+export const OTHER_AREA_SLUG = 'other'
+
+/** True when an `area=` value means the catch-all rather than a catalog slug. */
+export function isOtherArea(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().toLowerCase() === OTHER_AREA_SLUG
+}
+
+/**
  * Assemble the tree every client renders. Always returns all REGION_META regions
  * in rail order (count 0 when empty) so the rail never reshuffles. A region's
  * count is its OWN listing count (a listing with no sub-area still counts), so it
  * is not the sum of its chips. Sub-area rows for an unknown region are dropped.
+ *
+ * `otherCounts` (published listings with no catalog resort, per region) adds the
+ * "Other" chip LAST — only when non-zero, and only beside real chips, since a
+ * region with no catalog sub-areas has no chip row to put it in.
  */
 export function buildDestinationTree(
   regionCounts: ReadonlyMap<string, number>,
-  subAreas: readonly SubAreaRow[]
+  subAreas: readonly SubAreaRow[],
+  otherCounts: ReadonlyMap<string, number> = new Map()
 ): DestinationRegion[] {
-  return REGION_META.map((r) => ({
-    name: r.name,
-    slug: r.slug,
-    name_ar: r.name_ar,
-    icon: r.icon,
-    count: regionCounts.get(r.name) ?? 0,
-    sub_areas: subAreas
-      .filter((s) => s.region === r.name)
+  return REGION_META.map((r) => {
+    const chips: DestinationSubArea[] = subAreas
+      .filter((s) => s.region === r.name && s.slug !== OTHER_AREA_SLUG)
       .slice()
       .sort(compareSubAreas)
       .map((s) => ({
@@ -129,6 +143,19 @@ export function buildDestinationTree(
         km_marker: km(s.km_marker),
         location_note: s.location_note ?? null,
         count: Number(s.count) || 0,
-      })),
-  }))
+      }))
+    const other = Number(otherCounts.get(r.name)) || 0
+    if (chips.length > 0 && other > 0) {
+      chips.push({
+        id: `${OTHER_AREA_SLUG}-${r.slug}`,
+        slug: OTHER_AREA_SLUG,
+        name: 'Other',
+        name_ar: 'أخرى',
+        km_marker: null,
+        location_note: null,
+        count: other,
+      })
+    }
+    return { name: r.name, slug: r.slug, name_ar: r.name_ar, icon: r.icon, count: regionCounts.get(r.name) ?? 0, sub_areas: chips }
+  })
 }

@@ -305,7 +305,8 @@ export const ALERT_SOURCES = [
   { key: 'pending_payments', label: 'Payments to confirm', module: 'payments', href: '/ops/payments' },
   { key: 'disputed_payments', label: 'Payment disputes', module: 'payments', href: '/ops/payments' },
   { key: 'open_reports', label: 'Abuse reports to triage', module: 'reports', href: '/ops/reports' },
-  { key: 'pending_resort_submissions', label: 'Resort submissions to review', module: 'resorts', href: '/ops/resorts' },
+  // No resort-submission alert: since 2026-10-29 a typed resort just shows under its
+  // region's "Other" chip, and mapping it is optional — not work to be nagged about.
   { key: 'flagged_users', label: 'Users caught sharing contact details', module: 'moderation', href: '/ops/moderation' },
   { key: 'open_disputes', label: 'Guest disputes to investigate', module: 'disputes', href: '/ops/disputes' },
   // Stored by the nightly host-response sweep, not counted live — see

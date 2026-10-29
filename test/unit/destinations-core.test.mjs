@@ -8,6 +8,8 @@ import {
   findRegion,
   compareSubAreas,
   buildDestinationTree,
+  OTHER_AREA_SLUG,
+  isOtherArea,
 } from '../../src/lib/local/destinations-core.ts'
 import { REGION_VALUES, resortSlug } from '../../src/lib/local/resort-core.ts'
 
@@ -87,5 +89,42 @@ describe('buildDestinationTree', () => {
     const [s] = buildDestinationTree(new Map(), [row({ slug: 'x', km_marker: '97.0', name_ar: 'مراسي' })])[0].sub_areas
     assert.equal(s.km_marker, 97)
     assert.equal(s.name_ar, 'مراسي')
+  })
+})
+
+describe('Other chip', () => {
+  const nc = (tree) => tree.find((r) => r.name === 'North Coast')
+  test('appended LAST with its own count, Arabic name and a per-region id', () => {
+    const tree = buildDestinationTree(new Map([['North Coast', 9]]),
+      [row({ slug: 'marassi', count: 2 }), row({ slug: 'hacienda', count: 1 })],
+      new Map([['North Coast', 4]]))
+    const chips = nc(tree).sub_areas
+    assert.deepEqual(chips.map((s) => s.slug), ['hacienda', 'marassi', OTHER_AREA_SLUG])
+    const other = chips.at(-1)
+    assert.equal(other.count, 4)
+    assert.equal(other.name, 'Other')
+    assert.match(other.name_ar, /\p{Script=Arabic}/u)
+    assert.equal(other.id, 'other-north-coast')
+    assert.equal(nc(tree).count, 9)
+  })
+  test('omitted when nothing is unassigned', () => {
+    const tree = buildDestinationTree(new Map(), [row({ slug: 'marassi' })], new Map([['North Coast', 0]]))
+    assert.deepEqual(nc(tree).sub_areas.map((s) => s.slug), ['marassi'])
+  })
+  test('omitted for a region with no catalog chips — no chip row to put it in', () => {
+    const tree = buildDestinationTree(new Map(), [], new Map([['Dahab', 3]]))
+    assert.equal(tree.find((r) => r.name === 'Dahab').sub_areas.length, 0)
+  })
+  test('a catalog row that somehow has the reserved slug never shadows it', () => {
+    const tree = buildDestinationTree(new Map(), [row({ slug: 'marassi' }), row({ slug: 'other', count: 7 })], new Map([['North Coast', 1]]))
+    const chips = nc(tree).sub_areas
+    assert.equal(chips.filter((s) => s.slug === 'other').length, 1)
+    assert.equal(chips.at(-1).count, 1)
+  })
+  test('isOtherArea: case/space-insensitive, strings only', () => {
+    assert.ok(isOtherArea('other'))
+    assert.ok(isOtherArea(' Other '))
+    assert.ok(!isOtherArea('marassi'))
+    assert.ok(!isOtherArea(null))
   })
 })
