@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { cookies } from 'next/headers'
 import { verifyToken, getUserById } from '@/lib/local/auth'
 import { isActiveStatus, normalizeStatus } from '@/lib/local/account-status-core'
-import { getHostState } from '@/lib/local/db'
+import { getHostState, getIdentityState } from '@/lib/local/db'
 
 export const dynamic = 'force-dynamic'
 
@@ -63,9 +63,11 @@ export async function GET(req: Request) {
       return NextResponse.json({ user: null, accountStatus: normalizeStatus(row.account_status) }, { headers: CORS })
     }
 
-    const host = await getHostState(row.id)
+    // identity_* (signup-identity-core) rides along so a client re-checks on every
+    // launch whether the account still owes its phone/ID or has a rejected ID.
+    const [host, identity] = await Promise.all([getHostState(row.id), getIdentityState(row.id)])
     return NextResponse.json(
-      { user: { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role, ...host } },
+      { user: { id: row.id, email: row.email, full_name: row.full_name, provider: row.provider, avatar_url: row.avatar_url, role: row.role, ...host, ...identity } },
       { headers: CORS }
     )
   } catch (err) {

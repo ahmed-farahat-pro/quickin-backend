@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
-import { createBooking, getUserBookings, submitPaymentProof } from '@/lib/local/db'
+import { createBooking, getIdentityState, getUserBookings, submitPaymentProof } from '@/lib/local/db'
+import { bookingIdentityBlock } from '@/lib/local/signup-identity-core'
 import { getUserFromRequest } from '@/lib/local/auth'
 
 // Bookings API (no Supabase). Auth via Bearer token (mobile) or qk_token cookie (web).
@@ -43,6 +44,13 @@ export async function POST(req: Request) {
     const user = await getUserFromRequest(req)
     if (!user) {
       return NextResponse.json({ error: 'Please sign in to reserve' }, { status: 401, headers: CORS })
+    }
+    // Accounts created under the signup identity rule may not book while their
+    // phone/ID is still owed, or after their ID was rejected (until they re-upload).
+    // A pending ID does not stop a booking. `code` is what clients switch on.
+    const identityBlock = bookingIdentityBlock(await getIdentityState(user.id))
+    if (identityBlock) {
+      return NextResponse.json({ error: identityBlock.message, code: identityBlock.code }, { status: 403, headers: CORS })
     }
     const body = await req.json()
     const listingId = body.listing_id || body.listingId

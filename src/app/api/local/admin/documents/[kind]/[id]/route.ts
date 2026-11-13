@@ -11,10 +11,14 @@ import {
   owningModuleFor,
   parseDocumentDataUrl,
 } from '@/lib/local/document-core'
+import { parsePhotoIndex } from '@/lib/local/guest-identity-core'
 
 // GET /api/local/admin/documents/:kind/:id
-//   kind ∈ id_front | id_back | id_selfie | ownership
-//   id   = the id_verifications row (ID kinds) or the listing (ownership)
+//   kind ∈ id_front | id_back | id_selfie | ownership | id_change_front | id_change_back
+//          | payment_proof | dispute_photo
+//   id   = the id_verifications row (ID kinds), the listing (ownership), the
+//          id_change_requests row, the payment_proofs row, or the dispute
+//   ?n=  = dispute_photo only: which photo, 0-based
 //
 // Serves ONE document's bytes, to ONE operator, ONE view at a time — and records it.
 // Before this existed, the verification queue shipped every pending submission's
@@ -55,8 +59,16 @@ export async function GET(req: Request, ctx: { params: Promise<{ kind: string; i
   const owning = await requireStaff(req, owningModuleFor(kind))
   if ('error' in owning) return owning.error
 
+  // A dispute holds several photos; `?n=` (0-based) picks one.
+  let index: number | undefined
+  if (kind === 'dispute_photo') {
+    const n = parsePhotoIndex(new URL(req.url).searchParams.get('n'))
+    if (n === null) return NextResponse.json({ error: 'Missing photo index' }, { status: 400, headers: HEADERS })
+    index = n
+  }
+
   try {
-    const doc = await adminReadDocument(kind, id)
+    const doc = await adminReadDocument(kind, id, index)
     // Missing row, missing document, and bad id all look identical from outside.
     if (!doc) return NextResponse.json({ error: 'Document not found' }, { status: 404, headers: HEADERS })
 
@@ -88,7 +100,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ kind: string; i
       staffId: gate.staff.legacy ? null : gate.staff.staffId,
       staffEmail: gate.staff.email,
       targetType, targetId,
-      detail: { kind, document_id: id, mime, bytes: base64ByteLength(base64) },
+      detail: { kind, document_id: id, ...(index !== undefined ? { n: index } : {}), mime, bytes: base64ByteLength(base64) },
       ip: clientIpOf(req),
     })
 

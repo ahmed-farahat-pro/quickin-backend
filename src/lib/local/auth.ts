@@ -393,12 +393,38 @@ export async function createPendingUser(args: {
   otp: string
   otpExpires: Date
   country?: string | null
-}): Promise<void> {
-  await pool.query(
-    `INSERT INTO users (email, password_hash, password_plain, full_name, provider, role, email_verified, otp_code, otp_expires_at, country)
-     VALUES ($1, $2, $3, $4, 'email', $5, false, $6, $7, $8)`,
-    [args.email, args.passwordHash, args.passwordPlain ?? null, args.fullName, args.role, args.otp, args.otpExpires.toISOString(), args.country ?? null]
+  /** Already normalized by phone-core. Required since signup-identity-core. */
+  phone: string
+}): Promise<string> {
+  // identity_required marks the account as created under the signup identity
+  // rule — see signup-identity-core. Returns the id so signup can file the ID.
+  const { rows } = await pool.query(
+    `INSERT INTO users (email, password_hash, password_plain, full_name, provider, role, email_verified, otp_code, otp_expires_at, country, phone, identity_required)
+     VALUES ($1, $2, $3, $4, 'email', $5, false, $6, $7, $8, $9, true)
+     RETURNING id`,
+    [args.email, args.passwordHash, args.passwordPlain ?? null, args.fullName, args.role, args.otp, args.otpExpires.toISOString(), args.country ?? null, args.phone]
   )
+  return rows[0].id as string
+}
+
+/**
+ * True when another account already holds this (normalized) phone number.
+ * Accounts whose email was never verified don't count: an abandoned signup
+ * must not squat on a number. `exceptEmail` lets a re-signup keep its own.
+ */
+export async function phoneTakenByOther(phone: string, exceptEmail: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM users
+      WHERE phone = $1 AND lower(email) <> lower($2) AND email_verified = true
+      LIMIT 1`,
+    [phone, exceptEmail]
+  )
+  return rows.length > 0
+}
+
+/** Store the phone + identity requirement on an account (re-signup, Google completion). */
+export async function setUserPhone(userId: string, phone: string): Promise<void> {
+  await pool.query(`UPDATE users SET phone = $2, identity_required = true WHERE id = $1`, [userId, phone])
 }
 
 /** Refresh the OTP (and optionally details) for a still-unverified account. Returns true if a row matched. */
@@ -511,9 +537,11 @@ export async function upsertSocialUser(args: {
     )
     return rows[0] as User
   }
+  // A first Google sign-in brings no phone or ID — identity_required sends the
+  // new account to the clients' "Complete your account" screen (signup-identity-core).
   const { rows } = await pool.query(
-    `INSERT INTO users (email, full_name, provider, avatar_url, role, email_verified)
-     VALUES ($1, $2, $3, $4, $5, true) RETURNING ${USER_COLS}`,
+    `INSERT INTO users (email, full_name, provider, avatar_url, role, email_verified, identity_required)
+     VALUES ($1, $2, $3, $4, $5, true, true) RETURNING ${USER_COLS}`,
     [args.email, args.fullName, args.provider, args.avatarUrl || null, role]
   )
   if (!rows[0]) throw new Error('Failed to upsert social user')

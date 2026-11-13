@@ -7,7 +7,11 @@ import {
   generateOtp,
   OTP_TTL_MS,
   blockedAccountResponse,
+  setUserPhone,
 } from '@/lib/local/auth'
+import { submitVerificationImages } from '@/lib/local/db'
+import { readSignupIdentity } from '@/lib/local/signup-identity'
+import { SIGNUP_IDENTITY_SOURCE } from '@/lib/local/signup-identity-core'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
 import { checkEmail, emailProblemMessage, normalizeEmail } from '@/lib/local/email-core'
 import { checkName, fallbackNameFromEmail, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
@@ -32,12 +36,15 @@ export async function OPTIONS() {
   })
 }
 
-// POST /api/auth/signup — { email, password, full_name, role } → emails a 6-digit OTP.
+// POST /api/auth/signup — { email, password, full_name, phone, doc_type, id_number,
+// id_front, id_back } → emails a 6-digit OTP. Phone and ID are mandatory for every
+// new account (signup-identity-core); a bad one answers 400 { error, fields }.
 // Returns { pending: true, email } (NO token yet). The account is created unverified;
 // the client then calls /api/auth/verify-otp with the code to activate + receive a token.
 export async function POST(req: Request) {
   try {
-    const { email, password, full_name, country: rawCountry } = await req.json()
+    const body = await req.json()
+    const { email, password, full_name, country: rawCountry } = body
     if (!email || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: CORS })
     }
@@ -103,15 +110,41 @@ export async function POST(req: Request) {
       )
     }
 
+    // Phone + identity document, checked in full before any row is written so a
+    // refused signup leaves nothing behind. Keys match the body for the forms.
+    const read = await readSignupIdentity(body, cleanEmail)
+    if (read.fields) {
+      return NextResponse.json(
+        { error: 'Please check the highlighted fields', fields: read.fields },
+        { status: 400, headers: CORS }
+      )
+    }
+    const identity = read.identity
+
     const otp = generateOtp()
     const otpExpires = new Date(Date.now() + OTP_TTL_MS)
 
+    let userId: string
     if (existing) {
       // Unverified account re-signing up → refresh its OTP + details.
       await setUserOtp({ email: cleanEmail, otp, otpExpires, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: 'user', country })
+      await setUserPhone(existing.id, identity.phone)
+      userId = existing.id
     } else {
-      await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: 'user', otp, otpExpires, country })
+      userId = await createPendingUser({ email: cleanEmail, passwordHash: hashPassword(String(password)), passwordPlain: String(password), fullName, role: 'user', otp, otpExpires, country, phone: identity.phone })
     }
+    // Filed before the code is emailed: if this fails no OTP goes out, and the
+    // next signup attempt refreshes the same unverified row. A re-signup
+    // replaces its own pending submission rather than stacking another.
+    await submitVerificationImages({
+      userId,
+      front: identity.idFront,
+      back: identity.idBack,
+      idNumber: identity.idNumber,
+      fullName,
+      docType: identity.docType,
+      source: SIGNUP_IDENTITY_SOURCE,
+    })
 
     const DEV_FALLBACK_OTP = '123456'
     let emailSent = true

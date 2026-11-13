@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server'
+import { adminGetGuestIdentity } from '@/lib/local/guest-identity'
+import { maskTail } from '@/lib/local/guest-identity-core'
 import { requireStaff, staffActor, logStaffAction, clientIpOf } from '@/lib/local/staff'
 import { adminGetUserDetail, adminRemoveUserAvatar, adminSetAccountStatus, adminDeleteUser } from '@/lib/local/db'
 import {
@@ -39,9 +41,14 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   if ('error' in gate) return gate.error
   const { id } = await ctx.params
   try {
-    const detail = await adminGetUserDetail(id)
+    const [detail, identity] = await Promise.all([adminGetUserDetail(id), adminGetGuestIdentity(id)])
     if (!detail) return NextResponse.json({ error: 'User not found' }, { status: 404, headers: CORS })
-    return NextResponse.json(detail, { headers: CORS })
+    // The phone leaves masked; the full number is behind the audited Reveal at
+    // POST ./identity. See guest-identity-core.ts.
+    return NextResponse.json(
+      { ...detail, user: { ...detail.user, phone: maskTail(detail.user.phone) }, identity },
+      { headers: CORS },
+    )
   } catch (err) {
     console.error('admin user GET:', err)
     return NextResponse.json({ error: 'Failed to load' }, { status: 500, headers: CORS })

@@ -39,9 +39,9 @@ import {
 const PNG = 'data:image/png;base64,iVBORw0KGgo='
 
 describe('document kinds', () => {
-  test('recognises exactly the six kinds', () => {
+  test('recognises exactly the eight kinds', () => {
     for (const k of DOCUMENT_KINDS) assert.equal(isDocumentKind(k), true)
-    assert.equal(DOCUMENT_KINDS.length, 6)
+    assert.equal(DOCUMENT_KINDS.length, 8)
   })
 
   test('rejects anything else, including SQL-ish input', () => {
@@ -70,6 +70,9 @@ describe('document kinds', () => {
     assert.equal(owningModuleFor('id_back'), 'verifications')
     assert.equal(owningModuleFor('id_selfie'), 'verifications')
     assert.equal(owningModuleFor('ownership'), 'listings')
+    // A guest's own uploads stay behind the queue they were filed in.
+    assert.equal(owningModuleFor('payment_proof'), 'payments')
+    assert.equal(owningModuleFor('dispute_photo'), 'disputes')
   })
 
   test('auditTargetTypeFor keys the audit row on the subject, not the document', () => {
@@ -78,6 +81,8 @@ describe('document kinds', () => {
     assert.equal(auditTargetTypeFor('id_back'), 'user')
     assert.equal(auditTargetTypeFor('id_selfie'), 'user')
     assert.equal(auditTargetTypeFor('ownership'), 'listing')
+    assert.equal(auditTargetTypeFor('payment_proof'), 'user')
+    assert.equal(auditTargetTypeFor('dispute_photo'), 'user')
   })
 })
 

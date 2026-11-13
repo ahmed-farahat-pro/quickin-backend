@@ -85,10 +85,6 @@ function loadAssets(): Record<string, Buffer> {
   return buffers
 }
 
-/** Where the public stay pass lives (the web project). Same default as
- *  src/lib/local/db.ts, overridable with WEB_URL. */
-const WEB_URL = (process.env.WEB_URL || 'https://quickin-frontend.vercel.app').replace(/\/+$/, '')
-
 // Bookings are charged in EGP, so the pass shows EGP (not a $ amount).
 function money(amount: number | null | undefined): string {
   const n = Number(amount)
@@ -161,17 +157,14 @@ export async function GET(req: Request, ctx: { params: Promise<{ bookingId: stri
     // eventTicket layout — initializes the field arrays.
     pass.type = 'eventTicket'
 
-    // QR encoding the PUBLIC STAY-PASS URL — the same thing the in-app QR on web,
-    // iOS and Android encodes, so a scan (by the guest's camera or the host's
-    // phone) opens the pass page with the host's stay guide instead of showing a
-    // bare string. `altText` keeps the human-readable code under the barcode for
-    // a manual check-in. Never falls back to the booking id: the pass page
-    // resolves by reservation_code, and the guard above already required one.
-    pass.setBarcodes({
-      format: 'PKBarcodeFormatQR',
-      message: `${WEB_URL}/stay/${encodeURIComponent(reservationCode)}`,
-      messageEncoding: 'iso-8859-1',
-      altText: reservationCode,
+    // No barcode. The QR was removed from the stay pass on every surface
+    // (2026-11-13), so the pass carries the reservation code as text instead, on
+    // the front where a manual check-in reads it. Never the booking id: the pass
+    // page resolves by reservation_code, and the guard above already required one.
+    pass.headerFields.push({
+      key: 'code',
+      label: 'Code',
+      value: reservationCode,
     })
 
     // Primary: the place.

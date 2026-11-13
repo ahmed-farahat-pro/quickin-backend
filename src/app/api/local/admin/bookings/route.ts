@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { requireStaff } from '@/lib/local/staff'
 import { adminListBookings } from '@/lib/local/db'
+import { maskTail } from '@/lib/local/guest-identity-core'
 
 // Admin (staff session + module permission): GET  → newest-first bookings with guest + listing info.
 export const dynamic = 'force-dynamic'
@@ -10,7 +11,10 @@ export async function GET(req: Request) {
   const gate = await requireStaff(req, 'bookings')
   if ('error' in gate) return gate.error
   try {
-    return NextResponse.json({ bookings: await adminListBookings() }, { headers: CORS })
+    // Guest phones go out masked; the full number is on the guest's profile, behind
+    // an audited Reveal that needs the `users` module.
+    const bookings = (await adminListBookings()).map((b) => ({ ...b, guest_phone: maskTail(b.guest_phone) }))
+    return NextResponse.json({ bookings }, { headers: CORS })
   } catch (err) {
     console.error('admin bookings GET:', err)
     return NextResponse.json({ error: 'Failed to load' }, { status: 500, headers: CORS })

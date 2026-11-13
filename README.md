@@ -30,7 +30,7 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/profile/id-change` | The signed-in user's ID number and the state of any request to change it → `{ current, request, can_request, available }`. The request half **degrades**: if `id_change_requests` has not been migrated onto this database the read still answers with the number on file, `request: null` and `available: false`, rather than taking the Edit Profile row down with it |
 | POST | `/api/local/profile/id-change` | File a change request: `{ requested_value, doc_type, front, back?, reason? }`. **`front` is required** — without a document the reviewer has nothing to check the number against. Resubmitting replaces a request still awaiting review. **503 `{ code: 'id_change_unavailable' }`** when the table has not been migrated onto this database — not a 500, because nothing about the request is wrong and "try again later" is true |
 | DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
-| POST | `/api/local/bookings` | Create a reservation (auth required) |
+| POST | `/api/local/bookings` | Create a reservation (auth required). `403 {error, code}` with `code` `identity_incomplete` \| `identity_rejected` for an account that owes its phone/ID or had its ID rejected — see [Every new account gives a phone and an ID](#every-new-account-gives-a-phone-and-an-id) |
 | GET  | `/api/local/bookings` | The signed-in user's reservations. Each carries `host_phone` — the host's number, **`null` until the booking is `confirmed`/`completed` AND `payment_status='paid'`** |
 | GET\|POST | `/api/local/chat`, `/api/local/bookings/:id/messages` | **Removed 2026-10-02 — answer 410** `{error}` with a sentence the old apps can show. Host ⇄ guest messaging was replaced by listing comments (below); the old threads stay in the database, unread |
 | GET  | `/api/local/listings/:id/comments` | **Public** Q&A on a listing, newest first (max 200): `{ comments: [{ id, listing_id, user_id, author_name, author_avatar, body, created_at, mine, reply: {body, created_at} \| null }], is_host, can_comment }`. Auth optional — it only decides `mine`, `is_host` (show reply controls) and `can_comment` (signed in, not the host, listing published). See Listing comments below |
@@ -41,13 +41,20 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/host/comments` | The host's "Guest questions" — comments across all their listings, unanswered first: `{ comments: [...same shape + listing_title, listing_image], unanswered }` |
 | GET  | `/api/local/admin/comments` | **/ops → Comments** (module `moderation`). `?scope=visible\|hidden\|removed\|all` (default `visible`), `?q=` searches comment, reply, author name/email and listing title, `?listingId=` / `?userId=` narrow it. → `{ comments: [{ …, author_name, author_email, author_status, deleted_by, delete_reason, state }] }` — full name and email, because staff need to know whom they are banning. `state` is `visible` \| `hidden` (author banned) \| `removed_by_author` \| `removed_by_staff`. Max 300, newest first |
 | DELETE | `/api/local/admin/comments/:id` | Staff remove a comment (`moderation`), optional `{ reason }` kept for the audit log only. The author is notified (`type: 'comment_removed'`). `?part=reply` removes only the host's reply. Audited as `comment_removed` / `comment_reply_removed`. **Banning the author** is the existing `POST /api/local/admin/moderation {userId, action:'suspend', reason}` |
-| POST | `/api/auth/signup` | Register (email + password) |
+| POST | `/api/auth/signup` | Register: email + password + `full_name`, **plus `phone`, `doc_type`, `id_number`, `id_front`, `id_back` (all required)**. `400 {error, fields}` keyed like the body. Files the ID to `/ops` as `source='signup'` |
+| GET  | `/api/local/account/identity` | The signed-in user's identity state (`identity_required`, `identity_complete`, `verification_status`, `verification_note`) |
+| POST | `/api/local/account/identity` | "Complete your account" for a first Google sign-in: `{phone, doc_type, id_number, id_front, id_back}` → identity state. `400 {error, fields}`; `409` when nothing is owed |
 | POST | `/api/auth/login` | Sign in (email + password) |
 | POST | `/api/auth/social` | Demo social sign-in (`google`) |
 | POST | `/api/auth/google` | Google sign-in — verifies a Google ID token against Google's JWKS |
 | GET  | `/api/auth/me` | Resolve the current user (Bearer token or `qk_token` cookie) |
 | —    | *(all auth routes above)* | A **blocked or removed** account is refused with **403 `{ error, accountStatus }`** — deliberately **without** `needsVerification`, so the apps show the message instead of routing to the OTP screen. See Account status below |
 | DELETE | `/api/local/admin/users/:id` | **410 Gone** — hard delete is retired. Block or remove the account in `/ops` → Users |
+| GET  | `/api/local/admin/users/:id` | **/ops → Users → profile** (module `users`). Now also carries `identity` (same shape as the route below), and `user.phone` is **masked** to its last three characters. See *Guest identity in /ops* |
+| GET  | `/api/local/admin/users/:id/identity` | The guest's identity panel, **masked** (`users`): `{ phone_masked, id_number_masked, id_number_source: 'verification'\|'profile', doc_type, doc_type_label, verification_status, verification_notes, verification_source, verification_submitted_at, files: [{ kind, id, n?, group, label, status, context, submitted_at }] }`. `files` are references — open each through `/api/local/admin/documents/:kind/:id` |
+| POST | `/api/local/admin/users/:id/identity` | **Reveal** (`users`) → `{ phone, id_number, id_number_source, doc_type }` unmasked. Writes an `identity_revealed` audit row FIRST and fails closed — no row, no values |
+| GET  | `/api/local/admin/documents/:kind/:id` | One document's bytes, audited as `document_viewed`. Needs `documents` **and** the kind's owning module: `id_front`/`id_back`/`id_selfie` → `verifications`, `id_change_front`/`id_change_back` → `id_changes`, `ownership` → `listings`, **`payment_proof` → `payments`** (id = the `payment_proofs` row), **`dispute_photo` → `disputes`** (id = the dispute, `?n=` the 0-based photo index; 400 without it) |
+| GET  | `/api/local/admin/bookings` | **/ops → Bookings** (`bookings`). Each row now also has `guest_id`, `guest_phone` (**masked**) and `guest_verification_status` |
 | GET  | `/api/auth/logout` | Clear the auth cookie, then **302 to the relative `/explore`** (relative on purpose — the browser reaches this through the web app’s `/api/*` rewrite, so an absolute redirect built from `req.url` would point at this backend, which serves no pages) |
 | GET  | `/api/local/payment-config` | Every destination shown at checkout (auth required): `{instapay_handle, instructions, instapay_link, instapay_qr_image, qr_payload, instapay_enabled, bank:{…}, flash:{enabled, configured}, available_methods}` |
 | POST | `/api/local/bookings/[id]/flash-checkout` | Guest starts (or resumes) a **Flash** card/wallet checkout → `{status, paid, payment_link, expires_at, amount_cents, order_id}`. Open `payment_link` in a browser. Re-POSTing while the link is still good returns the **same** link, never a second order. `409 {code:'flash_unavailable'}` when Flash is off/unconfigured, `409 {code:'not_payable'}` when the booking can't be paid, `400 {code:'below_minimum'}` under 5 EGP, `502 {code:'flash_error'}` when Flash refuses. See *Flash — the automatic way to pay* |
@@ -1723,7 +1730,7 @@ clients label the field required instead of optional. No migration.
 ## The stay pass waits for the money, not for the host
 
 **The defect.** A guest requested a stay, the host tapped Approve, and the reservation
-pass was live immediately — the QR, the Apple Wallet pass, the public `/stay/<code>`
+pass was live immediately — the in-app pass, the Apple Wallet pass, the public `/stay/<code>`
 page and the host's stay guide behind it — on both the guest's screen and the host's,
 with nothing paid.
 
@@ -1754,7 +1761,7 @@ have hidden the QR, not the pass behind it:
 | `getStayByCode` | `is_live` on the payload; `guide` is withheld entirely when false, so a scan of an unpaid code can't read the gate codes |
 | `GET /api/wallet/pass/:id` | `400` instead of a signed `.pkpass` |
 | `listStayGuide` | a **guest** without a live pass gets `[]`; the host and an operator always read it |
-| Web / iOS / Android | no QR, no code, no stay link, no Wallet button — a placeholder saying the payment is what's outstanding |
+| Web / iOS / Android | no code, no stay link, no Wallet button — a placeholder saying the payment is what's outstanding |
 
 **The reservation code is deliberately still issued at approval.** It is the reference
 the acceptance email, the host's inbox card, the ops queues, disputes and payouts all
@@ -1769,6 +1776,21 @@ clients.
 Covered by `test/unit/stay-pass-core.test.mjs`, mirrored verbatim in the web repo and
 translated into `StayPassGateTest.kt` (Android) and `Tests/StayPassGateTests` (iOS). A
 change to the rule belongs in all four.
+
+### The stay pass has no QR code
+
+Removed on 2026-11-13, on every surface: the web reservation card, the public
+`/stay/<code>` page, the host's guest-link preview, iOS, Android, and the Apple Wallet
+pass built by `GET /api/wallet/pass/:id`. The pass is the **reservation code** plus a
+link to `/stay/<code>`. The Wallet pass sets **no barcode**; it shows the code as a
+header field (`Code`) on the front, and again on the back. A Wallet pass a guest added
+before the change keeps its QR until they re-add it.
+
+What still has a QR, on purpose: the **places** a host adds to the stay guide
+(`place_qr` items), and the Instapay payment destination.
+
+Covered by `test/unit/wallet-pass-no-qr.test.mjs` (a source assertion — the route
+cannot be imported by a test).
 
 ## How a host gets paid — the payout method
 
@@ -1814,6 +1836,32 @@ The section is **host-only** (`is_host` OR the legacy `role='host'`, the same ru
 listing gate uses) and gates nothing — a host with no payout method can still list and
 still take bookings; they simply have nowhere to be paid. `payout_ready` on the GET is
 the profile-completeness flag the clients show that with.
+
+## Every new account gives a phone and an ID
+
+Since 2026-11-13 every account created — guest or host — hands over a **phone number
+and an identity document** (`doc_type`, `id_number`, front and back photos) at signup.
+The rule is `src/lib/local/signup-identity-core.ts`; field checks reuse `phone-core`,
+`host-verification-core` (`normalizeDocType`, `isIdDocumentImage`) and `id-change-core`
+(`normalizeDocumentNumber` — a national ID is 14 digits), run by
+`signup-identity.ts`'s `readSignupIdentity`.
+
+- **New accounts only.** `users.identity_required` is set when the row is created
+  (`createPendingUser`, or the INSERT in `upsertSocialUser`) and never back-filled, so
+  no pre-existing account is affected.
+- **Email signup** validates every field before writing anything, then files the ID
+  (`submitVerificationImages`, `source='signup'`) **before** the OTP is emailed.
+- **First Google sign-in** creates the account with nothing on file, so it reads
+  `identity_complete: false`; the clients hold it on a blocking "Complete your account"
+  screen that posts to `POST /api/local/account/identity`.
+- **Pending** ID: nothing is blocked (the host publish gate is separate). **Rejected**
+  ID: `POST /api/local/bookings` refuses with `code: identity_rejected` until the user
+  re-uploads through `POST /api/local/verification` (pending again).
+- **One account per phone**: `phoneTakenByOther` refuses a number another
+  email-verified account holds. Unverified (abandoned) signups don't count.
+- Every auth response (`withHostState`) and `/api/auth/me` carry `identity_required`,
+  `identity_complete`, `verification_status`, `verification_note`.
+- The phone is **not** SMS-verified — format only.
 
 ## Account verification — the verified badge
 
@@ -2368,6 +2416,28 @@ extension-less relative imports; see README → Testing for why those exist.
 Vercel projects. It is currently unset on both, so each falls back to its own
 `AUTH_SECRET` — and a `qk_staff` cookie signed by one will not verify on the other.
 
+## Guest identity in /ops
+
+An operator can see a guest's phone, ID number and every file they uploaded from
+`/ops/users/:id` (the "Identity & documents" panel), and each `/ops` → Bookings row
+shows the guest's masked phone, ID status and a link to that profile. Built 2026-11-13.
+
+| Piece | What it does |
+| --- | --- |
+| `lib/local/guest-identity-core.ts` | Pure rules, unit-tested: `maskTail` (all but the last 3 characters hidden, `+`/spaces kept so a phone still reads as one, short values hidden entirely), `pickIdNumber` (the latest ID verification's number wins over the never-reviewed `users.id_document`, and says which it came from), `listGuestFiles` (ID photos → ID-change photos → payment screenshots → dispute photos, only files that exist) |
+| `lib/local/guest-identity.ts` | The reads, plus `recordIdentityReveal` — an audit insert that THROWS, unlike the best-effort `logStaffAction` |
+| `admin/users/:id/identity` | GET masked view; POST reveal (audited `identity_revealed`, which records *which* fields were shown, never the values) |
+| `document-core.ts` | Two new kinds, `payment_proof` and `dispute_photo`, so a guest's screenshots and dispute photos open through the same audited, one-view-at-a-time channel as ID photos |
+
+**Masked at the API, not in the browser.** The full phone and number never sit in a
+page payload an operator merely opened; they come from the POST, one audited reveal at a
+time. Permissions are the existing modules — `users` for the panel and Reveal, and
+`documents` **plus** the owning module for each image — so no grant changes. The refunds
+queue (`payments`) still returns the guest's full phone: whoever sends a refund needs it.
+
+No migration: it reads tables that already exist (`disputes` / `id_change_requests`
+read as empty if absent).
+
 ## A rejected listing has to say why
 
 `setListingApproval` used to spend the rejection reason and then lose it: the note was
@@ -2410,6 +2480,7 @@ the list of record. Recent additions:
 | `migrate-flash.mjs` | `flash_orders` (one row per Flash checkout attempt) and the `flash_enabled = '0'` setting. Run it **before** deploying the Flash routes — they read the table |
 | `migrate-host-verification.mjs` | `id_verifications.doc_type`, `host_applications.verification_id` (links an application to the ID filed with it), `listings.unpublished_by_verification`, and the host verification-status index. Also **reports** how many approved hosts are unverified and how many live listings they hold — read that before deploying, since the gate is a hard cutover |
 | `migrate-commission.mjs` | Makes the platform commission safe on any database: creates `app_settings` if absent, seeds `platform_commission_rate`, adds `bookings.commission_rate` — and backfills it on **every** booking, not just paid ones (`migrate-analytics.mjs` only did the paid ones, which was fine when the column was a reporting field and is not now that guest prices derive from it) |
+| `migrate-signup-identity.mjs` | `users.identity_required` (default false — never back-filled) and a partial index on `users.phone` for the one-account-per-phone check. Run it **before** deploying — signup and first Google sign-in WRITE the column and 500 without it |
 | `migrate-host-response-alerts.mjs` | `host_response_alerts` (one row per booking request a host left unanswered 24h+) and a partial index on pending bookings by `created_at`. Run it **before** deploying — the cron and the ops screen 500 without it (the alert centre degrades to 0) |
 | `migrate-activity.mjs` | `user_logins` (the one activity event nothing recorded) plus timestamp indexes on `users`/`listings`/`payment_proofs` and a partial index on open reports — the derived activity feed and alert centre in `/ops` |
 | `migrate-documents-audit.mjs` | The `staff_audit_log (target_type, target_id)` index, a partial index on `users.verification_status`, the `documents` module grant for existing `verifications`/`listings` moderators, and the backfill of `users.verification_status` from `id_verifications` — the source of truth behind the verified badge |

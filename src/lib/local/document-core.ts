@@ -22,6 +22,13 @@ export const DOCUMENT_KINDS = [
   // payload. See migrate-id-change-requests.mjs for why the two tables are separate.
   'id_change_front',
   'id_change_back',
+  // A guest's own uploads, opened from their /ops profile (guest-identity-core.ts).
+  // They used to reach /ops only inline in the payments and disputes queues; routing
+  // them here too means a profile view of them is logged like any ID photo.
+  // `payment_proof` is keyed by the payment_proofs row; `dispute_photo` by the
+  // dispute, with `?n=` picking one of its photos.
+  'payment_proof',
+  'dispute_photo',
 ] as const
 export type DocumentKind = (typeof DOCUMENT_KINDS)[number]
 
@@ -65,8 +72,12 @@ export function idColumnFor(kind: DocumentKind): string | null {
  * could already reach, it does not grant you a queue you were never given. So an
  * operator needs `documents` AND the owning module.
  */
-export function owningModuleFor(kind: DocumentKind): 'verifications' | 'listings' | 'id_changes' {
+export function owningModuleFor(
+  kind: DocumentKind,
+): 'verifications' | 'listings' | 'id_changes' | 'payments' | 'disputes' {
   if (kind === 'ownership') return 'listings'
+  if (kind === 'payment_proof') return 'payments'
+  if (kind === 'dispute_photo') return 'disputes'
   // An operator granted only the change queue can open the documents attached to it,
   // and nothing from the verification queue they were not given.
   if (isIdChangeDocumentKind(kind)) return 'id_changes'

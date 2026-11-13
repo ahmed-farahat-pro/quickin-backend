@@ -91,6 +91,7 @@ import {
 } from './listing-capacity-policy'
 import type { ListingCapacityField } from './listing-capacity-policy'
 import { checkOwnershipDoc, ownershipDocProblemMessage } from './ownership-doc-core'
+import { identityState, type IdentityState } from './signup-identity-core'
 import {
   checkMonthlyPrices,
   checkWeekendPrice,
@@ -3700,8 +3701,37 @@ export async function getHostState(userId: string): Promise<HostState> {
 
 /** Spread the host fields onto a user payload so login / verify-otp / social all
  *  return exactly the shape /api/auth/me does. */
-export async function withHostState<T extends { id: string }>(user: T): Promise<T & HostState> {
-  return { ...user, ...(await getHostState(user.id)) }
+export async function withHostState<T extends { id: string }>(user: T): Promise<T & HostState & IdentityState> {
+  const [host, identity] = await Promise.all([getHostState(user.id), getIdentityState(user.id)])
+  return { ...user, ...host, ...identity }
+}
+
+/** The signup identity fields (signup-identity-core) for a user — carried by
+ *  /api/auth/me and every auth response, and read by the booking gate. On a DB
+ *  without users.identity_required (42703) every account reads as not required,
+ *  which is exactly the pre-cutover behaviour. */
+export async function getIdentityState(userId: string): Promise<IdentityState> {
+  const verification = await getVerificationStatusFromTable(userId)
+  let required = false
+  let phone: string | null = null
+  if (isUuid(userId)) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT COALESCE(identity_required, false) AS required, phone FROM users WHERE id = $1`,
+        [userId]
+      )
+      required = Boolean(rows[0]?.required)
+      phone = rows[0]?.phone ?? null
+    } catch (err) {
+      if ((err as { code?: string }).code !== '42703') throw err
+    }
+  }
+  return identityState({
+    identityRequired: required,
+    phone,
+    verificationStatus: verification.status,
+    verificationNote: verification.notes,
+  })
 }
 
 /** The signed-in user's application, or null when they never applied. */
@@ -3964,9 +3994,10 @@ export async function submitVerificationImages(args: {
    *  the photo against the declared type); null only on rows predating it. */
   docType?: string | null
   /** Where the submission came from — 'manual' (the profile's verify card) or
-   *  'host_application' (filed with a become-a-host application). /ops shows it,
+   *  'host_application' (filed with a become-a-host application) or 'signup'
+   *  (filed with the account itself, signup-identity-core). /ops shows it,
    *  and it is the same vocabulary the web writes. */
-  source?: 'manual' | 'host_application'
+  source?: 'manual' | 'host_application' | 'signup'
 }): Promise<VerificationTableState> {
   const { userId, front, back = null, idNumber = null, fullName = null, docType = null, source = 'manual' } = args
   if (!isUuid(userId)) throw new Error('Invalid user')
@@ -4647,6 +4678,10 @@ export async function adminListBookings(): Promise<AdminBookingRow[]> {
             to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
             to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
             gu.full_name AS guest_name, gu.email AS guest_email,
+            -- The guest summary on each row (guest-identity-core.ts). The route masks
+            -- the phone before it leaves; the full number is on the profile's Reveal.
+            b.user_id AS guest_id, gu.phone AS guest_phone,
+            COALESCE(gu.verification_status, 'unverified') AS guest_verification_status,
             l.title AS listing_title,
             to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
        FROM bookings b
@@ -4975,8 +5010,34 @@ export async function adminReadConversation(
 export async function adminReadDocument(
   kind: DocumentKind,
   id: string,
+  /** dispute_photo only: which of the dispute's photos. */
+  index?: number,
 ): Promise<{ value: string; subjectId: string } | null> {
   if (!isUuid(id)) return null
+  // A guest's own uploads: the guest is the subject, so the view lands on their
+  // audit trail beside their ID photos (see guest-identity-core.ts).
+  if (kind === 'payment_proof') {
+    const { rows } = await pool.query(
+      `SELECT pp.image_data AS value, b.user_id AS subject_id
+         FROM payment_proofs pp JOIN bookings b ON b.id = pp.booking_id
+        WHERE pp.id = $1`,
+      [id],
+    )
+    const row = rows[0] as { value: string | null; subject_id: string } | undefined
+    if (!row?.value) return null
+    return { value: row.value, subjectId: row.subject_id }
+  }
+  if (kind === 'dispute_photo') {
+    if (index === undefined || index < 0) return null
+    // Postgres arrays are 1-based.
+    const { rows } = await pool.query(
+      `SELECT photos[$2] AS value, guest_id AS subject_id FROM disputes WHERE id = $1`,
+      [id, index + 1],
+    )
+    const row = rows[0] as { value: string | null; subject_id: string } | undefined
+    if (!row?.value) return null
+    return { value: row.value, subjectId: row.subject_id }
+  }
   if (kind === 'ownership') {
     const { rows } = await pool.query(
       `SELECT ownership_doc AS value, host_id AS subject_id FROM listings WHERE id = $1`,
@@ -5888,6 +5949,7 @@ export async function getPendingVerifications(
             (v.image_data        IS NOT NULL AND v.image_data        <> '') AS has_front,
             (v.back_image_data   IS NOT NULL AND v.back_image_data   <> '') AS has_back,
             (v.selfie_image_data IS NOT NULL AND v.selfie_image_data <> '') AS has_selfie,
+            v.source,
             to_char(v.submitted_at,'YYYY-MM-DD HH24:MI') AS submitted_at,
             to_char(v.reviewed_at, 'YYYY-MM-DD HH24:MI') AS reviewed_at,
             v.reviewed_by, v.notes
@@ -6214,6 +6276,10 @@ export interface AdminBookingRow {
   check_out: string
   guest_name: string | null
   guest_email: string | null
+  guest_id: string | null
+  /** Masked by the route before it is sent — see guest-identity-core.ts. */
+  guest_phone: string | null
+  guest_verification_status: string
   listing_title: string | null
   created_at: string
 }
@@ -6484,6 +6550,8 @@ export interface AdminVerificationRow {
   has_front: boolean
   has_back: boolean
   has_selfie: boolean
+  /** Where it was filed — 'manual' | 'host_application' | 'signup' (null on old rows). */
+  source: string | null
   submitted_at: string
   reviewed_at: string | null
   reviewed_by: string | null

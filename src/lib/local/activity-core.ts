@@ -221,6 +221,7 @@ const AUDIT_LABELS: Record<string, string> = {
   user_set_host: 'Changed host access',
   user_thread_viewed: 'Read a message thread',
   document_viewed: 'Opened a document',
+  identity_revealed: 'Revealed a phone or ID number',
   verification_verified: 'Verified an ID',
   verification_rejected: 'Rejected an ID',
   verification_reopened: 'Reopened an ID review',
