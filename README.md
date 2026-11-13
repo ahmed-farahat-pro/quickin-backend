@@ -25,13 +25,13 @@ npm run dev        # API at http://localhost:4000
 | PATCH | `/api/local/listings/[id]` | The host edits their listing. Carries the same **`pin_warning`** field, for the same reason — a pin can be dragged into the wrong country from the editor too |
 | GET  | `/api/local/listings/[id]/calendar` | The listing's day-by-day calendar, `?start=&end=` (**inclusive** of both ends, ≤400 days; defaults to today → +92d). `{ listing_id, currency, commission_rate, base_price, start, end, days[] }` where each day is `{ date, price, source, status }`. `source` is which rung priced the night — `custom` \| `weekend` \| `monthly` \| `base`; `status` is `available` \| `blocked` \| `booked`. **Public, but money-aware:** the listing's host gets their RAW rates plus a `guest_price` companion and the block `note`; everyone else gets only the commission-inclusive figure |
 | PUT  | `/api/local/listings/[id]/calendar` | The host prices or opens/closes a set of days: `{ dates: ["YYYY-MM-DD" \| {start,end}], price?, blocked?, note? }` → `{ updated, skipped, calendar }`. `price: <n>` pins that nightly rate, `price: null` **resets** those days to the listing's normal pricing (deletes the rows), and omitting `price` leaves prices alone; `blocked: true/false` closes or opens them. Days held by a reservation come back in **`skipped`** rather than failing the request. 401 unsigned, 403 not the host, 400 on a bad date or price |
-| GET  | `/api/local/profile` | The signed-in user's own profile → `{ id, email, full_name, role, age, id_document, phone, bio, avatar_url, country, … }`. **`phone` is only ever returned here**, to the person themselves — never on a listing or a booking |
-| PATCH | `/api/local/profile` | **The one door that writes these columns** — the web account page, iOS and Android all save through it. Any subset of `{ full_name, age, phone, bio, avatar_url, country }`; `fullName` / `avatarUrl` / `Age` are accepted as aliases. **A field you don't send is left alone; a field you send as `null` or `''` is CLEARED** — that is how "remove my photo" works, and see *Absent is not the same as cleared*. `id_document` is read-only (400 `{code:'id_change_required'}` on an attempt to change it); refusals name the input as `field` so a form can put the reason under it |
+| GET  | `/api/local/profile` | The signed-in user's own profile → `{ id, email, full_name, role, age, id_document, phone, bio, avatar_url, country, … }`. **The user's own `phone` is only ever returned here.** `phone_required` is `true` for hosts — the field must not be shown as optional to them. The one place a *host's* number reaches anyone else is `host_phone` on a paid booking (see *The host's number waits for the money too*) |
+| PATCH | `/api/local/profile` | **The one door that writes these columns** — the web account page, iOS and Android all save through it. Any subset of `{ full_name, age, phone, bio, avatar_url, country }`; `fullName` / `avatarUrl` / `Age` are accepted as aliases. **A field you don't send is left alone; a field you send as `null` or `''` is CLEARED** — that is how "remove my photo" works, and see *Absent is not the same as cleared*. `id_document` is read-only (400 `{code:'id_change_required'}` on an attempt to change it); refusals name the input as `field` so a form can put the reason under it. **A host may change their phone but not clear it** → `400 {field:'phone', code:'phone_required'}` |
 | GET  | `/api/local/profile/id-change` | The signed-in user's ID number and the state of any request to change it → `{ current, request, can_request, available }`. The request half **degrades**: if `id_change_requests` has not been migrated onto this database the read still answers with the number on file, `request: null` and `available: false`, rather than taking the Edit Profile row down with it |
 | POST | `/api/local/profile/id-change` | File a change request: `{ requested_value, doc_type, front, back?, reason? }`. **`front` is required** — without a document the reviewer has nothing to check the number against. Resubmitting replaces a request still awaiting review. **503 `{ code: 'id_change_unavailable' }`** when the table has not been migrated onto this database — not a 500, because nothing about the request is wrong and "try again later" is true |
 | DELETE | `/api/local/profile/id-change` | Withdraw a request still awaiting review (a decided one stays, as the record of the decision) |
 | POST | `/api/local/bookings` | Create a reservation (auth required) |
-| GET  | `/api/local/bookings` | The signed-in user's reservations |
+| GET  | `/api/local/bookings` | The signed-in user's reservations. Each carries `host_phone` — the host's number, **`null` until the booking is `confirmed`/`completed` AND `payment_status='paid'`** |
 | GET\|POST | `/api/local/chat`, `/api/local/bookings/:id/messages` | **Removed 2026-10-02 — answer 410** `{error}` with a sentence the old apps can show. Host ⇄ guest messaging was replaced by listing comments (below); the old threads stay in the database, unread |
 | GET  | `/api/local/listings/:id/comments` | **Public** Q&A on a listing, newest first (max 200): `{ comments: [{ id, listing_id, user_id, author_name, author_avatar, body, created_at, mine, reply: {body, created_at} \| null }], is_host, can_comment }`. Auth optional — it only decides `mine`, `is_host` (show reply controls) and `can_comment` (signed in, not the host, listing published). See Listing comments below |
 | POST | `/api/local/listings/:id/comments` | `{ body }` → 201 `{ comment }`. Signed in. 403 the listing's own host, 404 unpublished, 400 empty / over 1000 chars / contact details (contentguard surface `comment`), 409 the moderation warning gate, 429 over 10 per 10 min. Notifies the host (`type: 'comment'`) + push |
@@ -1700,6 +1700,25 @@ four locales, worded to match the iOS/Android `pay.rejected.*` strings — so a 
 reads the identical explanation on `/reservations`, on `/pay/:id` and in both apps. The
 admin's reason itself is shown **verbatim**: it is free text a human typed for this
 guest, and translating or paraphrasing it would defeat the point of demanding one.
+
+## The host's number waits for the money too
+
+A guest never sees their host's phone while browsing, requesting or waiting. Every
+booking response carries `host_phone`, and it is `null` until the booking is
+**`confirmed` (or `completed`) AND `payment_status = 'paid'`** — host acceptance
+alone is not enough, otherwise an accepted-but-unpaid request would hand the guest
+a number to settle off-platform with. A refund or cancellation hides it again.
+
+The rule is `HOST_PHONE_VISIBLE_SQL` in `src/lib/local/host-contact-core.ts`,
+selected inside `BOOKING_COLS`, so no booking read path can forget it; its JS twin
+`hostPhoneVisible()` is pinned by `test/unit/host-contact-core.test.mjs`. The number
+is the host's profile phone, falling back to their approved host application's.
+
+Because a paid guest is promised a number, **a host's phone is mandatory**: the
+host application already requires one, approving it copies it onto the profile when
+the profile has none, and `PATCH /api/local/profile` refuses to clear a host's phone
+(`code:'phone_required'`). `GET /api/local/profile` returns `phone_required` so the
+clients label the field required instead of optional. No migration.
 
 ## The stay pass waits for the money, not for the host
 

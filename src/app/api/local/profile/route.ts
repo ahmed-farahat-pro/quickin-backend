@@ -5,13 +5,16 @@ import { canonicalDocumentNumber } from '@/lib/local/id-change-core'
 import { checkName, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
 import { ageProblemMessage, bioProblemMessage, checkAge, checkBio, normalizeBio, parseAge } from '@/lib/local/profile-core'
 import { normalizePhone } from '@/lib/local/phone-core'
+import { HOST_PHONE_REQUIRED_MESSAGE } from '@/lib/local/host-contact-core'
 import { MAX_AVATAR_URL_CHARS, readProfilePatch } from '@/lib/local/profile-patch-core'
 
 // Profile of the signed-in user. The ONE door that writes these columns — the web
 // account page, iOS and Android all PATCH here.
 //   GET   /api/local/profile           → { id, email, full_name, role, age, id_document, phone, … }
 //   PATCH /api/local/profile {fields}  → update name / age / phone / bio / avatar / country
-// phone is only ever returned here (to the user themselves), never on a listing/booking.
+// The user's own phone is returned here; a HOST's phone reaches a guest only on a
+// confirmed + paid booking (`host_phone`, see host-contact-core). `phone_required`
+// is true for hosts, who may change their phone but not clear it.
 //
 // id_document is READ-ONLY here on purpose. It used to be an ordinary editable field,
 // which meant any account could rewrite its own identity number at any time with
@@ -43,7 +46,7 @@ export async function GET(req: Request) {
     if (!user) return NextResponse.json({ error: 'Not signed in' }, { status: 401, headers: CORS })
     if (user.id === 'admin') {
       return NextResponse.json(
-        { id: 'admin', email: user.email, full_name: 'Administrator', role: 'admin', provider: 'admin', avatar_url: null, age: null, id_document: null, phone: null },
+        { id: 'admin', email: user.email, full_name: 'Administrator', role: 'admin', provider: 'admin', avatar_url: null, age: null, id_document: null, phone: null, phone_required: false },
         { headers: CORS }
       )
     }
@@ -146,6 +149,15 @@ export async function PATCH(req: Request) {
       }
       fields.phone = phone
     } else if (patch.phone.kind === 'cleared') {
+      // A host's number is what a paid guest calls, so it can change but never
+      // go blank. Guests may still clear theirs.
+      const current = await getFullProfile(user.id)
+      if (current?.phone_required) {
+        return NextResponse.json(
+          { error: HOST_PHONE_REQUIRED_MESSAGE, field: 'phone', code: 'phone_required' },
+          { status: 400, headers: CORS },
+        )
+      }
       fields.phone = null
     }
 

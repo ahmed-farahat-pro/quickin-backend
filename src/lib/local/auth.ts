@@ -251,13 +251,16 @@ export interface Profile {
   phone: string | null
   country: string | null
   verification_status: string
+  /** Hosts may change their phone but never clear it — see host-contact-core. */
+  phone_required: boolean
 }
 
 /** The signed-in user's full profile (incl. phone) — only ever returned to themselves. */
 export async function getFullProfile(id: string): Promise<Profile | null> {
   const { rows } = await pool.query(
     `SELECT id, email, full_name, role, provider, avatar_url, bio, age, id_document, phone, country,
-            COALESCE(verification_status, 'unverified') AS verification_status
+            COALESCE(verification_status, 'unverified') AS verification_status,
+            (COALESCE(is_host, false) = true OR role = 'host') AS phone_required
        FROM users WHERE id = $1`,
     [id]
   )

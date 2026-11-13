@@ -48,6 +48,7 @@ import type { PaymentConfig } from './payment-config-core'
 import { isFlashConfigured } from './flash'
 import { rowToPayoutMethod } from './payout-method-core'
 import { needsIdentityDocuments, normalizeVerificationStatus, revokesListingPrivileges } from './host-verification-core'
+import { HOST_PHONE_VISIBLE_SQL } from './host-contact-core'
 import type { PayoutMethodRecord, PayoutMethodView } from './payout-method-core'
 import {
   COMMISSION_RATE_KEY,
@@ -259,6 +260,8 @@ export interface Booking {
   host_id: string | null
   payment_status: string
   paid_at: string | null
+  /** The host's phone — non-null only once the booking is confirmed AND paid. */
+  host_phone: string | null
   /** 'instapay' once a transfer screenshot is submitted (else null / legacy value). */
   payment_method: string | null
   /** Latest payment_proofs row status: submitted | approved | rejected | disputed (null = no proof). */
@@ -1063,6 +1066,16 @@ const BOOKING_COLS = `
   b.promo_discount::float8 AS promo_discount,
   to_char(b.created_at, 'YYYY-MM-DD') AS created_at,
   l.title, l.location, l.region, l.host_id,
+  -- The host's phone, released only once the stay is confirmed AND paid (see
+  -- host-contact-core). NULL otherwise, so no booking read can leak it early.
+  -- The profile number wins; the approved application's is the fallback for
+  -- hosts approved before approval copied it across.
+  CASE WHEN ${HOST_PHONE_VISIBLE_SQL} THEN COALESCE(
+    (SELECT NULLIF(hu.phone, '') FROM users hu WHERE hu.id = l.host_id),
+    (SELECT ha.phone FROM host_applications ha
+      WHERE ha.user_id = l.host_id AND ha.status = 'approved'
+      ORDER BY ha.reviewed_at DESC NULLS LAST LIMIT 1)
+  ) END AS host_phone,
   (SELECT url FROM listing_images li WHERE li.listing_id = l.id ORDER BY li."order" LIMIT 1) AS image
 `
 
@@ -3819,6 +3832,15 @@ export async function reviewHostApplication(appId: string, action: 'approve' | '
     if (!uid) throw new Error('Application not found')
     if (action === 'approve') {
       await client.query(`UPDATE users SET is_host = true WHERE id = $1`, [uid])
+      // Hosts must have a phone (guests get it once a booking is paid), and the
+      // application already carries a validated one — so a host never starts
+      // without it. A number they already keep on their profile is left alone.
+      await client.query(
+        `UPDATE users u SET phone = a.phone
+           FROM host_applications a
+          WHERE a.id = $1 AND u.id = a.user_id AND COALESCE(u.phone, '') = ''`,
+        [appId],
+      )
       // Keep the legacy `role` flag in sync so the mobile backend (which reads role)
       // also recognizes this host. The column is absent on a frontend-only dev DB, so
       // it runs behind a SAVEPOINT: a missing column must not abort the approval.
