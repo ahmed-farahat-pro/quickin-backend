@@ -41,9 +41,10 @@ npm run dev        # API at http://localhost:4000
 | GET  | `/api/local/host/comments` | The host's "Guest questions" — comments across all their listings, unanswered first: `{ comments: [...same shape + listing_title, listing_image], unanswered }` |
 | GET  | `/api/local/admin/comments` | **/ops → Comments** (module `moderation`). `?scope=visible\|hidden\|removed\|all` (default `visible`), `?q=` searches comment, reply, author name/email and listing title, `?listingId=` / `?userId=` narrow it. → `{ comments: [{ …, author_name, author_email, author_status, deleted_by, delete_reason, state }] }` — full name and email, because staff need to know whom they are banning. `state` is `visible` \| `hidden` (author banned) \| `removed_by_author` \| `removed_by_staff`. Max 300, newest first |
 | DELETE | `/api/local/admin/comments/:id` | Staff remove a comment (`moderation`), optional `{ reason }` kept for the audit log only. The author is notified (`type: 'comment_removed'`). `?part=reply` removes only the host's reply. Audited as `comment_removed` / `comment_reply_removed`. **Banning the author** is the existing `POST /api/local/admin/moderation {userId, action:'suspend', reason}` |
-| POST | `/api/auth/signup` | Register: email + password + `full_name`, **plus `phone`, `doc_type`, `id_number`, `id_front`, `id_back` (all required)**. `400 {error, fields}` keyed like the body. Files the ID to `/ops` as `source='signup'` |
+| POST | `/api/auth/signup` | Register: email + password + `full_name`, **plus `phone`, `doc_type`, `id_number`, `id_front`, `id_back` (all required)**, plus the role pages: `role` (`guest` default \| `host`); a guest may add `refund_method` (optional, the payout-method body); a host must add `host_type`, `address`, `company?`, `notes?`, `terms_accepted: true` and `payout` (the payout-method body) and is filed as a **pending host application**. `400 {error, fields}` keyed like the body, every step's fields in one map. Files the ID to `/ops` as `source='signup'`. See *Signup picks Guest or Host* |
 | GET  | `/api/local/account/identity` | The signed-in user's identity state (`identity_required`, `identity_complete`, `verification_status`, `verification_note`) |
-| POST | `/api/local/account/identity` | "Complete your account" for a first Google sign-in: `{phone, doc_type, id_number, id_front, id_back}` → identity state. `400 {error, fields}`; `409` when nothing is owed |
+| POST | `/api/local/account/identity` | "Complete your account" for a first Google sign-in: `{phone, doc_type, id_number, id_front, id_back}` + the same role fields as `/api/auth/signup` → identity state + host state. `400 {error, fields}`; `409` when nothing is owed |
+| GET/PUT/DELETE | `/api/local/account/refund-method` | Any signed-in user's **refund destination** (bank account / InstaPay) → `{refund_method, refund_ready}`. Same body and validation as `PUT /api/local/host/payout-method`, and the **same one-row-per-user record** (`host_payout_methods`) — one place QuickIn sends this person money. `400` with the reason, `401` signed out. Shown to `/ops` in the refunds queue as `guest_refund_method` |
 | POST | `/api/auth/login` | Sign in (email + password) |
 | POST | `/api/auth/social` | Demo social sign-in (`google`) |
 | POST | `/api/auth/google` | Google sign-in — verifies a Google ID token against Google's JWKS |
@@ -66,7 +67,8 @@ npm run dev        # API at http://localhost:4000
 | PUT  | `/api/local/admin/settings/bank` | Update the bank-transfer half — `{enabled?, bank_name?, account_name?, account_number?, iban?, instructions?}`. `400` with the reason on a malformed account number or IBAN |
 | GET  | `/api/local/admin/settings/flash` | Read the config (same payload). Staff session with the `payments` module |
 | PUT  | `/api/local/admin/settings/flash` | `{enabled: boolean}` — the only Flash setting; credentials are env vars. Audited as `flash_updated` |
-| POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, doc_type, id_front, id_back, company?, notes?}`. **The ID documents are required** (`doc_type` + both sides, as `data:image/…` URLs) unless the applicant's identity is already `verified` or `pending`, in which case they are omitted and the application is linked to the submission on file; they are filed as a pending `id_verifications` row (`source='host_application'`) so one admin decision covers host status and identity. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review |
+| GET | `/api/local/host/application` | The signed-in user's host application: `{host_status, application, profile: {full_name, phone, national_id, doc_type, verification_status, missing[]}, payout_method, terms_version}`. `profile` is what the form shows read-only; `missing` is the only profile data it asks for |
+| POST | `/api/local/host/apply` | Submit (or re-submit after a rejection) a host application — `{full_name, national_id, phone, address, host_type, doc_type, id_front, id_back, company?, notes?}`. **The ID documents are required** (`doc_type` + both sides, as `data:image/…` URLs) unless the applicant's identity is already `verified` or `pending`, in which case they are omitted and the application is linked to the submission on file; they are filed as a pending `id_verifications` row (`source='host_application'`) so one admin decision covers host status and identity. Never grants hosting; only an admin approval does. `400 {error, fields}` with a message per offending input — the **phone must be a phone number** and the **name must be a name**, not merely non-empty, and both are stored normalized (see below); a refused name also carries `nameProblem`. `409` if the user is already a host or has one under review. **Same account, no re-typing (2026-11-13):** `full_name`, `phone` and `national_id` are taken from the **profile** whenever it has them (a submitted value only fills a gap — see `GET /api/local/host/application` → `profile.missing`); the body also needs `terms_accepted: true` (field `terms`) and a `payout` object — the same body as `PUT /api/local/host/payout-method`, field `payout` — unless a payout method is already on file. The payout is saved only after the application is filed. See *Becoming a host on the same account* |
 | PATCH | `/api/local/host/listings/[id]/visibility` | **The host takes their own listing off the market, or puts it back** — `{is_published: false\|true}` → `{id, is_published, unpublished_by_host, declined_requests, blocked_by, blocked_message, listing}`. There is no host-facing DELETE and there will not be one; see *A host removes a listing by hiding it* below. Deactivating also **declines every booking request still waiting on this host** (`declined_requests` says how many) through the same path a manual decline uses, so each guest gets the ordinary notification. Reactivating clears only the host's own flag: when an account block, the identity gate or the review queue still holds the listing down, `blocked_by` names it (`verification` \| `staff` \| `rejected` \| `under_review`) and `is_published` comes back **false**. 401 unsigned, 403 not the host |
 | ANY  | `/api/local/services`, `/api/local/services/[id]`, `/api/local/service-requests`, `/api/local/service-requests/[id]`, `/api/local/host/services`, `/api/local/host/services/[id]/visibility`, `/api/local/host/service-requests` | **410 Gone** — Services were removed 2026-10-20. See *Services were removed* below |
 | GET  | `/api/local/wishlist` | `{listings, listingIds, services: [], serviceIds: []}` — listings only; the two service keys are always empty, kept for old app builds |
@@ -2480,6 +2482,7 @@ the list of record. Recent additions:
 | `migrate-flash.mjs` | `flash_orders` (one row per Flash checkout attempt) and the `flash_enabled = '0'` setting. Run it **before** deploying the Flash routes — they read the table |
 | `migrate-host-verification.mjs` | `id_verifications.doc_type`, `host_applications.verification_id` (links an application to the ID filed with it), `listings.unpublished_by_verification`, and the host verification-status index. Also **reports** how many approved hosts are unverified and how many live listings they hold — read that before deploying, since the gate is a hard cutover |
 | `migrate-commission.mjs` | Makes the platform commission safe on any database: creates `app_settings` if absent, seeds `platform_commission_rate`, adds `bookings.commission_rate` — and backfills it on **every** booking, not just paid ones (`migrate-analytics.mjs` only did the paid ones, which was fine when the column was a reporting field and is not now that guest prices derive from it) |
+| `migrate-host-terms.mjs` | `host_applications.terms_version` + `terms_accepted_at`. Run it **before** deploying — `POST /api/local/host/apply` WRITES both and 500s without them |
 | `migrate-signup-identity.mjs` | `users.identity_required` (default false — never back-filled) and a partial index on `users.phone` for the one-account-per-phone check. Run it **before** deploying — signup and first Google sign-in WRITE the column and 500 without it |
 | `migrate-host-response-alerts.mjs` | `host_response_alerts` (one row per booking request a host left unanswered 24h+) and a partial index on pending bookings by `created_at`. Run it **before** deploying — the cron and the ops screen 500 without it (the alert centre degrades to 0) |
 | `migrate-activity.mjs` | `user_logins` (the one activity event nothing recorded) plus timestamp indexes on `users`/`listings`/`payment_proofs` and a partial index on open reports — the derived activity feed and alert centre in `/ops` |
@@ -2606,3 +2609,42 @@ hour"). Re-running the sweep the same night opens nothing and nudges no one.
   `01:00 UTC` is **03:00 Cairo in winter (EET, UTC+2) and 04:00 in summer (EEST,
   UTC+3)**. An exact 03:00 all year would need a second cron entry plus an hour check
   in the route.
+
+## Becoming a host on the same account
+
+A guest becomes a host from their own account (profile → *Become a host*); there is no
+second account. A host signup (see *Signup picks Guest or Host*, Guest preselected) files
+this same application. The application **never re-asks what the
+profile holds**: `src/lib/local/host-application-core.ts` decides, per field, whether the
+profile supplies it (`applicantProfile`) — the name if it passes the name policy, the phone
+if it normalizes, the ID number while its submission is `verified` or `pending`. The forms
+show those read-only and ask only for `profile.missing`; the server ignores a submitted
+value the profile already has (`resolveProfileField`). The application adds the host-only
+facts: host type, address, company, a payout destination (`payoutRequired` — skipped when
+one is on file) and the host terms (`hostTermsAccepted`, stored with `HOST_TERMS_VERSION`).
+Admin review and the publish gate (approved host + verified ID) are unchanged.
+Tests: `test/unit/host-application-core.test.mjs`.
+
+## Signup picks Guest or Host
+
+From 2026-11-13 a first-time signup (email form, or the Google *Complete your account*
+screen) opens on two cards — **Guest is preselected**, so nobody has to choose — and then
+walks stepped pages with a step indicator (`SIGNUP_STEPS` in
+`src/lib/local/signup-role-core.ts`):
+
+| Role | Pages |
+|---|---|
+| guest | account → identity → refund (optional, skippable) |
+| host | account → identity → hosting → payout (required) |
+
+Everything is posted once, at the end, before the email code. The identity half is
+*Every new account gives a phone and an ID*. The host's **hosting** page files the same
+application as `POST /api/local/host/apply` (host type, address, company, notes, host terms),
+linked to the ID the signup just filed, so it reaches `/ops` at once; the **payout** is saved
+after it. A guest's optional **refund** destination goes into the same `host_payout_methods`
+row — there is one destination per person, so a guest who later becomes a host already has
+payout details, and the refunds queue reads it (`guest_refund_method`). **No migration.** A
+client that sends no `role` is a guest without a refund step — the old behaviour. Becoming a
+host later from the account (*Becoming a host on the same account*) is unchanged. Rules:
+`signup-role-core.ts` (pure, tested in `test/unit/signup-role-core.test.mjs`); the reader and
+writer: `signup-role.ts`.

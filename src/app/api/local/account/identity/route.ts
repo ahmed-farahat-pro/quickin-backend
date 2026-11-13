@@ -1,16 +1,20 @@
 import { NextResponse } from 'next/server'
 import { getUserById, getUserFromRequest, setUserPhone } from '@/lib/local/auth'
-import { getIdentityState, submitVerificationImages } from '@/lib/local/db'
+import { getHostState, getIdentityState, submitVerificationImages } from '@/lib/local/db'
 import { readSignupIdentity } from '@/lib/local/signup-identity'
 import { SIGNUP_IDENTITY_SOURCE } from '@/lib/local/signup-identity-core'
+import { applySignupRole, readSignupRole } from '@/lib/local/signup-role'
 
 // The "Complete your account" step (signup-identity-core). An account created by
 // a first Google sign-in has no phone or ID yet; the clients hold it on a blocking
 // screen while `identity_complete` is false and post the same fields the email
 // signup form sends.
 //   GET  /api/local/account/identity  (auth) — the identity state alone.
-//   POST /api/local/account/identity  (auth) { phone, doc_type, id_number, id_front, id_back }
-//        → 200 identity state | 400 { error, fields } | 409 when nothing is owed.
+//   POST /api/local/account/identity  (auth) { phone, doc_type, id_number, id_front, id_back,
+//        role?, host_type, address, company, notes, terms_accepted, payout | refund_method }
+//        → 200 identity state + host state | 400 { error, fields } | 409 when nothing is owed.
+// The role fields are the email signup's (signup-role-core): a Google user picks
+// Guest or Host on this screen and walks the same steps.
 // A REJECTED document is re-uploaded through POST /api/local/verification, not here.
 export const dynamic = 'force-dynamic'
 const CORS = {
@@ -53,9 +57,10 @@ export async function POST(req: Request) {
     }
     const body = await req.json()
     const read = await readSignupIdentity(body, me.email)
-    if (read.fields) {
+    const roleRead = readSignupRole(body)
+    if (read.fields || roleRead.fields) {
       return NextResponse.json(
-        { error: 'Please check the highlighted fields', fields: read.fields },
+        { error: 'Please check the highlighted fields', fields: { ...read.fields, ...roleRead.fields } },
         { status: 400, headers: CORS }
       )
     }
@@ -72,7 +77,14 @@ export async function POST(req: Request) {
       source: SIGNUP_IDENTITY_SOURCE,
     })
     await setUserPhone(me.id, identity.phone)
-    return NextResponse.json(await getIdentityState(me.id), { headers: CORS })
+    // An already-approved host (an older Google account) has nothing to apply for.
+    const host = await getHostState(me.id)
+    const parts = host.is_host || host.host_status === 'pending'
+      ? { ...roleRead.parts, role: 'guest' as const, hosting: null }
+      : roleRead.parts
+    await applySignupRole(me.id, parts, identity, row?.full_name ?? '')
+    const [identityState, hostState] = await Promise.all([getIdentityState(me.id), getHostState(me.id)])
+    return NextResponse.json({ ...identityState, ...hostState }, { headers: CORS })
   } catch (err) {
     console.error('POST /api/local/account/identity failed:', err)
     return NextResponse.json({ error: 'Could not save your details', detail: String(err) }, { status: 500, headers: CORS })

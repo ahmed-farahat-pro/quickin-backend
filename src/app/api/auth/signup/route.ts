@@ -12,6 +12,7 @@ import {
 import { submitVerificationImages } from '@/lib/local/db'
 import { readSignupIdentity } from '@/lib/local/signup-identity'
 import { SIGNUP_IDENTITY_SOURCE } from '@/lib/local/signup-identity-core'
+import { applySignupRole, readSignupRole } from '@/lib/local/signup-role'
 import { sendOtpEmail, smtpConfigured } from '@/lib/local/mailer'
 import { checkEmail, emailProblemMessage, normalizeEmail } from '@/lib/local/email-core'
 import { checkName, fallbackNameFromEmail, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
@@ -37,8 +38,11 @@ export async function OPTIONS() {
 }
 
 // POST /api/auth/signup — { email, password, full_name, phone, doc_type, id_number,
-// id_front, id_back } → emails a 6-digit OTP. Phone and ID are mandatory for every
-// new account (signup-identity-core); a bad one answers 400 { error, fields }.
+// id_front, id_back, role?, … } → emails a 6-digit OTP. Phone and ID are mandatory for
+// every new account (signup-identity-core); a bad one answers 400 { error, fields }.
+// `role` (signup-role-core): 'guest' may add an optional `refund_method`; 'host' must
+// add the hosting page (host_type, address, company?, notes?, terms_accepted) and a `payout`,
+// and is filed as a pending host application. No role = guest, the old behaviour.
 // Returns { pending: true, email } (NO token yet). The account is created unverified;
 // the client then calls /api/auth/verify-otp with the code to activate + receive a token.
 export async function POST(req: Request) {
@@ -112,14 +116,18 @@ export async function POST(req: Request) {
 
     // Phone + identity document, checked in full before any row is written so a
     // refused signup leaves nothing behind. Keys match the body for the forms.
+    // The role pages are checked in the same pass, so one 400 names every bad
+    // field on every step and the client can jump to the first one.
     const read = await readSignupIdentity(body, cleanEmail)
-    if (read.fields) {
+    const roleRead = readSignupRole(body)
+    if (read.fields || roleRead.fields) {
       return NextResponse.json(
-        { error: 'Please check the highlighted fields', fields: read.fields },
+        { error: 'Please check the highlighted fields', fields: { ...read.fields, ...roleRead.fields } },
         { status: 400, headers: CORS }
       )
     }
     const identity = read.identity
+    const roleParts = roleRead.parts
 
     const otp = generateOtp()
     const otpExpires = new Date(Date.now() + OTP_TTL_MS)
@@ -145,6 +153,8 @@ export async function POST(req: Request) {
       docType: identity.docType,
       source: SIGNUP_IDENTITY_SOURCE,
     })
+    // After the ID, so a host's application links the document just filed.
+    await applySignupRole(userId, roleParts, identity, fullName)
 
     const DEV_FALLBACK_OTP = '123456'
     let emailSent = true
@@ -157,15 +167,18 @@ export async function POST(req: Request) {
       await setUserOtp({ email: cleanEmail, otp: DEV_FALLBACK_OTP, otpExpires, role: 'user' })
     }
 
-    // A brand-new account is never a host — still send the host fields every other
-    // auth response carries so clients can hydrate from any of them.
+    // A brand-new account is never an approved host — a host signup is a pending
+    // application. Still send the host fields every other auth response carries so
+    // clients can hydrate from any of them.
+    const isHostSignup = roleParts.role === 'host'
     return NextResponse.json(
       {
         pending: true,
         email: cleanEmail,
+        role: roleParts.role,
         is_host: false,
-        host_type: null,
-        host_status: 'none',
+        host_type: isHostSignup ? roleParts.hosting?.host_type ?? null : null,
+        host_status: isHostSignup ? 'pending' : 'none',
         host_review_note: null,
         ...(smtpConfigured && emailSent ? {} : { devCode: DEV_FALLBACK_OTP }),
       },

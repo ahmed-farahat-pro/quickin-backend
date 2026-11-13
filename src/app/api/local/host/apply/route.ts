@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server'
 import { getUserFromRequest } from '@/lib/local/auth'
 import {
+  getApplicantProfile,
   getHostState,
+  getPayoutMethod,
   getVerificationStatusFromTable,
+  savePayoutMethod,
   submitHostApplication,
   HOST_TYPES,
   type HostType,
@@ -10,6 +13,14 @@ import {
 import { checkName, nameProblemMessage, normalizeName } from '@/lib/local/name-policy'
 import { normalizePhone } from '@/lib/local/phone-core'
 import { checkApplicationIdentity } from '@/lib/local/host-verification-core'
+import {
+  HOST_TERMS_VERSION,
+  hostTermsAccepted,
+  payoutRequired,
+  payoutSubmitted,
+  resolveProfileField,
+} from '@/lib/local/host-application-core'
+import { isPayoutMethodError, validatePayout, type PayoutMethodRecord } from '@/lib/local/payout-method-core'
 
 // POST /api/local/host/apply — submit (or re-submit after a rejection) a host
 // application for admin review. It NEVER grants hosting: only an admin approval in
@@ -21,6 +32,13 @@ import { checkApplicationIdentity } from '@/lib/local/host-verification-core'
 // against without them. An applicant who is already verified — or whose
 // submission is already in the queue — does not send them again
 // (`checkApplicationIdentity`, the same rule the forms render from).
+//
+// Same account, no re-typing (2026-11-13): full_name, phone and national_id come
+// from the PROFILE whenever it has them (host-application-core) — a submitted
+// value only fills a gap on an account from before the signup rule. The
+// application adds the host-only facts: `payout` (the same body as PUT
+// /api/local/host/payout-method; required unless one is on file) and
+// `terms_accepted: true`.
 export const dynamic = 'force-dynamic'
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -50,9 +68,10 @@ export async function POST(req: Request) {
     const b = await req.json().catch(() => ({}))
     // Collapses whitespace and drops invisibles as well as trimming, so what we
     // store is exactly what the policy judged.
-    const fullName = normalizeName(b.full_name ?? b.fullName)
-    const nationalId = str(b.national_id ?? b.nationalId)
-    const rawPhone = str(b.phone)
+    const profile = await getApplicantProfile(me.id)
+    const fullName = normalizeName(resolveProfileField(profile, 'full_name', b.full_name ?? b.fullName))
+    const nationalId = resolveProfileField(profile, 'national_id', b.national_id ?? b.nationalId)
+    const rawPhone = resolveProfileField(profile, 'phone', b.phone)
     // Canonical form, or null when it isn't a phone number. Stored normalized so
     // the same mobile sent as `+20 10…` by one client and `010…` by another is
     // one applicant in /ops, and reaches the web's rows in the same shape.
@@ -78,6 +97,21 @@ export async function POST(req: Request) {
     else if (!phone) fields.phone = 'Enter a valid phone number, like 010 1234 5678'
     if (!address) fields.address = 'Address is required'
     if (!(HOST_TYPES as readonly string[]).includes(hostType)) fields.host_type = 'Choose individual, company or brokerage'
+    if (!hostTermsAccepted(b.terms_accepted ?? b.termsAccepted)) fields.terms = 'Accept the host terms to apply'
+
+    // Payout destination — validated now, saved only once the application is in,
+    // so a refused application never leaves a payout row behind.
+    let payout: PayoutMethodRecord | null = null
+    if (payoutSubmitted(b.payout)) {
+      try {
+        payout = validatePayout(b.payout)
+      } catch (e) {
+        if (!isPayoutMethodError(e)) throw e
+        fields.payout = (e as Error).message
+      }
+    } else if (payoutRequired(!!(await getPayoutMethod(me.id)))) {
+      fields.payout = 'Add a bank account or InstaPay to receive your earnings'
+    }
 
     // Identity documents. Read from the id_verifications row rather than
     // users.verification_status, because that row is what the reviewer opens and
@@ -124,7 +158,11 @@ export async function POST(req: Request) {
       doc_type: docType || null,
       id_front: idFront || null,
       id_back: idBack || null,
+      terms_version: HOST_TERMS_VERSION,
     })
+    // The payout endpoint is host-only; an applicant is not one yet, so the
+    // application files it directly. It gates nothing until approval.
+    if (payout) await savePayoutMethod(me.id, payout)
     return NextResponse.json({ ok: true, host_status: 'pending', application }, { headers: CORS })
   } catch (err) {
     console.error('host apply failed:', err)

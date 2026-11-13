@@ -47,6 +47,9 @@ import { PAYMENT_SETTING_KEYS, normalizePaymentMethod, rowsToPaymentConfig } fro
 import type { PaymentConfig } from './payment-config-core'
 import { isFlashConfigured } from './flash'
 import { rowToPayoutMethod } from './payout-method-core'
+import { applicantProfile, type ApplicantProfile } from './host-application-core'
+import { checkName, normalizeName } from './name-policy'
+import { normalizePhone } from './phone-core'
 import { needsIdentityDocuments, normalizeVerificationStatus, revokesListingPrivileges } from './host-verification-core'
 import { HOST_PHONE_VISIBLE_SQL } from './host-contact-core'
 import type { PayoutMethodRecord, PayoutMethodView } from './payout-method-core'
@@ -3758,6 +3761,27 @@ export async function getHostApplication(userId: string): Promise<HostApplicatio
  *  verified or pending submission is linked to it instead of photographing the
  *  same document twice (`needsIdentityDocuments`); the route enforces the same
  *  rule up front so the applicant gets per-field messages. */
+/** The profile half of a become-a-host application — what signup already
+ *  collected, run through the same name/phone rules the form would apply, so
+ *  `applicantProfile` can trust whatever it gets. See host-application-core. */
+export async function getApplicantProfile(userId: string): Promise<ApplicantProfile & {
+  doc_type: string | null
+  verification_status: string
+}> {
+  const [{ rows }, identity] = await Promise.all([
+    pool.query(`SELECT full_name, phone FROM users WHERE id = $1`, [isUuid(userId) ? userId : null]),
+    getVerificationStatusFromTable(userId),
+  ])
+  const name = normalizeName(rows[0]?.full_name ?? '')
+  const profile = applicantProfile({
+    fullName: name && !checkName(name) ? name : null,
+    phone: normalizePhone(rows[0]?.phone ?? ''),
+    verificationStatus: identity.status,
+    idNumber: identity.id_number,
+  })
+  return { ...profile, doc_type: identity.doc_type, verification_status: identity.status }
+}
+
 export async function submitHostApplication(
   userId: string,
   f: {
@@ -3773,22 +3797,26 @@ export async function submitHostApplication(
     /** FRONT / BACK photos as `data:image/…` URLs (or https links). */
     id_front?: string | null
     id_back?: string | null
+    /** HOST_TERMS_VERSION the applicant accepted; stamped with now(). */
+    terms_version: string
   }
 ): Promise<HostApplication | null> {
   if (!isUuid(userId)) throw new Error('Invalid user')
   const company = f.host_type === 'individual' ? null : (f.company || null)
-  const vals = [userId, f.full_name, f.national_id, f.phone, f.address, company, f.notes || null]
+  const vals = [userId, f.full_name, f.national_id, f.phone, f.address, company, f.notes || null, f.terms_version]
   const upd = await pool.query(
     `UPDATE host_applications
         SET full_name = $2, national_id = $3, phone = $4, address = $5, company = $6, notes = $7,
+            terms_version = $8, terms_accepted_at = now(),
             status = 'pending', submitted_at = now(), reviewed_at = NULL, reviewed_by = NULL, review_note = NULL
       WHERE user_id = $1 RETURNING id`,
     vals
   )
   if (!upd.rows[0]) {
     await pool.query(
-      `INSERT INTO host_applications (user_id, full_name, national_id, phone, address, company, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      `INSERT INTO host_applications (user_id, full_name, national_id, phone, address, company, notes,
+                                      terms_version, terms_accepted_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())`,
       vals
     )
   }
@@ -4827,7 +4855,14 @@ export interface RefundRow {
   /** Null while due; the settlement stamp once someone has sent the money. */
   refunded_at: string | null
   refund_reference: string | null
+  /** The bank account / InstaPay address the guest gave for refunds (at signup or
+   *  on their profile), or null when they gave none — then the phone is the lead. */
+  guest_refund_method: PayoutMethodView | null
 }
+
+/** Where a refunded guest wants their money — the same one-row-per-user table a
+ *  host's payout destination lives in. */
+const REFUND_METHOD_JOIN = `LEFT JOIN host_payout_methods rm ON rm.user_id = b.user_id`
 
 const REFUND_ROW_COLS = `
   b.id AS booking_id, b.reservation_code, l.title,
@@ -4841,8 +4876,24 @@ const REFUND_ROW_COLS = `
   to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
   to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
   to_char(b.refunded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS refunded_at,
-  b.refund_reference
+  b.refund_reference,
+  rm.method AS rm_method, rm.account_name AS rm_account_name, rm.account_ref AS rm_account_ref,
+  rm.bank_name AS rm_bank_name, rm.iban AS rm_iban, rm.account_number AS rm_account_number,
+  rm.swift_bic AS rm_swift_bic, rm.branch AS rm_branch, rm.provider AS rm_provider,
+  rm.updated_at AS rm_updated_at
 `
+
+/** Fold the `rm_*` columns into one `guest_refund_method` view. */
+function toRefundRow(r: Record<string, unknown>): RefundRow {
+  const out: Record<string, unknown> = {}
+  const rm: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(r)) {
+    if (k.startsWith('rm_')) rm[k.slice(3)] = v
+    else out[k] = v
+  }
+  out.guest_refund_method = rm.method ? rowToPayoutMethod(rm) : null
+  return out as unknown as RefundRow
+}
 
 /** Cancelled, owed money, guest had paid, nobody has sent it. The SQL twin of
  *  isRefundDue(). LEFT JOIN on users so a deleted guest account still shows the
@@ -4866,6 +4917,7 @@ export async function adminListRefunds(): Promise<{ due: RefundRow[]; settled: R
          FROM bookings b
          JOIN listings l ON l.id = b.listing_id
          LEFT JOIN users gu ON gu.id = b.user_id
+         ${REFUND_METHOD_JOIN}
         WHERE ${REFUND_DUE_SQL}
         ORDER BY b.cancelled_at ASC NULLS LAST`
     ),
@@ -4874,12 +4926,13 @@ export async function adminListRefunds(): Promise<{ due: RefundRow[]; settled: R
          FROM bookings b
          JOIN listings l ON l.id = b.listing_id
          LEFT JOIN users gu ON gu.id = b.user_id
+         ${REFUND_METHOD_JOIN}
         WHERE b.status = 'cancelled' AND b.refunded_at IS NOT NULL
         ORDER BY b.refunded_at DESC
         LIMIT 100`
     ),
   ])
-  return { due: due.rows as RefundRow[], settled: settled.rows as RefundRow[] }
+  return { due: due.rows.map(toRefundRow), settled: settled.rows.map(toRefundRow) }
 }
 
 /** How many guests are still owed money, and how much — for the /ops badge counts. */
