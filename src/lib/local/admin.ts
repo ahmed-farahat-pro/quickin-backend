@@ -4,6 +4,7 @@ import { sendPush } from './push'
 import { sendNotificationEmail } from './mailer'
 import { genReservationCode } from './db'
 import { ACTIVE_ACCOUNT_SQL } from './account-status-core'
+import { likeEscape, normalizeRecipientQuery, type NotifyRequest } from './notify-core'
 
 const WEB_URL = process.env.WEB_URL || 'https://quickin-frontend.vercel.app'
 
@@ -222,40 +223,49 @@ export async function adminSetListingPublished(
 }
 
 /**
- * Admin broadcast — "fire a notification" to web/iOS/Android users. Writes an
- * in-app notification for every targeted user, sends an FCM push (if a device
- * token + FIREBASE_SERVICE_ACCOUNT exist), and optionally an email. Best-effort
- * per user — one failure never aborts the rest.
+ * Admin notification — "fire a notification" to web/iOS/Android users, either a
+ * whole segment or hand-picked users. Writes an in-app notification for every
+ * targeted user, sends an FCM push (if they have a device token), and optionally an
+ * email. Best-effort per user — one failure never aborts the rest.
+ *
+ * Takes an already-validated request (see notify-core.ts parseNotifyRequest).
  */
-export async function adminBroadcast(args: {
-  title: string
-  body?: string | null
-  link?: string | null
-  audience?: 'all' | 'guests' | 'hosts'
-  push?: boolean
-  email?: boolean
-}): Promise<{ recipients: number; emailed: number }> {
-  const title = (args.title ?? '').toString().trim()
-  if (!title) throw new Error('Title is required')
-  const body = (args.body ?? '').toString().trim() || null
-  const link = (args.link ?? '').toString().trim() || null
-  const audience = args.audience === 'guests' ? 'guests' : args.audience === 'hosts' ? 'hosts' : 'all'
+export async function adminBroadcast(req: NotifyRequest): Promise<{
+  recipients: number
+  emailed: number
+  with_device: number
+  skipped: string[]
+}> {
+  const { title, body, link, target } = req
 
-  const filter =
-    audience === 'guests' ? `role = 'user'` : audience === 'hosts' ? `role IN ('host','admin')` : `true`
-  // Blocked and removed accounts get no push and no email — a suspended user should
-  // hear nothing from the product until they're reinstated.
-  const { rows } = await pool.query(
-    `SELECT id, email FROM users WHERE (${filter}) AND ${ACTIVE_ACCOUNT_SQL}`
-  )
+  // Blocked and removed accounts get nothing — a suspended user should hear
+  // nothing from the product until they're reinstated. That holds for hand-picked
+  // sends too: they come back in `skipped` so the operator sees who was left out.
+  let rows: { id: string; email: string | null; device_count: number }[]
+  const select = `SELECT id, email,
+            (SELECT COUNT(*)::int FROM device_tokens d WHERE d.user_id = users.id) AS device_count
+       FROM users`
+  if (target.kind === 'users') {
+    const r = await pool.query(`${select} WHERE id = ANY($1::uuid[]) AND ${ACTIVE_ACCOUNT_SQL}`, [target.userIds])
+    rows = r.rows
+  } else {
+    const filter =
+      target.audience === 'guests' ? `role = 'user'` : target.audience === 'hosts' ? `role IN ('host','admin')` : `true`
+    const r = await pool.query(`${select} WHERE (${filter}) AND ${ACTIVE_ACCOUNT_SQL}`)
+    rows = r.rows
+  }
+  const found = new Set(rows.map((r) => String(r.id).toLowerCase()))
+  const skipped = target.kind === 'users' ? target.userIds.filter((id) => !found.has(id)) : []
 
   let emailed = 0
-  for (const u of rows as { id: string; email: string | null }[]) {
+  let withDevice = 0
+  for (const u of rows) {
     await createNotification(u.id, { type: 'announcement', title, body, link })
-    if (args.push !== false) {
+    if (req.push) {
+      if (u.device_count > 0) withDevice++
       await sendPush(u.id, { title, body, link })
     }
-    if (args.email && u.email) {
+    if (req.email && u.email) {
       await sendNotificationEmail(
         u.email,
         title,
@@ -266,7 +276,28 @@ export async function adminBroadcast(args: {
       emailed++
     }
   }
-  return { recipients: rows.length, emailed }
+  return { recipients: rows.length, emailed, with_device: withDevice, skipped }
+}
+
+/**
+ * Recipient picker for /ops → Notifications: active accounts matching a name,
+ * email or phone, with how many push devices each has registered.
+ */
+export async function searchNotifyRecipients(rawQ: unknown) {
+  const q = normalizeRecipientQuery(rawQ)
+  if (!q) return []
+  const like = `%${likeEscape(q)}%`
+  const { rows } = await pool.query(
+    `SELECT id, email, full_name, role, phone,
+            (SELECT COUNT(*)::int FROM device_tokens d WHERE d.user_id = users.id) AS device_count
+       FROM users
+      WHERE ${ACTIVE_ACCOUNT_SQL}
+        AND (email ILIKE $1 OR full_name ILIKE $1 OR phone ILIKE $1 OR id::text = $2)
+      ORDER BY full_name NULLS LAST, email
+      LIMIT 20`,
+    [like, q.toLowerCase()]
+  )
+  return rows
 }
 
 /** Admin changes a user's role (user | host | admin). */

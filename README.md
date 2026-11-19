@@ -83,6 +83,8 @@ npm run dev        # API at http://localhost:4000
 | PUT  | `/api/local/admin/settings/commission` | Set it — `{percent}` (e.g. `12.5`). `400` outside 0–100. Reprices every listing immediately (the `impact` payload is `{listings}` — the old `services` count is gone); existing bookings keep their snapshotted rate |
 | GET  | `/api/local/admin/host-response-alerts` | Booking requests hosts left unanswered 24h+ (`bookings` module). `?status=open` (default) \| `handled` \| `closed` \| `all`. Each row carries the host's contact details and `host_alert_count` (repeat offenders). See [Host response alerts](#host-response-alerts) |
 | POST | `/api/local/admin/host-response-alerts` | `{id, note}` — open → handled. `note` is required (≤500). `409` when the alert is no longer open. Does not touch the booking. Audited as `host_response_alert_handled` |
+| POST | `/api/local/admin/notify` | Send a notification (`notify` module). `{title, body?, link?, push?=true, email?=false}` plus either `user_ids: uuid[]` (1–200 hand-picked users; wins over audience) or `audience: all\|guests\|hosts`. In-app row + FCM push + optional email per recipient; suspended/removed accounts skipped. Returns `{recipients, emailed, with_device, skipped}`. `400` on bad input. Audited as `broadcast_sent`. See [Admin notifications](#admin-notifications) |
+| GET  | `/api/local/admin/notify/recipients` | `?q=` (2+ chars) — up to 20 active users matching name/email/phone/id, each with `device_count` (registered push devices). `notify` module. Powers the /ops Notifications picker |
 | GET  | `/api/cron/host-response-alerts` | The nightly sweep (01:00 UTC = 03:00 Cairo in winter, 04:00 in summer). Opens/refreshes alerts, closes answered or past-check-in ones, reminds each host once per night. `Authorization: Bearer <CRON_SECRET>` when that is set. Returns `{today, resolved, expired, opened, stale, nudged}` |
 
 All responses send `Access-Control-Allow-Origin: *`. Every POST route answers a CORS
@@ -1651,6 +1653,23 @@ investigator needs.
 
 **The host is not shown the dispute.** It goes to QuickIn, and the copy on every
 client says so.
+
+## Admin notifications
+
+/ops → **Notifications** (web, `notify` module) sends one message to hand-picked
+users or to a segment. Each recipient gets an in-app notification (the bell), an
+FCM push to every registered iOS/Android device, and optionally an email.
+
+- Input rules live in `src/lib/local/notify-core.ts` (tested in
+  `test/unit/notify-core.test.mjs`): title ≤120, message ≤500, link must be an app
+  path (`/reservations`) or `https://` URL, at most 200 hand-picked users.
+- `user_ids` always beats `audience`, so a named send can never widen to everyone.
+- Suspended/removed accounts never receive anything; picked ones come back in
+  `skipped`.
+- Users with no registered device (`device_count = 0`) still get the in-app copy —
+  the picker shows this so the operator knows push won't reach them.
+- Push needs Firebase credentials (see `src/lib/local/push.ts`); without them the
+  push step no-ops and the in-app + email copies still go out.
 
 ## Admin actions are audited
 
