@@ -123,13 +123,40 @@ export function sortForHost<T extends { reply: unknown; created_at: string }>(li
 
 // ── Staff moderation (/ops → Comments) ───────────────────────────────────────
 
-/** Which comments the staff list shows. `visible` = what the public can see now. */
-export const ADMIN_COMMENT_SCOPES = ['visible', 'removed', 'hidden', 'all'] as const
+/**
+ * Which comments the staff list shows. `review` = live comments no staff member has
+ * looked at yet (the queue); `visible` = everything the public can see now, reviewed
+ * or not. Comments go live the moment they are posted — the queue is so staff see
+ * every one, not a gate in front of the listing.
+ */
+export const ADMIN_COMMENT_SCOPES = ['review', 'visible', 'removed', 'hidden', 'all'] as const
 export type AdminCommentScope = (typeof ADMIN_COMMENT_SCOPES)[number]
 
 export function normalizeAdminScope(value: unknown): AdminCommentScope {
   const v = String(value ?? '').toLowerCase()
   return (ADMIN_COMMENT_SCOPES as readonly string[]).includes(v) ? (v as AdminCommentScope) : 'visible'
+}
+
+/** What staff can do to a comment besides removing it (PATCH /admin/comments/:id). */
+export const ADMIN_COMMENT_ACTIONS = ['keep', 'restore'] as const
+export type AdminCommentAction = (typeof ADMIN_COMMENT_ACTIONS)[number]
+
+export function normalizeAdminAction(value: unknown): AdminCommentAction | null {
+  const v = String(value ?? '').toLowerCase()
+  return (ADMIN_COMMENT_ACTIONS as readonly string[]).includes(v) ? (v as AdminCommentAction) : null
+}
+
+/**
+ * Only a comment STAFF removed can be restored. One the author deleted stays gone —
+ * putting back words someone took down themselves is not moderation's call.
+ */
+export function canRestore(row: { deleted_at: unknown; deleted_by?: string | null }): boolean {
+  return Boolean(row.deleted_at) && row.deleted_by === 'staff'
+}
+
+/** "Keep" only means something on a comment that is still up. */
+export function canKeep(row: { deleted_at: unknown }): boolean {
+  return !row.deleted_at
 }
 
 /** Most rows one staff list returns. */

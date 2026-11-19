@@ -134,6 +134,23 @@ describe('staff moderation helpers', async () => {
     // rows deleted before deleted_by existed were all the author's own
     assert.equal(core.moderationState({ deleted_at: '2026-10-02', deleted_by: null }), 'removed_by_author')
   })
+  test('review scope and actions are recognised', () => {
+    assert.equal(core.normalizeAdminScope('review'), 'review')
+    assert.equal(core.normalizeAdminAction('keep'), 'keep')
+    assert.equal(core.normalizeAdminAction('RESTORE'), 'restore')
+    assert.equal(core.normalizeAdminAction('delete'), null)
+    assert.equal(core.normalizeAdminAction(undefined), null)
+  })
+  test('only a staff-removed comment can be restored', () => {
+    assert.equal(core.canRestore({ deleted_at: '2026-11-19', deleted_by: 'staff' }), true)
+    assert.equal(core.canRestore({ deleted_at: '2026-11-19', deleted_by: 'author' }), false)
+    assert.equal(core.canRestore({ deleted_at: '2026-11-19', deleted_by: null }), false)
+    assert.equal(core.canRestore({ deleted_at: null, deleted_by: null }), false)
+  })
+  test('only a live comment can be kept', () => {
+    assert.equal(core.canKeep({ deleted_at: null }), true)
+    assert.equal(core.canKeep({ deleted_at: '2026-11-19' }), false)
+  })
   test('removalNotice names the listing when known', () => {
     assert.match(core.removalNotice('Villa').body, /“Villa”/)
     assert.doesNotMatch(core.removalNotice(null).body, /“/)

@@ -36,6 +36,13 @@ const pool = new pg.Pool({ connectionString: _cs, ssl: _isLocal ? false : { reje
   // on a deleted row means the author did — the only way to delete before this.
   await pool.query(`ALTER TABLE listing_comments ADD COLUMN IF NOT EXISTS deleted_by text`)
   await pool.query(`ALTER TABLE listing_comments ADD COLUMN IF NOT EXISTS delete_reason text`)
+  // Staff review queue (2026-11-19): /ops → Comments "To review" is every live
+  // comment with reviewed_at NULL; Keep or Restore stamps it with the staff email.
+  await pool.query(`ALTER TABLE listing_comments ADD COLUMN IF NOT EXISTS reviewed_at timestamptz`)
+  await pool.query(`ALTER TABLE listing_comments ADD COLUMN IF NOT EXISTS reviewed_by text`)
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS listing_comments_review_idx
+       ON listing_comments (created_at DESC) WHERE deleted_at IS NULL AND reviewed_at IS NULL`)
   const { rows } = await pool.query(`SELECT count(*)::int AS n FROM listing_comments`)
   console.log(`✅ listing_comments ready (${rows[0].n} rows)`)
   await pool.end()

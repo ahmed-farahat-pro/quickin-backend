@@ -5,6 +5,8 @@ import { guardContent } from './moderation'
 import {
   ADMIN_COMMENT_LIMIT,
   COMMENT_PAGE_LIMIT,
+  canKeep,
+  canRestore,
   moderationState,
   normalizeAdminScope,
   normalizeRemovalReason,
@@ -136,6 +138,9 @@ export interface AdminCommentRow {
   deleted_at: string | null
   deleted_by: string | null
   delete_reason: string | null
+  /** When a staff member marked it Keep (or restored it). NULL = still in the queue. */
+  reviewed_at: string | null
+  reviewed_by: string | null
   state: ReturnType<typeof moderationState>
 }
 
@@ -149,6 +154,7 @@ export async function adminListComments(opts: {
   const scope = normalizeAdminScope(opts.scope)
   const where: string[] = []
   const args: unknown[] = []
+  if (scope === 'review') where.push(`c.deleted_at IS NULL AND c.reviewed_at IS NULL AND ${AUTHOR_ACTIVE}`)
   if (scope === 'visible') where.push(`c.deleted_at IS NULL AND ${AUTHOR_ACTIVE}`)
   if (scope === 'hidden') where.push(`c.deleted_at IS NULL AND NOT ${AUTHOR_ACTIVE}`)
   if (scope === 'removed') where.push(`c.deleted_at IS NOT NULL`)
@@ -167,7 +173,7 @@ export async function adminListComments(opts: {
             u.full_name AS author_name, u.email AS author_email,
             COALESCE(u.account_status, 'active') AS author_status,
             c.body, c.created_at, c.host_reply, c.host_replied_at,
-            c.deleted_at, c.deleted_by, c.delete_reason
+            c.deleted_at, c.deleted_by, c.delete_reason, c.reviewed_at, c.reviewed_by
        FROM listing_comments c
        JOIN users u ON u.id = c.user_id
        JOIN listings l ON l.id = c.listing_id
@@ -201,6 +207,64 @@ export async function adminRemoveComment(
   if (!row) return null
   await createNotification(row.user_id, { type: 'comment_removed', ...removalNotice(row.title), link: null })
   return { user_id: row.user_id, listing_id: row.listing_id, reason: why }
+}
+
+/** How many live comments no staff member has reviewed yet — the To review badge. */
+export async function adminCommentReviewCount(): Promise<number> {
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS n
+       FROM listing_comments c JOIN users u ON u.id = c.user_id
+      WHERE c.deleted_at IS NULL AND c.reviewed_at IS NULL AND ${AUTHOR_ACTIVE}`,
+  )
+  return rows[0]?.n ?? 0
+}
+
+/**
+ * Staff mark a live comment "Keep": it leaves the To review queue and stays up.
+ * `null` when there is no such live comment.
+ */
+export async function adminKeepComment(
+  commentId: string,
+  staffEmail: string,
+): Promise<{ user_id: string; listing_id: string } | null> {
+  if (!isUuid(commentId)) return null
+  const { rows } = await pool.query(
+    `SELECT user_id, listing_id, deleted_at FROM listing_comments WHERE id = $1`,
+    [commentId],
+  )
+  const row = rows[0]
+  if (!row || !canKeep(row)) return null
+  await pool.query(
+    `UPDATE listing_comments SET reviewed_at = now(), reviewed_by = $2 WHERE id = $1 AND deleted_at IS NULL`,
+    [commentId, staffEmail],
+  )
+  return { user_id: row.user_id, listing_id: row.listing_id }
+}
+
+/**
+ * Staff undo their own removal: the comment goes back on the listing, counted as
+ * reviewed. The author is not notified a second time. `null` when the comment is
+ * not one staff removed (live, author-deleted, or a bad id).
+ */
+export async function adminRestoreComment(
+  commentId: string,
+  staffEmail: string,
+): Promise<{ user_id: string; listing_id: string } | null> {
+  if (!isUuid(commentId)) return null
+  const { rows } = await pool.query(
+    `SELECT user_id, listing_id, deleted_at, deleted_by FROM listing_comments WHERE id = $1`,
+    [commentId],
+  )
+  const row = rows[0]
+  if (!row || !canRestore(row)) return null
+  await pool.query(
+    `UPDATE listing_comments
+        SET deleted_at = NULL, deleted_by = NULL, delete_reason = NULL,
+            reviewed_at = now(), reviewed_by = $2
+      WHERE id = $1 AND deleted_by = 'staff'`,
+    [commentId, staffEmail],
+  )
+  return { user_id: row.user_id, listing_id: row.listing_id }
 }
 
 /** Staff remove only the host's reply, leaving the question up. */
