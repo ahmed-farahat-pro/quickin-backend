@@ -4744,7 +4744,10 @@ export async function adminListListings(): Promise<AdminListingRow[]> {
             to_char(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
             (SELECT COUNT(*) FROM bookings b WHERE b.listing_id = l.id)::int AS booking_count,
             (SELECT li.url FROM listing_images li WHERE li.listing_id = l.id
-              ORDER BY li."order" LIMIT 1) AS image
+              ORDER BY li."order" LIMIT 1) AS image,
+            -- How many photos the /ops viewer will page through; the gallery itself
+            -- comes from GET /admin/listings/:id/photos so this list stays light.
+            (SELECT COUNT(*) FROM listing_images li WHERE li.listing_id = l.id)::int AS image_count
        FROM listings l
        LEFT JOIN users u ON u.id = l.host_id
        LEFT JOIN resorts r ON r.id = l.resort_id
@@ -6371,6 +6374,8 @@ export interface AdminListingRow {
   created_at: string
   booking_count: number
   image: string | null
+  /** Total photos on the listing — the /ops viewer fetches them on demand. */
+  image_count: number
   /** True when the host attached a proof-of-ownership document. The document ITSELF
    *  is no longer shipped here — it comes one at a time from the audited
    *  /api/local/admin/documents/ownership/:id, which needs the `documents` module
